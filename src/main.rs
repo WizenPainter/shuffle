@@ -21,8 +21,8 @@ use chrono::{DateTime, Local};
 use gpui::{
     div, img, point, prelude::*, px, rgb, rgba, size, uniform_list, AnyElement, App, Application,
     Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, FocusHandle, ImageSource, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, RenderImage, ScrollWheelEvent, TitlebarOptions,
-    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    MouseButton, MouseDownEvent, MouseMoveEvent, RenderImage, ScrollHandle, ScrollWheelEvent,
+    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSImage, NSWorkspace};
 use objc2_foundation::{NSData, NSString};
@@ -32,6 +32,10 @@ const RECENTS_CAP: usize = 12;
 // Default column widths for the main listing; all are user-resizable.
 const ICON_W: f32 = 18.0;
 const MIN_COL_W: f32 = 50.0;
+
+// Command-palette result row height, and how many show before scrolling.
+const PALETTE_ROW_H: f32 = 26.0;
+const PALETTE_MAX_ROWS: usize = 7;
 
 /// The four resizable columns of the main listing.
 #[derive(Clone, Copy, PartialEq)]
@@ -157,6 +161,7 @@ struct Finder2 {
     palette_items: Vec<PaletteItem>,
     selected: usize,
     search_gen: u64,
+    palette_scroll: ScrollHandle,
 }
 
 impl Finder2 {
@@ -177,6 +182,7 @@ impl Finder2 {
             palette_items: Vec::new(),
             selected: 0,
             search_gen: 0,
+            palette_scroll: ScrollHandle::new(),
         }
     }
 
@@ -254,6 +260,7 @@ impl Finder2 {
         self.search_gen = self.search_gen.wrapping_add(1);
         let gen = self.search_gen;
         self.selected = 0;
+        self.palette_scroll.set_offset(point(px(0.0), px(0.0)));
         let q = self.query.trim().to_string();
 
         if q.is_empty() {
@@ -372,7 +379,34 @@ impl Finder2 {
         }
         let next = (self.selected as i64 + delta).clamp(0, n as i64 - 1);
         self.selected = next as usize;
+        // Keep the highlighted row in view as you arrow through a long list.
+        self.palette_scroll.scroll_to_item(self.selected);
         cx.notify();
+    }
+
+    /// Read-only scroll indicator for the palette results list.
+    fn palette_scrollbar_thumb(&self) -> Option<AnyElement> {
+        let base = &self.palette_scroll;
+        let viewport = f64::from(base.bounds().size.height) as f32;
+        let max = f64::from(base.max_offset().height) as f32;
+        if viewport <= 1.0 || max <= 1.0 {
+            return None;
+        }
+        let scrolled = (-(f64::from(base.offset().y) as f32)).clamp(0.0, max);
+        let content = viewport + max;
+        let thumb_h = (viewport * viewport / content).clamp(20.0, viewport);
+        let thumb_top = (viewport - thumb_h) * (scrolled / max);
+        Some(
+            div()
+                .absolute()
+                .top(px(thumb_top))
+                .right(px(2.0))
+                .w(px(6.0))
+                .h(px(thumb_h))
+                .rounded_full()
+                .bg(rgba(0xffffff44))
+                .into_any_element(),
+        )
     }
 
     fn activate_selection(&mut self, cx: &mut Context<Self>) {
@@ -442,10 +476,14 @@ impl Finder2 {
     }
 
     fn render_palette(&self, cx: &Context<Self>) -> impl IntoElement {
+        // Fit the list to its content, capped — so there's no empty gray space
+        // below a short result set, and it scrolls once it's long.
+        let visible = self.palette_items.len().min(PALETTE_MAX_ROWS);
+        let list_h = visible as f32 * PALETTE_ROW_H;
+
         let rows: Vec<AnyElement> = self
             .palette_items
             .iter()
-            .take(12)
             .enumerate()
             .map(|(i, item)| {
                 let selected = i == self.selected;
@@ -462,7 +500,7 @@ impl Finder2 {
                     .items_center()
                     .gap_2()
                     .px_3()
-                    .py_1()
+                    .h(px(PALETTE_ROW_H))
                     .cursor_pointer();
                 let base = if selected {
                     base.bg(rgb(0x33334a))
@@ -516,7 +554,12 @@ impl Finder2 {
             .bottom_0()
             .flex()
             .justify_center()
-            .bg(rgba(0x00000055))
+            // Align to top so the panel hugs its content height instead of
+            // stretching to fill the whole window.
+            .items_start()
+            .bg(rgba(0x00000033))
+            // Block scroll/click from reaching the file list behind the palette.
+            .occlude()
             .child(
                 div()
                     .mt(px(90.0))
@@ -524,7 +567,8 @@ impl Finder2 {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .bg(rgb(0x222228))
+                    // ~75% opaque so the explorer shows faintly through the menu.
+                    .bg(rgba(0x222228bf))
                     .rounded_lg()
                     .border_1()
                     .border_color(rgb(0x3a3a44))
@@ -541,7 +585,27 @@ impl Finder2 {
                             .child(div().flex_none().text_color(rgb(0x7aa2f7)).child("›"))
                             .child(input),
                     )
-                    .child(div().flex().flex_col().py_1().children(rows)),
+                    // Scrollable, height-capped results with a scroll indicator.
+                    .child(
+                        div()
+                            .relative()
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .id("palette-results")
+                                    .h(px(list_h))
+                                    .overflow_y_scroll()
+                                    .track_scroll(&self.palette_scroll)
+                                    .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| {
+                                        cx.notify()
+                                    }))
+                                    .flex()
+                                    .flex_col()
+                                    .children(rows),
+                            )
+                            .children(self.palette_scrollbar_thumb()),
+                    ),
             )
     }
 
