@@ -18,9 +18,10 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    div, img, prelude::*, px, rgb, size, uniform_list, AnyElement, App, Application, Bounds,
-    ClickEvent, Context, CursorStyle, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent,
-    RenderImage, TitlebarOptions, Window, WindowBounds, WindowOptions,
+    div, img, point, prelude::*, px, rgb, rgba, size, uniform_list, AnyElement, App, Application,
+    Bounds, ClickEvent, Context, CursorStyle, ImageSource, MouseButton, MouseDownEvent,
+    MouseMoveEvent, RenderImage, ScrollWheelEvent, TitlebarOptions, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSImage, NSWorkspace};
 use objc2_foundation::{NSData, NSString};
@@ -100,6 +101,16 @@ struct Resize {
     start_w: f32,
 }
 
+/// An in-progress scrollbar-thumb drag.
+#[derive(Clone, Copy)]
+struct ScrollDrag {
+    start_y: f32,
+    start_scrolled: f32,
+}
+
+/// Reserved cache key for the shared generic folder icon.
+const FOLDER_KEY: &str = "\u{0}folder";
+
 /// One row in the main listing, with the metadata we display.
 struct Entry {
     name: String,
@@ -116,6 +127,8 @@ struct Finder2 {
     bookmarks: Vec<PathBuf>,
     widths: ColumnWidths,
     resize: Option<Resize>,
+    scroll_handle: UniformListScrollHandle,
+    scroll_drag: Option<ScrollDrag>,
 }
 
 impl Finder2 {
@@ -128,7 +141,95 @@ impl Finder2 {
             bookmarks: read_path_list("bookmarks.txt"),
             widths: ColumnWidths::default(),
             resize: None,
+            scroll_handle: UniformListScrollHandle::new(),
+            scroll_drag: None,
         }
+    }
+
+    /// Current scrolled distance from the top, in pixels.
+    fn current_scrolled(&self) -> f32 {
+        let state = self.scroll_handle.0.borrow();
+        (-(f64::from(state.base_handle.offset().y) as f32)).max(0.0)
+    }
+
+    fn begin_scroll_drag(&mut self, y: f32) {
+        self.scroll_drag = Some(ScrollDrag {
+            start_y: y,
+            start_scrolled: self.current_scrolled(),
+        });
+    }
+
+    fn update_scroll_drag(&mut self, y: f32, cx: &mut Context<Self>) {
+        let Some(drag) = self.scroll_drag else {
+            return;
+        };
+        let state = self.scroll_handle.0.borrow();
+        let base = &state.base_handle;
+        let viewport = f64::from(base.bounds().size.height) as f32;
+        let max = f64::from(base.max_offset().height) as f32;
+        if viewport <= 1.0 || max <= 1.0 {
+            return;
+        }
+        let content = viewport + max;
+        let thumb_h = (viewport * viewport / content).clamp(28.0, viewport);
+        let travel = (viewport - thumb_h).max(1.0);
+        // Thumb moves `delta` px; scale that to content-scroll distance.
+        let delta = y - drag.start_y;
+        let new_scrolled = (drag.start_scrolled + delta * (max / travel)).clamp(0.0, max);
+        let x = base.offset().x;
+        base.set_offset(point(x, px(-new_scrolled)));
+        drop(state);
+        cx.notify();
+    }
+
+    fn end_scroll_drag(&mut self) {
+        self.scroll_drag = None;
+    }
+
+    /// A floating, draggable scrollbar thumb sized/positioned from the list's
+    /// scroll state. Returns `None` when the content fits (or isn't measured yet).
+    fn scrollbar_thumb(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let state = self.scroll_handle.0.borrow();
+        let base = &state.base_handle;
+        let viewport = f64::from(base.bounds().size.height) as f32;
+        let max = f64::from(base.max_offset().height) as f32;
+        if viewport <= 1.0 || max <= 1.0 {
+            return None;
+        }
+        let scrolled = (-(f64::from(base.offset().y) as f32)).clamp(0.0, max);
+        let content = viewport + max;
+        let min_thumb = 28.0_f32;
+        let thumb_h = (viewport * viewport / content).clamp(min_thumb, viewport);
+        let thumb_top = (viewport - thumb_h) * (scrolled / max);
+
+        // Brighter while being dragged.
+        let color = if self.scroll_drag.is_some() {
+            rgba(0xffffff66)
+        } else {
+            rgba(0xffffff33)
+        };
+
+        Some(
+            div()
+                .id("scrollbar-thumb")
+                .absolute()
+                .top(px(thumb_top))
+                .right(px(2.0))
+                .w(px(8.0))
+                .h(px(thumb_h))
+                .rounded_full()
+                .bg(color)
+                .cursor(CursorStyle::PointingHand)
+                .hover(|s| s.bg(rgba(0xffffff55)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                        this.begin_scroll_drag(f64::from(ev.position.y) as f32);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+        )
     }
 
     fn begin_resize(&mut self, col: Column, x: f32) {
@@ -177,8 +278,10 @@ impl Finder2 {
         let mut jobs: Vec<(String, PathBuf)> = Vec::new();
         ICON_CACHE.with(|cache| {
             let cache = cache.borrow();
+            let mut has_dir = false;
             for entry in &self.entries {
                 if entry.is_dir {
+                    has_dir = true;
                     continue;
                 }
                 let path = self.current_dir.join(&entry.name);
@@ -189,6 +292,10 @@ impl Finder2 {
                     }
                     jobs.push((key, path));
                 }
+            }
+            // The shared generic folder icon, built once for all directories.
+            if has_dir && !cache.contains_key(FOLDER_KEY) {
+                jobs.push((FOLDER_KEY.to_string(), folder_dir_path()));
             }
         });
         if jobs.is_empty() {
@@ -336,8 +443,13 @@ impl Finder2 {
             .child(self.column_header(cx))
             // Virtualized listing: only the visible rows (and their icons) are
             // ever built, so cost is constant regardless of directory size.
+            // Wrapped in a relative container so the scrollbar can overlay it.
             .child(
-                uniform_list(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(uniform_list(
                     "file-list",
                     item_count,
                     cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
@@ -396,7 +508,11 @@ impl Finder2 {
                         items
                     }),
                 )
-                .flex_1(),
+                .size_full()
+                .track_scroll(self.scroll_handle.clone())
+                .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| cx.notify())),
+                )
+                .children(self.scrollbar_thumb(cx)),
             )
     }
 
@@ -488,10 +604,14 @@ impl Render for Finder2 {
             // the thin handle without dropping the resize.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 this.update_resize(f64::from(ev.position.x) as f32, cx);
+                this.update_scroll_drag(f64::from(ev.position.y) as f32, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| this.end_resize()),
+                cx.listener(|this, _, _, _| {
+                    this.end_resize();
+                    this.end_scroll_drag();
+                }),
             )
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx))
@@ -720,15 +840,19 @@ fn icon_glyph(name: &str, is_dir: bool) -> &'static str {
 /// fetch one, otherwise an emoji fallback. Directories always use the folder
 /// emoji (per design — folder icon stays as-is for now).
 fn icon_element(path: &Path, name: &str, is_dir: bool) -> AnyElement {
-    if !is_dir {
-        // Cache-only lookup — never build on the render thread. Missing icons
-        // show the emoji placeholder until the background pre-warm fills them in.
-        if let Some(handle) = lookup_icon(path) {
-            return img(ImageSource::Render(handle))
-                .w(px(16.0))
-                .h(px(16.0))
-                .into_any_element();
-        }
+    // Cache-only lookup — never build on the render thread. Missing icons show
+    // the emoji placeholder until the background pre-warm fills them in.
+    // Directories share one generic macOS folder icon; files key by extension.
+    let handle = if is_dir {
+        lookup_cached(FOLDER_KEY)
+    } else {
+        lookup_icon(path)
+    };
+    if let Some(handle) = handle {
+        return img(ImageSource::Render(handle))
+            .w(px(16.0))
+            .h(px(16.0))
+            .into_any_element();
     }
     div().child(icon_glyph(name, is_dir)).into_any_element()
 }
@@ -752,11 +876,24 @@ fn icon_key(path: &Path) -> Option<String> {
     }
 }
 
-/// Read a previously-built icon from the cache. Never builds (so it's safe to
-/// call every frame from `render`).
+/// Read a previously-built icon from the cache by its key. Never builds.
+fn lookup_cached(key: &str) -> Option<Arc<RenderImage>> {
+    ICON_CACHE.with(|cache| cache.borrow().get(key).cloned().flatten())
+}
+
+/// Read a previously-built file icon from the cache (keyed by extension). Never
+/// builds, so it's safe to call every frame from `render`.
 fn lookup_icon(path: &Path) -> Option<Arc<RenderImage>> {
     let key = icon_key(path)?;
-    ICON_CACHE.with(|cache| cache.borrow().get(&key).cloned().flatten())
+    lookup_cached(&key)
+}
+
+/// A guaranteed-plain folder whose icon is the generic macOS folder icon (our
+/// own config dir — we create it, so it never has a custom icon).
+fn folder_dir_path() -> PathBuf {
+    let dir = config_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let _ = fs::create_dir_all(&dir);
+    dir
 }
 
 /// Ask NSWorkspace for `path`'s icon, decode it, and convert to a GPUI image.
