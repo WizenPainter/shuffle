@@ -13,13 +13,14 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::collections::HashSet;
+use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    div, img, prelude::*, px, rgb, size, AnyElement, App, Application, Bounds, ClickEvent, Context,
-    CursorStyle, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent, RenderImage,
-    TitlebarOptions, Window, WindowBounds, WindowOptions,
+    div, img, prelude::*, px, rgb, size, uniform_list, AnyElement, App, Application, Bounds,
+    ClickEvent, Context, CursorStyle, ImageSource, MouseButton, MouseDownEvent, MouseMoveEvent,
+    RenderImage, TitlebarOptions, Window, WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSImage, NSWorkspace};
 use objc2_foundation::{NSData, NSString};
@@ -165,6 +166,51 @@ impl Finder2 {
         write_path_list("recents.txt", &self.recents);
 
         cx.notify();
+        self.prewarm_icons(cx);
+    }
+
+    /// Build macOS file-type icons for the current directory off the render
+    /// thread, one file-type at a time, yielding between each so scrolling stays
+    /// smooth. Until an icon is ready the row shows the emoji placeholder.
+    fn prewarm_icons(&self, cx: &mut Context<Self>) {
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut jobs: Vec<(String, PathBuf)> = Vec::new();
+        ICON_CACHE.with(|cache| {
+            let cache = cache.borrow();
+            for entry in &self.entries {
+                if entry.is_dir {
+                    continue;
+                }
+                let path = self.current_dir.join(&entry.name);
+                if let Some(key) = icon_key(&path) {
+                    // Skip types we've already built or already queued.
+                    if cache.contains_key(&key) || !seen.insert(key.clone()) {
+                        continue;
+                    }
+                    jobs.push((key, path));
+                }
+            }
+        });
+        if jobs.is_empty() {
+            return;
+        }
+
+        cx.spawn(async move |this, cx| {
+            for (key, path) in jobs {
+                let built = build_macos_icon(&path);
+                ICON_CACHE.with(|cache| {
+                    cache.borrow_mut().insert(key, built);
+                });
+                // Repaint so the freshly-built icon appears; stop if the view
+                // is gone.
+                if this.update(cx, |_, cx| cx.notify()).is_err() {
+                    break;
+                }
+                // Yield to the executor so frames can render between builds.
+                cx.background_executor().timer(Duration::from_millis(1)).await;
+            }
+        })
+        .detach();
     }
 
     /// Pin the current directory to bookmarks (no-op if already pinned).
@@ -266,50 +312,9 @@ impl Finder2 {
 
     fn render_main(&self, cx: &Context<Self>) -> impl IntoElement {
         let path_label = self.current_dir.display().to_string();
-        let current = self.current_dir.clone();
-        let widths = self.widths;
-
-        let mut rows: Vec<AnyElement> = Vec::with_capacity(self.entries.len() + 1);
-
-        if let Some(parent) = self.current_dir.parent() {
-            let parent = parent.to_path_buf();
-            let icon = icon_element(&parent, "..", true);
-            rows.push(
-                file_row(
-                    "..",
-                    true,
-                    0,
-                    None,
-                    0,
-                    widths,
-                    icon,
-                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.navigate_to(parent.clone(), cx);
-                    }),
-                )
-                .into_any_element(),
-            );
-        }
-
-        for (i, entry) in self.entries.iter().enumerate() {
-            let target = current.join(&entry.name);
-            let icon = icon_element(&target, &entry.name, entry.is_dir);
-            rows.push(
-                file_row(
-                    &entry.name,
-                    entry.is_dir,
-                    entry.size,
-                    entry.modified,
-                    i + 1,
-                    widths,
-                    icon,
-                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.navigate_to(target.clone(), cx);
-                    }),
-                )
-                .into_any_element(),
-            );
-        }
+        // A leading ".." row exists only when there's a parent to go up to.
+        let has_parent = self.current_dir.parent().is_some();
+        let item_count = self.entries.len() + usize::from(has_parent);
 
         div()
             .flex_1()
@@ -329,16 +334,69 @@ impl Finder2 {
             )
             // Column header.
             .child(self.column_header(cx))
-            // Scrollable listing.
+            // Virtualized listing: only the visible rows (and their icons) are
+            // ever built, so cost is constant regardless of directory size.
             .child(
-                div()
-                    .id("file-list")
-                    .flex_1()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .py_1()
-                    .children(rows),
+                uniform_list(
+                    "file-list",
+                    item_count,
+                    cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
+                        let widths = this.widths;
+                        let has_parent = this.current_dir.parent().is_some();
+                        let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
+
+                        for ix in range {
+                            if has_parent && ix == 0 {
+                                let parent =
+                                    this.current_dir.parent().unwrap_or(Path::new("/")).to_path_buf();
+                                let icon = icon_element(&parent, "..", true);
+                                items.push(
+                                    file_row(
+                                        "..",
+                                        true,
+                                        0,
+                                        None,
+                                        ix,
+                                        widths,
+                                        icon,
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            this.navigate_to(parent.clone(), cx);
+                                        }),
+                                    )
+                                    .into_any_element(),
+                                );
+                                continue;
+                            }
+
+                            let entry_ix = if has_parent { ix - 1 } else { ix };
+                            let entry = &this.entries[entry_ix];
+                            let name = entry.name.clone();
+                            let is_dir = entry.is_dir;
+                            let entry_size = entry.size;
+                            let modified = entry.modified;
+                            let target = this.current_dir.join(&name);
+                            let icon = icon_element(&target, &name, is_dir);
+
+                            items.push(
+                                file_row(
+                                    &name,
+                                    is_dir,
+                                    entry_size,
+                                    modified,
+                                    ix,
+                                    widths,
+                                    icon,
+                                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                        this.navigate_to(target.clone(), cx);
+                                    }),
+                                )
+                                .into_any_element(),
+                            );
+                        }
+                        items
+                    }),
+                )
+                .flex_1(),
             )
     }
 
@@ -349,7 +407,6 @@ impl Finder2 {
             .flex()
             .items_center()
             .flex_none()
-            .gap_2()
             .px_3()
             .py_1()
             .text_xs()
@@ -383,28 +440,33 @@ fn header_cell(
     align_right: bool,
     cx: &Context<Finder2>,
 ) -> impl IntoElement {
-    let mut label_box = div().flex_1().min_w_0().overflow_hidden();
+    let mut label_box = div().flex_1().min_w_0().truncate();
     if left_pad > 0.0 {
         label_box = label_box.pl(px(left_pad));
     }
     if align_right {
-        label_box = label_box.flex().justify_end();
+        label_box = label_box.flex().justify_end().pr_2();
     }
 
     div()
         .flex_none()
         .w(px(width))
+        .h_full()
         .flex()
         .items_center()
         .child(label_box.child(label.to_string()))
+        // Drag handle: a wide grab zone centered on a visible 1px divider line.
         .child(
             div()
                 .id(("resize", col.key()))
                 .flex_none()
-                .w(px(6.0))
+                .w(px(11.0))
                 .h_full()
+                .flex()
+                .justify_center()
                 .cursor(CursorStyle::ResizeLeftRight)
-                .hover(|s| s.bg(rgb(0x3a3a46)))
+                .child(div().w(px(1.0)).h_full().bg(rgb(0x3a3a46)))
+                .hover(|s| s.bg(rgb(0x34343e)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
@@ -521,12 +583,11 @@ fn file_row(
         .id(("row", key))
         .flex()
         .items_center()
-        .gap_2()
         .px_3()
         .py_1()
         .cursor_pointer()
         .hover(|s| s.bg(rgb(0x2a2a30)))
-        // Name (icon + label).
+        // Name (icon + label). Long names truncate with an ellipsis.
         .child(
             div()
                 .flex_none()
@@ -534,6 +595,7 @@ fn file_row(
                 .flex()
                 .items_center()
                 .gap_2()
+                .pr_2()
                 .child(
                     div()
                         .flex_none()
@@ -544,8 +606,9 @@ fn file_row(
                 )
                 .child(
                     div()
+                        .flex_1()
                         .min_w_0()
-                        .overflow_hidden()
+                        .truncate()
                         .text_color(rgb(name_color))
                         .child(name.to_string()),
                 ),
@@ -555,7 +618,8 @@ fn file_row(
             div()
                 .flex_none()
                 .w(px(widths.kind))
-                .overflow_hidden()
+                .pr_3()
+                .truncate()
                 .text_color(meta_color)
                 .child(kind),
         )
@@ -564,7 +628,8 @@ fn file_row(
             div()
                 .flex_none()
                 .w(px(widths.date))
-                .overflow_hidden()
+                .pr_3()
+                .truncate()
                 .text_color(meta_color)
                 .child(format_date(modified)),
         )
@@ -602,12 +667,20 @@ fn kind_label(name: &str, is_dir: bool) -> String {
         Some("csv" | "tsv") => "CSV File".to_string(),
         Some("dwg") => "DWG File".to_string(),
         Some("dxf") => "DXF File".to_string(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "tiff" | "heic" | "webp" | "svg") => {
-            "Image".to_string()
+        // Images/video/audio/archives show their format, e.g. "PNG Image".
+        Some("jpg" | "jpeg") => "JPEG Image".to_string(),
+        Some(e @ ("png" | "gif" | "bmp" | "tiff" | "heic" | "webp" | "svg")) => {
+            format!("{} Image", e.to_uppercase())
         }
-        Some("mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v") => "Video".to_string(),
-        Some("mp3" | "wav" | "flac" | "aac" | "m4a" | "ogg") => "Audio".to_string(),
-        Some("zip" | "tar" | "gz" | "7z" | "rar" | "bz2" | "xz" | "dmg") => "Archive".to_string(),
+        Some(e @ ("mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v")) => {
+            format!("{} Video", e.to_uppercase())
+        }
+        Some(e @ ("mp3" | "wav" | "flac" | "aac" | "m4a" | "ogg")) => {
+            format!("{} Audio", e.to_uppercase())
+        }
+        Some(e @ ("zip" | "tar" | "gz" | "7z" | "rar" | "bz2" | "xz" | "dmg")) => {
+            format!("{} Archive", e.to_uppercase())
+        }
         Some(
             "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "c" | "cpp" | "h" | "hpp" | "go" | "java"
             | "rb" | "swift" | "zig" | "sh" | "json" | "toml" | "yaml" | "yml" | "html" | "css",
@@ -648,7 +721,9 @@ fn icon_glyph(name: &str, is_dir: bool) -> &'static str {
 /// emoji (per design — folder icon stays as-is for now).
 fn icon_element(path: &Path, name: &str, is_dir: bool) -> AnyElement {
     if !is_dir {
-        if let Some(handle) = cached_icon(path) {
+        // Cache-only lookup — never build on the render thread. Missing icons
+        // show the emoji placeholder until the background pre-warm fills them in.
+        if let Some(handle) = lookup_icon(path) {
             return img(ImageSource::Render(handle))
                 .w(px(16.0))
                 .h(px(16.0))
@@ -665,26 +740,28 @@ thread_local! {
         RefCell::new(HashMap::new());
 }
 
-/// Look up (or build and cache) the macOS icon for `path`, keyed by extension.
-fn cached_icon(path: &Path) -> Option<Arc<RenderImage>> {
+fn icon_key(path: &Path) -> Option<String> {
     let key = path
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_lowercase())?;
     if key.is_empty() {
-        return None;
+        None
+    } else {
+        Some(key)
     }
-    ICON_CACHE.with(|cache| {
-        if let Some(existing) = cache.borrow().get(&key) {
-            return existing.clone();
-        }
-        let built = build_macos_icon(path);
-        cache.borrow_mut().insert(key, built.clone());
-        built
-    })
+}
+
+/// Read a previously-built icon from the cache. Never builds (so it's safe to
+/// call every frame from `render`).
+fn lookup_icon(path: &Path) -> Option<Arc<RenderImage>> {
+    let key = icon_key(path)?;
+    ICON_CACHE.with(|cache| cache.borrow().get(&key).cloned().flatten())
 }
 
 /// Ask NSWorkspace for `path`'s icon, decode it, and convert to a GPUI image.
+/// This is the expensive part (AppKit + TIFF decode + resize), so it runs only
+/// off the render path, in the background pre-warm task.
 fn build_macos_icon(path: &Path) -> Option<Arc<RenderImage>> {
     let path_str = path.to_str()?;
     let tiff: Vec<u8> = {
@@ -699,6 +776,10 @@ fn build_macos_icon(path: &Path) -> Option<Arc<RenderImage>> {
     };
 
     let decoded = image::load_from_memory(&tiff).ok()?;
+    // The TIFF carries a large representation (up to ~1024px). We only show
+    // ~16px, so downscale to 32px (Triangle is fast and looks fine at this
+    // size) — this caps each cached icon at a few KB instead of multiple MB.
+    let decoded = decoded.resize_exact(32, 32, image::imageops::FilterType::Triangle);
     let rgba = decoded.to_rgba8();
     let (w, h) = rgba.dimensions();
     let mut raw = rgba.into_raw();
@@ -874,7 +955,13 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_window, cx| cx.new(|_cx| Finder2::new(load_last_dir())),
+            |_window, cx| {
+                cx.new(|cx| {
+                    let finder = Finder2::new(load_last_dir());
+                    finder.prewarm_icons(cx);
+                    finder
+                })
+            },
         )
         .unwrap();
 
