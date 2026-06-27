@@ -9,19 +9,20 @@
 //! highlighted. State lives in ~/Library/Application Support/finder2/.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
-use std::collections::HashSet;
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local};
 use gpui::{
     div, img, point, prelude::*, px, rgb, rgba, size, uniform_list, AnyElement, App, Application,
-    Bounds, ClickEvent, Context, CursorStyle, ImageSource, MouseButton, MouseDownEvent,
-    MouseMoveEvent, RenderImage, ScrollWheelEvent, TitlebarOptions, UniformListScrollHandle, Window,
-    WindowBounds, WindowOptions,
+    Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, FocusHandle, ImageSource, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, RenderImage, ScrollWheelEvent, TitlebarOptions,
+    UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSImage, NSWorkspace};
 use objc2_foundation::{NSData, NSString};
@@ -111,6 +112,26 @@ struct ScrollDrag {
 /// Reserved cache key for the shared generic folder icon.
 const FOLDER_KEY: &str = "\u{0}folder";
 
+/// What activating a command-palette item does.
+#[derive(Clone)]
+enum Action {
+    /// Open a path (navigate into it if a dir, else reveal its parent).
+    Open(PathBuf, bool),
+    /// Copy the current directory's path to the clipboard.
+    CopyDir,
+    /// Inert (e.g. "path not found").
+    None,
+}
+
+/// One row in the command palette: a title, a gray subtitle (full path), and
+/// what happens on activation.
+struct PaletteItem {
+    title: String,
+    subtitle: String,
+    action: Action,
+    is_dir: bool,
+}
+
 /// One row in the main listing, with the metadata we display.
 struct Entry {
     name: String,
@@ -129,10 +150,17 @@ struct Finder2 {
     resize: Option<Resize>,
     scroll_handle: UniformListScrollHandle,
     scroll_drag: Option<ScrollDrag>,
+    // Command palette (Cmd+P).
+    focus: FocusHandle,
+    palette_open: bool,
+    query: String,
+    palette_items: Vec<PaletteItem>,
+    selected: usize,
+    search_gen: u64,
 }
 
 impl Finder2 {
-    fn new(dir: PathBuf) -> Self {
+    fn new(dir: PathBuf, cx: &mut Context<Self>) -> Self {
         let entries = read_entries(&dir);
         Self {
             current_dir: dir,
@@ -143,6 +171,12 @@ impl Finder2 {
             resize: None,
             scroll_handle: UniformListScrollHandle::new(),
             scroll_drag: None,
+            focus: cx.focus_handle(),
+            palette_open: false,
+            query: String::new(),
+            palette_items: Vec::new(),
+            selected: 0,
+            search_gen: 0,
         }
     }
 
@@ -184,6 +218,331 @@ impl Finder2 {
 
     fn end_scroll_drag(&mut self) {
         self.scroll_drag = None;
+    }
+
+    // ----- command palette (Cmd+P) -----
+
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.palette_open = !self.palette_open;
+        if self.palette_open {
+            self.query.clear();
+            self.selected = 0;
+            self.refresh_palette(cx);
+            window.focus(&self.focus);
+        }
+        cx.notify();
+    }
+
+    fn close_palette(&mut self, cx: &mut Context<Self>) {
+        self.palette_open = false;
+        cx.notify();
+    }
+
+    /// Default items shown when the query is empty: the available commands.
+    fn default_commands(&self) -> Vec<PaletteItem> {
+        vec![PaletteItem {
+            title: "Copy current directory".to_string(),
+            subtitle: self.current_dir.to_string_lossy().into_owned(),
+            action: Action::CopyDir,
+            is_dir: true,
+        }]
+    }
+
+    /// Recompute the palette contents for the current query. Path-like queries
+    /// resolve synchronously; name queries kick off a debounced async search.
+    fn refresh_palette(&mut self, cx: &mut Context<Self>) {
+        self.search_gen = self.search_gen.wrapping_add(1);
+        let gen = self.search_gen;
+        self.selected = 0;
+        let q = self.query.trim().to_string();
+
+        if q.is_empty() {
+            self.palette_items = self.default_commands();
+            cx.notify();
+            return;
+        }
+
+        // Path mode: browse a directory live. Split the query into a base dir
+        // and a partial name; list the base's entries, ranked (typo-tolerant)
+        // by how well they match the partial.
+        if q.starts_with('/') || q.starts_with('~') {
+            let (base, partial) = split_path_query(&q);
+            if !base.is_dir() {
+                self.palette_items = vec![PaletteItem {
+                    title: "Path not found".to_string(),
+                    subtitle: base.to_string_lossy().into_owned(),
+                    action: Action::None,
+                    is_dir: false,
+                }];
+                cx.notify();
+                return;
+            }
+
+            let mut scored: Vec<(i32, String, bool)> = list_dir_names(&base)
+                .into_iter()
+                .map(|(name, is_dir)| {
+                    let score = if partial.is_empty() {
+                        0
+                    } else {
+                        match_score(&partial, &name)
+                    };
+                    (score, name, is_dir)
+                })
+                .collect();
+
+            if partial.is_empty() {
+                // Directories first, then alphabetical.
+                scored.sort_by(|a, b| {
+                    b.2.cmp(&a.2)
+                        .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+                });
+            } else {
+                // Best match first; ties → dirs first, then alphabetical.
+                scored.sort_by(|a, b| {
+                    b.0.cmp(&a.0)
+                        .then_with(|| b.2.cmp(&a.2))
+                        .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+                });
+            }
+
+            self.palette_items = scored
+                .into_iter()
+                .take(50)
+                .map(|(_, name, is_dir)| {
+                    let path = base.join(&name);
+                    let subtitle = path.to_string_lossy().into_owned();
+                    PaletteItem {
+                        title: name,
+                        subtitle,
+                        action: Action::Open(path, is_dir),
+                        is_dir,
+                    }
+                })
+                .collect();
+            cx.notify();
+            return;
+        }
+
+        // Need at least 2 chars for a name search (avoids huge 1-char results).
+        if q.chars().count() < 2 {
+            self.palette_items = self.default_commands();
+            cx.notify();
+            return;
+        }
+
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            // Debounce: bail if a newer keystroke superseded us.
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            let current = this.update(cx, |this, _| this.search_gen == gen).unwrap_or(false);
+            if !current {
+                return;
+            }
+            let hits = cx.background_spawn(async move { search_filesystem(&q) }).await;
+            this.update(cx, |this, cx| {
+                if this.search_gen != gen {
+                    return;
+                }
+                this.palette_items = hits
+                    .into_iter()
+                    .map(|(name, path, is_dir)| {
+                        let subtitle = path.to_string_lossy().into_owned();
+                        PaletteItem {
+                            title: name,
+                            subtitle,
+                            action: Action::Open(path, is_dir),
+                            is_dir,
+                        }
+                    })
+                    .collect();
+                this.selected = 0;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn move_selection(&mut self, delta: i64, cx: &mut Context<Self>) {
+        let n = self.palette_items.len();
+        if n == 0 {
+            return;
+        }
+        let next = (self.selected as i64 + delta).clamp(0, n as i64 - 1);
+        self.selected = next as usize;
+        cx.notify();
+    }
+
+    fn activate_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = self.palette_items.get(self.selected) else {
+            return;
+        };
+        match item.action.clone() {
+            Action::Open(path, is_dir) => {
+                let target = if is_dir {
+                    path
+                } else {
+                    path.parent().map(Path::to_path_buf).unwrap_or(path)
+                };
+                self.close_palette(cx);
+                self.navigate_to(target, cx);
+            }
+            Action::CopyDir => {
+                let text = self.current_dir.to_string_lossy().into_owned();
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                self.close_palette(cx);
+            }
+            Action::None => {}
+        }
+    }
+
+    /// Top-level key handling: Cmd+P toggles; while open, drive the palette.
+    fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let cmd = ks.modifiers.platform;
+        let key = ks.key.as_str();
+
+        if cmd && key == "p" {
+            self.toggle_palette(window, cx);
+            return;
+        }
+        if !self.palette_open {
+            return;
+        }
+
+        match key {
+            "escape" => self.close_palette(cx),
+            "enter" => self.activate_selection(cx),
+            "down" => self.move_selection(1, cx),
+            "up" => self.move_selection(-1, cx),
+            "backspace" => {
+                self.query.pop();
+                self.refresh_palette(cx);
+            }
+            "v" if cmd => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    self.query.push_str(text.trim());
+                    self.refresh_palette(cx);
+                }
+            }
+            _ => {
+                if cmd {
+                    return; // ignore other Cmd-combos
+                }
+                if let Some(ch) = ks.key_char.as_ref() {
+                    if !ch.is_empty() && !ch.chars().any(|c| c.is_control()) {
+                        self.query.push_str(ch);
+                        self.refresh_palette(cx);
+                    }
+                }
+            }
+        }
+    }
+
+    fn render_palette(&self, cx: &Context<Self>) -> impl IntoElement {
+        let rows: Vec<AnyElement> = self
+            .palette_items
+            .iter()
+            .take(12)
+            .enumerate()
+            .map(|(i, item)| {
+                let selected = i == self.selected;
+                let glyph = if matches!(item.action, Action::CopyDir) {
+                    "⧉"
+                } else if item.is_dir {
+                    "📁"
+                } else {
+                    "📄"
+                };
+                let base = div()
+                    .id(("pal", i))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer();
+                let base = if selected {
+                    base.bg(rgb(0x33334a))
+                } else {
+                    base.hover(|s| s.bg(rgb(0x2a2a30)))
+                };
+                base.child(div().flex_none().w(px(18.0)).child(glyph))
+                    .child(
+                        div()
+                            .flex()
+                            .items_baseline()
+                            .gap_2()
+                            .min_w_0()
+                            .flex_1()
+                            .child(div().flex_none().text_color(rgb(0xf0f0f4)).child(item.title.clone()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(rgb(0x7c7c86))
+                                    .child(item.subtitle.clone()),
+                            ),
+                    )
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.selected = i;
+                        this.activate_selection(cx);
+                    }))
+                    .into_any_element()
+            })
+            .collect();
+
+        // Input line: query with a caret, or a dim placeholder.
+        let input = if self.query.is_empty() {
+            div()
+                .text_color(rgb(0x6b6b73))
+                .child("Type a path, or a file/folder name…")
+        } else {
+            div()
+                .text_color(rgb(0xffffff))
+                .child(format!("{}\u{2502}", self.query))
+        };
+
+        // Backdrop covering the window, with the panel near the top.
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .flex()
+            .justify_center()
+            .bg(rgba(0x00000055))
+            .child(
+                div()
+                    .mt(px(90.0))
+                    .w(px(680.0))
+                    .flex()
+                    .flex_col()
+                    .overflow_hidden()
+                    .bg(rgb(0x222228))
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(rgb(0x3a3a44))
+                    .shadow_lg()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .py_2()
+                            .border_b_1()
+                            .border_color(rgb(0x3a3a44))
+                            .child(div().flex_none().text_color(rgb(0x7aa2f7)).child("›"))
+                            .child(input),
+                    )
+                    .child(div().flex().flex_col().py_1().children(rows)),
+            )
     }
 
     /// A floating, draggable scrollbar thumb sized/positioned from the list's
@@ -595,11 +954,15 @@ fn header_cell(
 
 impl Render for Finder2 {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        div()
+        let mut root = div()
+            .relative()
             .flex()
             .size_full()
             .bg(rgb(0x1e1e22))
             .text_sm()
+            // Focusable so it receives key events (Cmd+P, palette typing).
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_key))
             // Track column drags anywhere in the window so the cursor can leave
             // the thin handle without dropping the resize.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
@@ -614,7 +977,12 @@ impl Render for Finder2 {
                 }),
             )
             .child(self.render_sidebar(cx))
-            .child(self.render_main(cx))
+            .child(self.render_main(cx));
+
+        if self.palette_open {
+            root = root.child(self.render_palette(cx));
+        }
+        root
     }
 }
 
@@ -987,6 +1355,192 @@ fn read_entries(dir: &Path) -> Vec<Entry> {
     entries
 }
 
+/// Split a path-like query into (base directory, partial trailing name).
+/// Handles `~`/`~/` expansion. A trailing `/` means "list this dir" (no partial).
+fn split_path_query(q: &str) -> (PathBuf, String) {
+    let home = home_dir().to_string_lossy().into_owned();
+    let expanded = if q == "~" {
+        format!("{home}/")
+    } else if let Some(rest) = q.strip_prefix("~/") {
+        format!("{home}/{rest}")
+    } else {
+        q.to_string()
+    };
+
+    if expanded.ends_with('/') {
+        let base = expanded.trim_end_matches('/');
+        let base = if base.is_empty() { "/" } else { base };
+        return (PathBuf::from(base), String::new());
+    }
+    match expanded.rsplit_once('/') {
+        Some((base, partial)) => {
+            let base = if base.is_empty() { "/" } else { base };
+            (PathBuf::from(base), partial.to_string())
+        }
+        None => (PathBuf::from(expanded), String::new()),
+    }
+}
+
+/// Lightweight directory listing for the palette: (name, is_dir). Uses the
+/// readdir file-type (cheap), only stat-ing symlinks to resolve dir-ness.
+fn list_dir_names(dir: &Path) -> Vec<(String, bool)> {
+    let mut out = Vec::new();
+    if let Ok(read_dir) = fs::read_dir(dir) {
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = match entry.file_type() {
+                Ok(t) if t.is_dir() => true,
+                Ok(t) if t.is_symlink() => entry.path().is_dir(),
+                _ => false,
+            };
+            out.push((name, is_dir));
+        }
+    }
+    out
+}
+
+/// Character bigrams of a string.
+fn bigrams(s: &str) -> Vec<(char, char)> {
+    let chars: Vec<char> = s.chars().collect();
+    chars.windows(2).map(|w| (w[0], w[1])).collect()
+}
+
+/// Sørensen–Dice similarity (0..1) over character bigrams. Tolerant of typos
+/// and transpositions (e.g. "dcouments" vs "documents"), unlike subsequence.
+fn dice(a: &str, b: &str) -> f32 {
+    let ba = bigrams(a);
+    let bb = bigrams(b);
+    if ba.is_empty() || bb.is_empty() {
+        return if a == b { 1.0 } else { 0.0 };
+    }
+    let mut counts: HashMap<(char, char), i32> = HashMap::new();
+    for g in &bb {
+        *counts.entry(*g).or_insert(0) += 1;
+    }
+    let mut inter = 0;
+    for g in &ba {
+        if let Some(c) = counts.get_mut(g) {
+            if *c > 0 {
+                *c -= 1;
+                inter += 1;
+            }
+        }
+    }
+    2.0 * inter as f32 / (ba.len() + bb.len()) as f32
+}
+
+/// Typo-tolerant match score of a partial name against a candidate name.
+/// Combines exact/prefix/substring/subsequence signals with Dice similarity.
+fn match_score(partial: &str, name: &str) -> i32 {
+    let p = partial.to_lowercase();
+    let n = name.to_lowercase();
+    if p.is_empty() {
+        return 0;
+    }
+    let mut score = 0;
+    if n == p {
+        score += 10_000;
+    }
+    if n.starts_with(&p) {
+        score += 4_000;
+    }
+    if n.contains(&p) {
+        score += 1_500;
+    }
+    if let Some(fs) = fuzzy_score(&p, &n) {
+        score += 800 + fs;
+    }
+    score += (dice(&p, &n) * 2_000.0) as i32;
+    score -= (n.len() as i32) / 4; // mild preference for shorter names
+    score
+}
+
+/// Case-insensitive fuzzy (subsequence) score of `needle` against `haystack`.
+/// Higher is better; `None` if `needle` isn't a subsequence. Rewards
+/// contiguous runs and word-start matches, lightly penalizes length.
+fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
+    let n: Vec<char> = needle.to_lowercase().chars().collect();
+    let h: Vec<char> = haystack.to_lowercase().chars().collect();
+    if n.is_empty() {
+        return Some(0);
+    }
+    let mut hi = 0usize;
+    let mut score = 0i32;
+    let mut last_match: i32 = -2;
+    for &nc in &n {
+        let mut found = None;
+        while hi < h.len() {
+            if h[hi] == nc {
+                found = Some(hi);
+                break;
+            }
+            hi += 1;
+        }
+        let pos = found?;
+        if pos as i32 == last_match + 1 {
+            score += 6; // contiguous run
+        }
+        if pos == 0
+            || matches!(h[pos - 1], '/' | ' ' | '_' | '-' | '.')
+        {
+            score += 10; // start of a word/segment
+        }
+        score -= (pos as i32) / 4; // earlier matches slightly better
+        last_match = pos as i32;
+        hi = pos + 1;
+    }
+    score -= (h.len() as i32) / 8; // prefer shorter names
+    Some(score)
+}
+
+/// Spotlight-backed name search: gather candidates with `mdfind`, then fuzzy
+/// rank by filename. Runs on a background thread (blocking is fine there).
+fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
+    let mut child = match Command::new("mdfind")
+        .arg("-name")
+        .arg(query)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Vec::new(),
+    };
+
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        return Vec::new();
+    };
+
+    let mut scored: Vec<(i32, String, PathBuf)> = Vec::new();
+    // Cap how much we read so a broad query can't stall us.
+    for line in BufReader::new(stdout).lines().take(4000) {
+        let Ok(line) = line else { continue };
+        if line.is_empty() {
+            continue;
+        }
+        let path = PathBuf::from(&line);
+        let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+            continue;
+        };
+        if let Some(score) = fuzzy_score(query, &name) {
+            scored.push((score, name, path));
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+
+    scored.sort_by(|a, b| b.0.cmp(&a.0));
+    scored.truncate(40);
+    scored
+        .into_iter()
+        .map(|(_, name, path)| {
+            let is_dir = path.is_dir();
+            (name, path, is_dir)
+        })
+        .collect()
+}
+
 /// A short, human label for a path (last component; "/" → "Macintosh HD").
 fn path_label(p: &Path) -> String {
     if p == Path::new("/") {
@@ -1092,12 +1646,15 @@ fn main() {
                 }),
                 ..Default::default()
             },
-            |_window, cx| {
-                cx.new(|cx| {
-                    let finder = Finder2::new(load_last_dir());
+            |window, cx| {
+                let view = cx.new(|cx| {
+                    let finder = Finder2::new(load_last_dir(), cx);
                     finder.prewarm_icons(cx);
                     finder
-                })
+                });
+                // Focus the root so it receives keystrokes (Cmd+P) immediately.
+                window.focus(&view.read(cx).focus);
+                view
             },
         )
         .unwrap();
