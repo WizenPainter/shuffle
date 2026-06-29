@@ -674,8 +674,8 @@ struct Shuffle {
     active_pane: usize,
     /// Left pane's width fraction when two panes are shown (0.2..0.8).
     split_ratio: f32,
-    /// True while the user drags the divider between two panes.
-    divider_drag: bool,
+    /// In-progress divider drag: (cursor x at grab, split_ratio at grab).
+    divider_drag: Option<(f32, f32)>,
     recents: Vec<PathBuf>,
     bookmarks: Vec<PathBuf>,
     widths: ColumnWidths,
@@ -707,7 +707,7 @@ impl Shuffle {
             panes: vec![Pane::new(dir)],
             active_pane: 0,
             split_ratio: 0.5,
-            divider_drag: false,
+            divider_drag: None,
             recents: read_path_list("recents.txt"),
             bookmarks: read_path_list("bookmarks.txt"),
             widths: ColumnWidths::default(),
@@ -2184,8 +2184,11 @@ impl Shuffle {
             .hover(|s| s.bg(rgb(theme().hover)))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _, cx| {
-                    this.divider_drag = true;
+                cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    // Remember where the grab started and the ratio at that
+                    // moment, so the drag continues from the current size rather
+                    // than snapping the divider to the cursor.
+                    this.divider_drag = Some((f64::from(ev.position.x) as f32, this.split_ratio));
                     cx.notify();
                 }),
             )
@@ -2198,12 +2201,17 @@ impl Shuffle {
     }
 
     /// Update the split ratio while dragging the divider. `x` is window-relative.
+    /// Delta-based: new ratio = ratio-at-grab + (cursor moved) / content width.
     fn update_divider(&mut self, x: f32, cx: &mut Context<Self>) {
-        if !self.divider_drag || self.panes.len() < 2 {
+        let Some((start_x, start_ratio)) = self.divider_drag else {
+            return;
+        };
+        if self.panes.len() < 2 {
             return;
         }
         let content_w = (self.pane_list_width(0) + self.pane_list_width(1)).max(1.0);
-        self.split_ratio = ((x - SIDEBAR_W) / content_w).clamp(0.2, 0.8);
+        let delta = (x - start_x) / content_w;
+        self.split_ratio = (start_ratio + delta).clamp(0.2, 0.8);
         cx.notify();
     }
 
@@ -2639,7 +2647,7 @@ impl Render for Shuffle {
                 cx.listener(|this, _, _, _| {
                     this.end_resize();
                     this.end_scroll_drag();
-                    this.divider_drag = false;
+                    this.divider_drag = None;
                 }),
             )
             .child(self.render_sidebar(cx))
