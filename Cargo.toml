@@ -1,18 +1,22 @@
 [package]
-name = "finder2"
+name = "shuffle"
 version = "0.1.0"
 edition = "2021"
-description = "A fast, snappy file manager for Apple Silicon Macs"
+description = "Shuffle — a fast, snappy file manager for Apple Silicon Macs"
 publish = false
 
 [dependencies]
 gpui = "0.2.2"
 chrono = "0.4"
+# Parallel fuzzy scoring of the in-memory file index.
+rayon = "1"
+# Fast parallel directory walking for index builds.
+jwalk = "0.8"
 # Decode the TIFF that NSImage hands us for file-type icons.
 image = { version = "0.25", features = ["tiff"] }
 # Fetch real macOS file icons via NSWorkspace (Apple Silicon / AppKit).
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSData"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSData", "NSFileManager", "NSURL"] }
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage"] }
 
 # Apple Silicon only for now. Build with a thin release profile while

@@ -1,4 +1,4 @@
-//! finder2 — a fast, snappy file manager for Apple Silicon Macs.
+//! Shuffle — a fast, snappy file manager for Apple Silicon Macs.
 //!
 //! Milestone 2: a left sidebar of shortcuts.
 //! - Recent: directories visited recently (tracked + persisted, most-recent first).
@@ -6,7 +6,7 @@
 //! - Favorites: Applications, Pictures, Documents, Downloads.
 //! - Locations: Macintosh HD (/) and the current user's home directory.
 //! Clicking any item navigates the main listing. The active location is
-//! highlighted. State lives in ~/Library/Application Support/finder2/.
+//! highlighted. State lives in ~/Library/Application Support/Shuffle/.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -19,15 +19,37 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    div, img, point, prelude::*, px, rgb, rgba, size, uniform_list, AnyElement, App, Application,
-    Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, FocusHandle, ImageSource, KeyDownEvent,
-    MouseButton, MouseDownEvent, MouseMoveEvent, RenderImage, ScrollHandle, ScrollWheelEvent,
-    TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions,
+    actions, div, img, point, prelude::*, px, rgb, rgba, size, uniform_list, AnyElement, App,
+    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, FocusHandle, ImageSource,
+    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
+    RenderImage, ScrollHandle, ScrollWheelEvent, TitlebarOptions, UniformListScrollHandle, Window,
+    WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSImage, NSWorkspace};
-use objc2_foundation::{NSData, NSString};
+use objc2_foundation::{NSData, NSFileManager, NSString, NSURL};
+use rayon::prelude::*;
 
 const RECENTS_CAP: usize = 12;
+
+// Menu-bar actions.
+actions!(shuffle, [OpenSettings, Quit]);
+
+/// The Settings window — empty for now; customization options will live here.
+struct Settings;
+
+impl Render for Settings {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .size_full()
+            .items_center()
+            .justify_center()
+            .bg(rgb(0x1e1e22))
+            .text_sm()
+            .text_color(rgb(0x6b6b73))
+            .child("Settings — customization options coming soon")
+    }
+}
 
 // Default column widths for the main listing; all are user-resizable.
 const ICON_W: f32 = 18.0;
@@ -113,8 +135,9 @@ struct ScrollDrag {
     start_scrolled: f32,
 }
 
-/// Reserved cache key for the shared generic folder icon.
+/// Reserved cache keys for the shared generic folder and file icons.
 const FOLDER_KEY: &str = "\u{0}folder";
+const FILE_KEY: &str = "\u{0}file";
 
 /// What activating a command-palette item does.
 #[derive(Clone)]
@@ -125,6 +148,14 @@ enum Action {
     CopyDir,
     /// Inert (e.g. "path not found").
     None,
+}
+
+/// An open right-click context menu: where it sits, and the entry it targets
+/// (None when invoked on empty space).
+struct ContextMenu {
+    x: f32,
+    y: f32,
+    target: Option<(PathBuf, bool)>,
 }
 
 /// One row in the command palette: a title, a gray subtitle (full path), and
@@ -145,7 +176,7 @@ struct Entry {
 }
 
 /// The root view.
-struct Finder2 {
+struct Shuffle {
     current_dir: PathBuf,
     entries: Vec<Entry>,
     recents: Vec<PathBuf>,
@@ -162,10 +193,14 @@ struct Finder2 {
     selected: usize,
     search_gen: u64,
     palette_scroll: ScrollHandle,
+    /// In-memory fuzzy index of ~/ (None until the background build finishes).
+    index: Option<Arc<FileIndex>>,
+    context_menu: Option<ContextMenu>,
 }
 
-impl Finder2 {
+impl Shuffle {
     fn new(dir: PathBuf, cx: &mut Context<Self>) -> Self {
+        ensure_base_icons(); // real folder/file icons ready before first render
         let entries = read_entries(&dir);
         Self {
             current_dir: dir,
@@ -183,7 +218,181 @@ impl Finder2 {
             selected: 0,
             search_gen: 0,
             palette_scroll: ScrollHandle::new(),
+            index: None,
+            context_menu: None,
         }
+    }
+
+    // ----- right-click context menu -----
+
+    fn open_context_menu(&mut self, x: f32, y: f32, target: Option<(PathBuf, bool)>, cx: &mut Context<Self>) {
+        self.context_menu = Some(ContextMenu { x, y, target });
+        cx.notify();
+    }
+
+    fn close_context_menu(&mut self, cx: &mut Context<Self>) {
+        if self.context_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Re-read the current directory's contents (after a create/trash).
+    fn refresh_current(&mut self, cx: &mut Context<Self>) {
+        self.entries = read_entries(&self.current_dir);
+        cx.notify();
+    }
+
+    fn new_folder(&mut self, cx: &mut Context<Self>) {
+        let path = unique_child(&self.current_dir, "untitled folder");
+        if fs::create_dir(&path).is_ok() {
+            self.refresh_current(cx);
+        }
+    }
+
+    fn new_file(&mut self, cx: &mut Context<Self>) {
+        let path = unique_child(&self.current_dir, "untitled file");
+        if fs::File::create(&path).is_ok() {
+            self.refresh_current(cx);
+        }
+    }
+
+    fn open_path(&mut self, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
+        if is_dir {
+            self.navigate_to(path, cx);
+        } else {
+            let _ = Command::new("open").arg(&path).spawn();
+        }
+    }
+
+    fn move_to_trash(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if trash_path(&path) {
+            self.refresh_current(cx);
+        }
+    }
+
+    fn render_context_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let menu = self.context_menu.as_ref().expect("called only when open");
+        let mut items: Vec<AnyElement> = Vec::new();
+
+        if let Some((path, is_dir)) = menu.target.clone() {
+            let is_dir2 = is_dir;
+            let p_open = path.clone();
+            items.push(
+                ctx_item(
+                    if is_dir { "Open" } else { "Open" },
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_context_menu(cx);
+                        this.open_path(p_open.clone(), is_dir2, cx);
+                    }),
+                )
+                .into_any_element(),
+            );
+            let p_rev = path.clone();
+            items.push(
+                ctx_item(
+                    "Reveal in Finder",
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_context_menu(cx);
+                        let _ = Command::new("open").arg("-R").arg(&p_rev).spawn();
+                    }),
+                )
+                .into_any_element(),
+            );
+            let p_copy = path.clone();
+            items.push(
+                ctx_item(
+                    "Copy Path",
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            p_copy.to_string_lossy().into_owned(),
+                        ));
+                        this.close_context_menu(cx);
+                    }),
+                )
+                .into_any_element(),
+            );
+            let p_trash = path.clone();
+            items.push(
+                ctx_item(
+                    "Move to Trash",
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_context_menu(cx);
+                        this.move_to_trash(p_trash.clone(), cx);
+                    }),
+                )
+                .into_any_element(),
+            );
+            items.push(ctx_separator().into_any_element());
+        }
+
+        items.push(
+            ctx_item(
+                "New Folder",
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.close_context_menu(cx);
+                    this.new_folder(cx);
+                }),
+            )
+            .into_any_element(),
+        );
+        items.push(
+            ctx_item(
+                "New File",
+                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.close_context_menu(cx);
+                    this.new_file(cx);
+                }),
+            )
+            .into_any_element(),
+        );
+
+        // Full-window backdrop: any click/right-click outside closes the menu.
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| this.close_context_menu(cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, _, _, cx| this.close_context_menu(cx)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .left(px(menu.x))
+                    .top(px(menu.y))
+                    .min_w(px(200.0))
+                    .py_1()
+                    .bg(rgb(0x2a2a30))
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(0x3a3a44))
+                    .shadow_lg()
+                    // Clicks inside the menu shouldn't close it via the backdrop.
+                    .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
+                    .children(items),
+            )
+    }
+
+    /// Build the ~/ fuzzy index on a background thread, then store it.
+    fn build_index(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let index = cx
+                .background_spawn(async move { FileIndex::build(home_dir()) })
+                .await;
+            this.update(cx, |this, cx| {
+                this.index = Some(Arc::new(index));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Current scrolled distance from the top, in pixels.
@@ -330,24 +539,25 @@ impl Finder2 {
             return;
         }
 
-        // Need at least 2 chars for a name search (avoids huge 1-char results).
-        if q.chars().count() < 2 {
-            self.palette_items = self.default_commands();
-            cx.notify();
-            return;
-        }
+        // Search from the very first character (the in-memory index is fast
+        // enough). Empty queries were already handled above.
 
         cx.notify();
+        let index = self.index.clone();
         cx.spawn(async move |this, cx| {
             // Debounce: bail if a newer keystroke superseded us.
             cx.background_executor()
-                .timer(Duration::from_millis(120))
+                .timer(Duration::from_millis(40))
                 .await;
             let current = this.update(cx, |this, _| this.search_gen == gen).unwrap_or(false);
             if !current {
                 return;
             }
-            let hits = cx.background_spawn(async move { search_filesystem(&q) }).await;
+            // In-memory index (fast, true fuzzy) once built; Spotlight until then.
+            let hits = match index {
+                Some(idx) => cx.background_spawn(async move { idx.search(&q, 40) }).await,
+                None => cx.background_spawn(async move { search_filesystem(&q) }).await,
+            };
             this.update(cx, |this, cx| {
                 if this.search_gen != gen {
                     return;
@@ -442,6 +652,10 @@ impl Finder2 {
             self.toggle_palette(window, cx);
             return;
         }
+        if key == "escape" && self.context_menu.is_some() {
+            self.close_context_menu(cx);
+            return;
+        }
         if !self.palette_open {
             return;
         }
@@ -487,13 +701,9 @@ impl Finder2 {
             .enumerate()
             .map(|(i, item)| {
                 let selected = i == self.selected;
-                let glyph = if matches!(item.action, Action::CopyDir) {
-                    "⧉"
-                } else if item.is_dir {
-                    "📁"
-                } else {
-                    "📄"
-                };
+                // Real Finder icons: folder for dirs/commands, type icon for files.
+                let dir_like = item.is_dir || matches!(item.action, Action::CopyDir);
+                let icon = icon_element(Path::new(&item.subtitle), dir_like);
                 let base = div()
                     .id(("pal", i))
                     .flex()
@@ -507,7 +717,7 @@ impl Finder2 {
                 } else {
                     base.hover(|s| s.bg(rgb(0x2a2a30)))
                 };
-                base.child(div().flex_none().w(px(18.0)).child(glyph))
+                base.child(div().flex_none().w(px(18.0)).child(icon))
                     .child(
                         div()
                             .flex()
@@ -872,6 +1082,17 @@ impl Finder2 {
                     .relative()
                     .flex_1()
                     .min_h_0()
+                    // Right-click on empty list space → New Folder/File menu.
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                            let (x, y) = (
+                                f64::from(ev.position.x) as f32,
+                                f64::from(ev.position.y) as f32,
+                            );
+                            this.open_context_menu(x, y, None, cx);
+                        }),
+                    )
                     .child(uniform_list(
                     "file-list",
                     item_count,
@@ -884,7 +1105,7 @@ impl Finder2 {
                             if has_parent && ix == 0 {
                                 let parent =
                                     this.current_dir.parent().unwrap_or(Path::new("/")).to_path_buf();
-                                let icon = icon_element(&parent, "..", true);
+                                let icon = icon_element(&parent, true);
                                 items.push(
                                     file_row(
                                         "..",
@@ -896,6 +1117,15 @@ impl Finder2 {
                                         icon,
                                         cx.listener(move |this, _: &ClickEvent, _, cx| {
                                             this.navigate_to(parent.clone(), cx);
+                                        }),
+                                        // ".." → background (New Folder/File) menu.
+                                        cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                                            let (x, y) = (
+                                                f64::from(ev.position.x) as f32,
+                                                f64::from(ev.position.y) as f32,
+                                            );
+                                            this.open_context_menu(x, y, None, cx);
+                                            cx.stop_propagation();
                                         }),
                                     )
                                     .into_any_element(),
@@ -910,7 +1140,8 @@ impl Finder2 {
                             let entry_size = entry.size;
                             let modified = entry.modified;
                             let target = this.current_dir.join(&name);
-                            let icon = icon_element(&target, &name, is_dir);
+                            let ctx_target = target.clone();
+                            let icon = icon_element(&target, is_dir);
 
                             items.push(
                                 file_row(
@@ -923,6 +1154,19 @@ impl Finder2 {
                                     icon,
                                     cx.listener(move |this, _: &ClickEvent, _, cx| {
                                         this.navigate_to(target.clone(), cx);
+                                    }),
+                                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                        let (x, y) = (
+                                            f64::from(ev.position.x) as f32,
+                                            f64::from(ev.position.y) as f32,
+                                        );
+                                        this.open_context_menu(
+                                            x,
+                                            y,
+                                            Some((ctx_target.clone(), is_dir)),
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
                                     }),
                                 )
                                 .into_any_element(),
@@ -977,7 +1221,7 @@ fn header_cell(
     col: Column,
     left_pad: f32,
     align_right: bool,
-    cx: &Context<Finder2>,
+    cx: &Context<Shuffle>,
 ) -> impl IntoElement {
     let mut label_box = div().flex_1().min_w_0().truncate();
     if left_pad > 0.0 {
@@ -1016,7 +1260,7 @@ fn header_cell(
         )
 }
 
-impl Render for Finder2 {
+impl Render for Shuffle {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut root = div()
             .relative()
@@ -1046,6 +1290,9 @@ impl Render for Finder2 {
         if self.palette_open {
             root = root.child(self.render_palette(cx));
         }
+        if self.context_menu.is_some() {
+            root = root.child(self.render_context_menu(cx));
+        }
         root
     }
 }
@@ -1053,7 +1300,7 @@ impl Render for Finder2 {
 /// Build a sidebar nav item that navigates to `target`, and push it onto `items`.
 fn push_nav(
     items: &mut Vec<AnyElement>,
-    cx: &Context<Finder2>,
+    cx: &Context<Shuffle>,
     key: &mut usize,
     label: String,
     target: PathBuf,
@@ -1071,6 +1318,49 @@ fn push_nav(
         }),
     );
     items.push(item.into_any_element());
+}
+
+/// One clickable row in the right-click context menu.
+fn ctx_item(
+    label: &'static str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(label)
+        .flex()
+        .items_center()
+        .mx_1()
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .text_color(rgb(0xe0e0e6))
+        .hover(|s| s.bg(rgb(0x33334a)))
+        .child(label)
+        .on_click(on_click)
+}
+
+fn ctx_separator() -> impl IntoElement {
+    div().my_1().mx_2().h(px(1.0)).bg(rgb(0x3a3a44))
+}
+
+/// A non-existing child path under `dir` based on `base` (adds " 2", " 3" …).
+fn unique_child(dir: &Path, base: &str) -> PathBuf {
+    let mut path = dir.join(base);
+    let mut n = 2;
+    while path.exists() {
+        path = dir.join(format!("{base} {n}"));
+        n += 1;
+    }
+    path
+}
+
+/// Move a path to the macOS Trash (recoverable). Returns whether it succeeded.
+fn trash_path(path: &Path) -> bool {
+    let ns_path = NSString::from_str(&path.to_string_lossy());
+    let url = NSURL::fileURLWithPath(&ns_path);
+    let fm = NSFileManager::defaultManager();
+    fm.trashItemAtURL_resultingItemURL_error(&url, None).is_ok()
 }
 
 fn nav_item(
@@ -1126,6 +1416,7 @@ fn file_row(
     widths: ColumnWidths,
     icon: AnyElement,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let kind = kind_label(name, is_dir);
     let name_color = if is_dir { 0x7aa2f7 } else { 0xe0e0e6 };
@@ -1198,6 +1489,7 @@ fn file_row(
         // Slack space after the last column (keeps row hover full-width).
         .child(div().flex_1())
         .on_click(on_click)
+        .on_mouse_down(MouseButton::Right, on_right)
 }
 
 /// A human-readable kind label for a file (e.g. "Microsoft Excel", "DWG File").
@@ -1243,42 +1535,18 @@ fn kind_label(name: &str, is_dir: bool) -> String {
     }
 }
 
-/// Emoji fallback when a real macOS icon can't be produced.
-fn icon_glyph(name: &str, is_dir: bool) -> &'static str {
-    if is_dir {
-        return "📁";
-    }
-    let ext = Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_lowercase());
-    match ext.as_deref() {
-        Some("xlsx" | "xls" | "xlsm" | "xlsb") => "📊",
-        Some("docx" | "doc") => "📝",
-        Some("pptx" | "ppt") => "📽",
-        Some("pdf") => "📕",
-        Some("csv" | "tsv") => "📑",
-        Some("dwg" | "dxf") => "📐",
-        Some("png" | "jpg" | "jpeg" | "gif" | "bmp" | "tiff" | "heic" | "webp" | "svg") => "🖼",
-        Some("mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v") => "🎬",
-        Some("mp3" | "wav" | "flac" | "aac" | "m4a" | "ogg") => "🎵",
-        Some("zip" | "tar" | "gz" | "7z" | "rar" | "bz2" | "xz" | "dmg") => "🗜",
-        Some("app") => "📦",
-        _ => "📄",
-    }
-}
-
 /// Build the icon element for an entry: a real macOS file-type icon when we can
 /// fetch one, otherwise an emoji fallback. Directories always use the folder
 /// emoji (per design — folder icon stays as-is for now).
-fn icon_element(path: &Path, name: &str, is_dir: bool) -> AnyElement {
-    // Cache-only lookup — never build on the render thread. Missing icons show
-    // the emoji placeholder until the background pre-warm fills them in.
-    // Directories share one generic macOS folder icon; files key by extension.
+fn icon_element(path: &Path, is_dir: bool) -> AnyElement {
+    // Cache-only lookup — never build on the render thread. Directories use the
+    // shared generic folder icon (built synchronously at startup, so no emoji
+    // placeholder). Files use their type-specific icon once the background
+    // pre-warm has it, otherwise the shared generic file icon.
     let handle = if is_dir {
         lookup_cached(FOLDER_KEY)
     } else {
-        lookup_icon(path)
+        lookup_icon(path).or_else(|| lookup_cached(FILE_KEY))
     };
     if let Some(handle) = handle {
         return img(ImageSource::Render(handle))
@@ -1286,7 +1554,10 @@ fn icon_element(path: &Path, name: &str, is_dir: bool) -> AnyElement {
             .h(px(16.0))
             .into_any_element();
     }
-    div().child(icon_glyph(name, is_dir)).into_any_element()
+    // Last resort only if the base icons couldn't be built.
+    div()
+        .child(if is_dir { "📁" } else { "📄" })
+        .into_any_element()
 }
 
 thread_local! {
@@ -1326,6 +1597,33 @@ fn folder_dir_path() -> PathBuf {
     let dir = config_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
     let _ = fs::create_dir_all(&dir);
     dir
+}
+
+/// A guaranteed-plain, extensionless file whose icon is the generic macOS
+/// document icon.
+fn file_probe_path() -> PathBuf {
+    let probe = folder_dir_path().join("icon_probe");
+    if !probe.exists() {
+        let _ = fs::write(&probe, b"");
+    }
+    probe
+}
+
+/// Build the generic folder + file icons synchronously (a few ms, once) so the
+/// very first render shows real Finder icons — no emoji placeholder / swap.
+fn ensure_base_icons() {
+    if ICON_CACHE.with(|c| !c.borrow().contains_key(FOLDER_KEY)) {
+        let icon = build_macos_icon(&folder_dir_path());
+        ICON_CACHE.with(|c| {
+            c.borrow_mut().insert(FOLDER_KEY.to_string(), icon);
+        });
+    }
+    if ICON_CACHE.with(|c| !c.borrow().contains_key(FILE_KEY)) {
+        let icon = build_macos_icon(&file_probe_path());
+        ICON_CACHE.with(|c| {
+            c.borrow_mut().insert(FILE_KEY.to_string(), icon);
+        });
+    }
 }
 
 /// Ask NSWorkspace for `path`'s icon, decode it, and convert to a GPUI image.
@@ -1557,8 +1855,231 @@ fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
     Some(score)
 }
 
+/// One entry in the in-memory file index.
+struct IndexEntry {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+}
+
+/// A flat, in-memory index of everything under a root directory, used for fast
+/// fuzzy search without spawning Spotlight.
+struct FileIndex {
+    entries: Vec<IndexEntry>,
+}
+
+/// Non-hidden directory names we never descend into (huge + irrelevant to file
+/// search). Hidden dirs (dotfiles like .bun, .pyenv, .cargo, .git, .Trash) are
+/// skipped wholesale via `skip_hidden`, which removes the bulk of the noise.
+const SKIP_DIRS: &[&str] = &["node_modules", "Library"];
+
+impl FileIndex {
+    /// Walk `root` in parallel (jwalk), skipping hidden dirs and noise dirs,
+    /// into a flat list. Runs off the UI thread.
+    fn build(root: PathBuf) -> Self {
+        let walker = jwalk::WalkDir::new(&root)
+            .skip_hidden(true)
+            .process_read_dir(|_depth, _path, _state, children| {
+                children.retain(|res| match res {
+                    Ok(e) => {
+                        if e.file_type().is_dir() {
+                            let name = e.file_name();
+                            let name = name.to_string_lossy();
+                            !SKIP_DIRS.contains(&name.as_ref())
+                        } else {
+                            true
+                        }
+                    }
+                    Err(_) => false,
+                });
+            });
+
+        let mut entries = Vec::new();
+        for entry in walker {
+            let Ok(e) = entry else { continue };
+            if e.depth() == 0 {
+                continue; // the root itself
+            }
+            let is_dir = e.file_type().is_dir();
+            let name = e.file_name().to_string_lossy().into_owned();
+            entries.push(IndexEntry {
+                name,
+                path: e.path(),
+                is_dir,
+            });
+        }
+        FileIndex { entries }
+    }
+
+    /// Fuzzy-rank the index against `query` in parallel; return the top `limit`.
+    fn search(&self, query: &str, limit: usize) -> Vec<(String, PathBuf, bool)> {
+        let q: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
+        if q.is_empty() {
+            return Vec::new();
+        }
+        let q_str: String = q.iter().collect();
+        let q_bigrams: Vec<(char, char)> = q.windows(2).map(|w| (w[0], w[1])).collect();
+        let mut scored: Vec<(i32, usize)> = self
+            .entries
+            .par_iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                rank_entry(&q, &q_str, &q_bigrams, &e.name, &e.path, e.is_dir).map(|s| (s, i))
+            })
+            .collect();
+        scored.sort_unstable_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| self.entries[a.1].name.len().cmp(&self.entries[b.1].name.len()))
+        });
+        scored.truncate(limit);
+        scored
+            .into_iter()
+            .map(|(_, i)| {
+                let e = &self.entries[i];
+                (e.name.clone(), e.path.clone(), e.is_dir)
+            })
+            .collect()
+    }
+}
+
+fn is_word_boundary(c: char) -> bool {
+    matches!(c, '/' | ' ' | '_' | '-' | '.')
+}
+
+/// Allocation-free Sørensen–Dice over character bigrams: query bigrams are
+/// pre-computed (lowercased); the name is lowercased on the fly. Tolerant of
+/// typos/transpositions (e.g. "dcouments" vs "documents"). Fast enough to run
+/// on every index entry that fails the subsequence test.
+fn name_bigram_dice(q_bigrams: &[(char, char)], name: &str) -> f32 {
+    let qn = q_bigrams.len();
+    if qn == 0 {
+        return 0.0;
+    }
+    let cap = qn.min(64);
+    let mut used = [false; 64];
+    let mut inter = 0usize;
+    let mut name_bigrams = 0usize;
+    let mut prev: Option<char> = None;
+    for ch in name.chars() {
+        let lc = ch.to_ascii_lowercase();
+        if let Some(p) = prev {
+            name_bigrams += 1;
+            for i in 0..cap {
+                if !used[i] && q_bigrams[i] == (p, lc) {
+                    used[i] = true;
+                    inter += 1;
+                    break;
+                }
+            }
+        }
+        prev = Some(lc);
+    }
+    if name_bigrams == 0 {
+        return 0.0;
+    }
+    2.0 * inter as f32 / (qn + name_bigrams) as f32
+}
+
+/// Rank one candidate: prefer a real subsequence match (`score_entry`); if it
+/// isn't a subsequence, fall back to typo-tolerant bigram similarity so
+/// transposed/misspelled queries still surface the right file.
+fn rank_entry(
+    q: &[char],
+    q_str: &str,
+    q_bigrams: &[(char, char)],
+    name: &str,
+    path: &Path,
+    is_dir: bool,
+) -> Option<i32> {
+    if let Some(s) = score_entry(q, q_str, name, path, is_dir) {
+        return Some(s);
+    }
+    let sim = name_bigram_dice(q_bigrams, name);
+    if sim < 0.5 {
+        return None;
+    }
+    let mut score = (sim * 1500.0) as i32;
+    let name_len = name.chars().count() as i32;
+    score -= (name_len - q.len() as i32).max(0) * 4; // coverage
+    score -= path.components().count() as i32 * 8; // depth
+    if is_dir {
+        score += 40;
+    }
+    Some(score)
+}
+
+/// Full ranking of one candidate: subsequence gate + strong exact/prefix
+/// bonuses, a coverage penalty (favor names close to the query length), and a
+/// path-depth penalty (shallower = closer to home = ranked higher). Shared by
+/// the in-memory index and the Spotlight fallback so ranking is consistent.
+/// `q_str` is the lowercased query string; `q` its chars.
+fn score_entry(q: &[char], q_str: &str, name: &str, path: &Path, is_dir: bool) -> Option<i32> {
+    let mut score = index_score(q, name)?;
+    let name_lc = name.to_lowercase();
+
+    if name_lc == q_str {
+        score += 100_000; // exact name match — always wins
+    } else {
+        let stem = name_lc.rsplit_once('.').map(|(s, _)| s).unwrap_or(&name_lc);
+        if stem == q_str {
+            score += 60_000; // name without extension matches
+        }
+    }
+    if name_lc.starts_with(q_str) {
+        score += 5_000;
+    } else if name_lc.contains(q_str) {
+        score += 1_500;
+    }
+
+    // Coverage: the closer the name's length is to the query, the better
+    // ("Documents" beats "DocumentSymbolProvider.js" for "documents").
+    let name_len = name.chars().count() as i32;
+    score -= (name_len - q.len() as i32).max(0) * 4;
+    // Depth: shallower paths (closer to home) rank higher.
+    score -= path.components().count() as i32 * 8;
+    if is_dir {
+        score += 40;
+    }
+    Some(score)
+}
+
+/// Allocation-free subsequence fuzzy score (fzf-style). `query` is pre-lowercased.
+/// Returns `None` if `query` isn't a subsequence of `name`. Rewards contiguous
+/// runs and word-start matches; lightly penalizes length. Built for speed —
+/// called on every index entry, every keystroke.
+fn index_score(query: &[char], name: &str) -> Option<i32> {
+    let mut qi = 0;
+    let mut score = 0i32;
+    let mut last: i32 = -2;
+    let mut idx: i32 = 0;
+    let mut prev = '/'; // treat string start as a boundary
+    for ch in name.chars() {
+        if qi >= query.len() {
+            break;
+        }
+        if ch.to_ascii_lowercase() == query[qi] {
+            if idx == last + 1 {
+                score += 6;
+            }
+            if idx == 0 || is_word_boundary(prev) {
+                score += 10;
+            }
+            score -= idx / 4;
+            last = idx;
+            qi += 1;
+        }
+        prev = ch;
+        idx += 1;
+    }
+    if qi == query.len() {
+        Some(score - idx / 8)
+    } else {
+        None
+    }
+}
+
 /// Spotlight-backed name search: gather candidates with `mdfind`, then fuzzy
-/// rank by filename. Runs on a background thread (blocking is fine there).
+/// rank by filename. Used as a fallback while the in-memory index is building.
 fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
     let mut child = match Command::new("mdfind")
         .arg("-name")
@@ -1576,6 +2097,10 @@ fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
         return Vec::new();
     };
 
+    // Same ranking as the in-memory index (is_dir unknown pre-stat → false; the
+    // exact/prefix/coverage/depth signals still rank "Documents" correctly).
+    let q: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
+    let q_str: String = q.iter().collect();
     let mut scored: Vec<(i32, String, PathBuf)> = Vec::new();
     // Cap how much we read so a broad query can't stall us.
     for line in BufReader::new(stdout).lines().take(4000) {
@@ -1587,7 +2112,7 @@ fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
         let Some(name) = path.file_name().map(|n| n.to_string_lossy().into_owned()) else {
             continue;
         };
-        if let Some(score) = fuzzy_score(query, &name) {
+        if let Some(score) = score_entry(&q, &q_str, &name, &path, false) {
             scored.push((score, name, path));
         }
     }
@@ -1637,7 +2162,7 @@ fn username() -> String {
 
 fn config_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
-        .map(|h| PathBuf::from(h).join("Library/Application Support/finder2"))
+        .map(|h| PathBuf::from(h).join("Library/Application Support/Shuffle"))
 }
 
 fn config_file(name: &str) -> Option<PathBuf> {
@@ -1698,22 +2223,115 @@ fn write_path_list(name: &str, paths: &[PathBuf]) {
 }
 
 fn main() {
+    // Hidden benchmark mode: `shuffle --index-bench <query>` builds the ~/ index
+    // and runs a search, printing timings and the top hits, then exits.
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() >= 3 && args[1] == "--index-bench" {
+        let t0 = std::time::Instant::now();
+        let index = FileIndex::build(home_dir());
+        eprintln!(
+            "index: {} entries built in {} ms",
+            index.entries.len(),
+            t0.elapsed().as_millis()
+        );
+        let t1 = std::time::Instant::now();
+        let hits = index.search(&args[2], 10);
+        eprintln!(
+            "search {:?}: {} hits in {} µs",
+            args[2],
+            hits.len(),
+            t1.elapsed().as_micros()
+        );
+        for (name, path, is_dir) in hits {
+            eprintln!(
+                "  {} {:<28} {}",
+                if is_dir { "DIR " } else { "file" },
+                name,
+                path.display()
+            );
+        }
+        return;
+    }
+
+    // Synthetic, disk-free validation of typo ranking.
+    if args.len() >= 2 && args[1] == "--typo-test" {
+        let mk = |p: &str, is_dir: bool| {
+            let path = PathBuf::from(p);
+            IndexEntry {
+                name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                path,
+                is_dir,
+            }
+        };
+        let index = FileIndex {
+            entries: vec![
+                mk("/Users/guzma/Documents", true),
+                mk("/Users/guzma/Downloads", true),
+                mk("/Users/guzma/Music", true),
+                mk("/Users/guzma/go/pkg/mod/x/spec-example-documents", true),
+                mk("/Users/guzma/Documents/foo/DocumentSummaryInformation", false),
+                mk("/Users/guzma/Documents/report.docx", false),
+            ],
+        };
+        for q in ["documents", "dcouments", "documnets", "dwnloads", "musc"] {
+            let hits = index.search(q, 3);
+            eprintln!(
+                "{:?} -> {:?}",
+                q,
+                hits.iter().map(|h| h.0.clone()).collect::<Vec<_>>()
+            );
+        }
+        return;
+    }
+
     Application::new().run(|cx: &mut App| {
+        // Menu bar: app menu with Settings + Quit, plus their shortcuts.
+        cx.bind_keys([
+            KeyBinding::new("cmd-,", OpenSettings, None),
+            KeyBinding::new("cmd-q", Quit, None),
+        ]);
+        cx.set_menus(vec![Menu {
+            name: "Shuffle".into(),
+            items: vec![
+                MenuItem::action("Settings…", OpenSettings),
+                MenuItem::separator(),
+                MenuItem::action("Quit Shuffle", Quit),
+            ],
+        }]);
+        cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
+        cx.on_action(|_: &OpenSettings, cx: &mut App| {
+            let bounds = Bounds::centered(None, size(px(560.0), px(420.0)), cx);
+            cx.open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Settings".into()),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                |_window, cx| cx.new(|_cx| Settings),
+            )
+            .ok();
+            cx.activate(true);
+        });
+
         let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
 
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("finder2".into()),
+                    title: Some("Shuffle".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
             },
             |window, cx| {
                 let view = cx.new(|cx| {
-                    let finder = Finder2::new(load_last_dir(), cx);
+                    let finder = Shuffle::new(load_last_dir(), cx);
                     finder.prewarm_icons(cx);
+                    finder.build_index(cx);
                     finder
                 });
                 // Focus the root so it receives keystrokes (Cmd+P) immediately.
