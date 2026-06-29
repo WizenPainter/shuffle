@@ -146,6 +146,8 @@ enum Action {
     Open(PathBuf, bool),
     /// Copy the current directory's path to the clipboard.
     CopyDir,
+    /// Open the Settings window.
+    OpenSettings,
     /// Inert (e.g. "path not found").
     None,
 }
@@ -181,6 +183,19 @@ struct Shuffle {
     entries: Vec<Entry>,
     recents: Vec<PathBuf>,
     bookmarks: Vec<PathBuf>,
+    /// Back/forward navigation history and our position within it.
+    history: Vec<PathBuf>,
+    hist_pos: usize,
+    /// Deepest directory visited along the current lineage. When we move up to
+    /// an ancestor, the breadcrumb keeps showing this path's trailing segments
+    /// (grayed out) so the user can click forward into them again.
+    deepest: Option<PathBuf>,
+    /// When `Some`, the path bar is an editable text field holding this string.
+    editing_path: Option<String>,
+    /// When `Some`, an in-directory "find" filter is active (opened by `/`).
+    /// `find_results` holds the matching `entries` indices, best match first.
+    find_query: Option<String>,
+    find_results: Vec<usize>,
     widths: ColumnWidths,
     resize: Option<Resize>,
     scroll_handle: UniformListScrollHandle,
@@ -203,10 +218,16 @@ impl Shuffle {
         ensure_base_icons(); // real folder/file icons ready before first render
         let entries = read_entries(&dir);
         Self {
-            current_dir: dir,
+            current_dir: dir.clone(),
             entries,
             recents: read_path_list("recents.txt"),
             bookmarks: read_path_list("bookmarks.txt"),
+            history: vec![dir.clone()],
+            hist_pos: 0,
+            deepest: Some(dir),
+            editing_path: None,
+            find_query: None,
+            find_results: Vec::new(),
             widths: ColumnWidths::default(),
             resize: None,
             scroll_handle: UniformListScrollHandle::new(),
@@ -542,6 +563,10 @@ impl Shuffle {
         // Search from the very first character (the in-memory index is fast
         // enough). Empty queries were already handled above.
 
+        // Built-in commands (e.g. Settings) show instantly, ahead of the
+        // async file results, so typing "settings" surfaces it immediately.
+        self.palette_items = command_matches(&q);
+        self.selected = 0;
         cx.notify();
         let index = self.index.clone();
         cx.spawn(async move |this, cx| {
@@ -554,26 +579,26 @@ impl Shuffle {
                 return;
             }
             // In-memory index (fast, true fuzzy) once built; Spotlight until then.
+            let qs = q.clone();
             let hits = match index {
-                Some(idx) => cx.background_spawn(async move { idx.search(&q, 40) }).await,
-                None => cx.background_spawn(async move { search_filesystem(&q) }).await,
+                Some(idx) => cx.background_spawn(async move { idx.search(&qs, 40) }).await,
+                None => cx.background_spawn(async move { search_filesystem(&qs) }).await,
             };
             this.update(cx, |this, cx| {
                 if this.search_gen != gen {
                     return;
                 }
-                this.palette_items = hits
-                    .into_iter()
-                    .map(|(name, path, is_dir)| {
-                        let subtitle = path.to_string_lossy().into_owned();
-                        PaletteItem {
-                            title: name,
-                            subtitle,
-                            action: Action::Open(path, is_dir),
-                            is_dir,
-                        }
-                    })
-                    .collect();
+                let mut items = command_matches(&q);
+                items.extend(hits.into_iter().map(|(name, path, is_dir)| {
+                    let subtitle = path.to_string_lossy().into_owned();
+                    PaletteItem {
+                        title: name,
+                        subtitle,
+                        action: Action::Open(path, is_dir),
+                        is_dir,
+                    }
+                }));
+                this.palette_items = items;
                 this.selected = 0;
                 cx.notify();
             })
@@ -638,6 +663,10 @@ impl Shuffle {
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.close_palette(cx);
             }
+            Action::OpenSettings => {
+                self.close_palette(cx);
+                open_settings_window(cx);
+            }
             Action::None => {}
         }
     }
@@ -648,6 +677,18 @@ impl Shuffle {
         let cmd = ks.modifiers.platform;
         let key = ks.key.as_str();
 
+        // While editing the path bar, keys feed the text field.
+        if self.editing_path.is_some() {
+            self.handle_path_edit_key(ev, cx);
+            return;
+        }
+
+        // While the in-directory find bar is open, keys feed the filter.
+        if self.find_query.is_some() {
+            self.handle_find_key(ev, cx);
+            return;
+        }
+
         if cmd && key == "p" {
             self.toggle_palette(window, cx);
             return;
@@ -657,6 +698,10 @@ impl Shuffle {
             return;
         }
         if !self.palette_open {
+            // Typing "/" in the listing opens the in-directory find filter.
+            if !cmd && key == "/" {
+                self.open_find(cx);
+            }
             return;
         }
 
@@ -884,14 +929,21 @@ impl Shuffle {
         self.resize = None;
     }
 
-    /// Navigate into `dir` if it is a directory: re-read its contents, record it
-    /// as the most-recent location, and persist both the last dir and recents.
-    fn navigate_to(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        if !dir.is_dir() {
-            return;
-        }
+    /// Load `dir` as the current directory: re-read contents, update the
+    /// breadcrumb's deepest-tail, record it as most-recent, and persist. Does
+    /// NOT touch back/forward history (callers manage that).
+    fn load_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
         self.entries = read_entries(&dir);
+        // Keep the grayed-out forward tail in the breadcrumb when moving to an
+        // ancestor of where we were; otherwise the tail resets to here.
+        let keep = self.deepest.as_ref().is_some_and(|d| d.starts_with(&dir));
+        if !keep {
+            self.deepest = Some(dir.clone());
+        }
         self.current_dir = dir;
+        self.editing_path = None;
+        self.find_query = None;
+        self.find_results.clear();
         save_last_dir(&self.current_dir);
 
         self.recents.retain(|p| p != &self.current_dir);
@@ -901,6 +953,231 @@ impl Shuffle {
 
         cx.notify();
         self.prewarm_icons(cx);
+    }
+
+    /// Navigate into `dir` if it is a directory. New navigation truncates any
+    /// forward history, then appends `dir` as the new tip.
+    fn navigate_to(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if !dir.is_dir() || dir == self.current_dir {
+            return;
+        }
+        self.history.truncate(self.hist_pos + 1);
+        self.history.push(dir.clone());
+        self.hist_pos = self.history.len() - 1;
+        self.load_dir(dir, cx);
+    }
+
+    /// Go to the previous directory in history (the back arrow).
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        if self.hist_pos == 0 {
+            return;
+        }
+        self.hist_pos -= 1;
+        let dir = self.history[self.hist_pos].clone();
+        self.load_dir(dir, cx);
+    }
+
+    /// Go to the next directory in history (the forward arrow).
+    fn go_forward(&mut self, cx: &mut Context<Self>) {
+        if self.hist_pos + 1 >= self.history.len() {
+            return;
+        }
+        self.hist_pos += 1;
+        let dir = self.history[self.hist_pos].clone();
+        self.load_dir(dir, cx);
+    }
+
+    /// Enter path-edit mode: the bar becomes an editable text field.
+    fn begin_path_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_path = Some(self.current_dir.display().to_string());
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    /// Keystrokes while the path bar is being edited.
+    fn handle_path_edit_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let cmd = ks.modifiers.platform;
+        match ks.key.as_str() {
+            "escape" => {
+                self.editing_path = None;
+                cx.notify();
+            }
+            "enter" => {
+                if let Some(text) = self.editing_path.take() {
+                    let path = expand_path(text.trim());
+                    if path.is_dir() {
+                        self.navigate_to(path, cx);
+                    }
+                }
+                cx.notify();
+            }
+            "backspace" => {
+                if let Some(s) = self.editing_path.as_mut() {
+                    s.pop();
+                }
+                cx.notify();
+            }
+            "c" if cmd => {
+                if let Some(s) = &self.editing_path {
+                    cx.write_to_clipboard(ClipboardItem::new_string(s.clone()));
+                }
+            }
+            "v" if cmd => {
+                if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                    if let Some(s) = self.editing_path.as_mut() {
+                        s.push_str(t.trim());
+                    }
+                    cx.notify();
+                }
+            }
+            _ => {
+                if cmd {
+                    return; // leave other Cmd-combos alone
+                }
+                if let Some(ch) = ks.key_char.as_ref() {
+                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
+                        if let Some(s) = self.editing_path.as_mut() {
+                            s.push_str(ch);
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
+    // ----- in-directory find (the "/" filter) -----
+
+    /// Open the find bar, filtering only the current directory.
+    fn open_find(&mut self, cx: &mut Context<Self>) {
+        self.find_query = Some(String::new());
+        self.recompute_find();
+        cx.notify();
+    }
+
+    /// Recompute `find_results` from the current find query. Empty query shows
+    /// every entry; otherwise filters + ranks by similarity (typo-tolerant).
+    fn recompute_find(&mut self) {
+        let Some(q) = self.find_query.as_deref() else {
+            return;
+        };
+        let q = q.trim();
+        if q.is_empty() {
+            self.find_results = (0..self.entries.len()).collect();
+            return;
+        }
+        let mut scored: Vec<(i32, usize)> = self
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| find_score(q, &e.name).map(|s| (s, i)))
+            .collect();
+        // Best score first; ties → dirs first, then alphabetical.
+        scored.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| self.entries[b.1].is_dir.cmp(&self.entries[a.1].is_dir))
+                .then_with(|| {
+                    self.entries[a.1]
+                        .name
+                        .to_lowercase()
+                        .cmp(&self.entries[b.1].name.to_lowercase())
+                })
+        });
+        self.find_results = scored.into_iter().map(|(_, i)| i).collect();
+    }
+
+    /// Keystrokes while the find bar is open.
+    fn handle_find_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let cmd = ks.modifiers.platform;
+        match ks.key.as_str() {
+            "escape" => {
+                self.find_query = None;
+                self.find_results.clear();
+                cx.notify();
+            }
+            "enter" => {
+                // Open the top match: navigate into dirs, open files.
+                if let Some(&i) = self.find_results.first() {
+                    let entry = &self.entries[i];
+                    let target = self.current_dir.join(&entry.name);
+                    let is_dir = entry.is_dir;
+                    self.find_query = None;
+                    self.find_results.clear();
+                    self.open_path(target, is_dir, cx);
+                } else {
+                    cx.notify();
+                }
+            }
+            "backspace" => {
+                if let Some(s) = self.find_query.as_mut() {
+                    s.pop();
+                }
+                self.recompute_find();
+                cx.notify();
+            }
+            "v" if cmd => {
+                if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                    if let Some(s) = self.find_query.as_mut() {
+                        s.push_str(t.trim());
+                    }
+                    self.recompute_find();
+                    cx.notify();
+                }
+            }
+            _ => {
+                if cmd {
+                    return;
+                }
+                if let Some(ch) = ks.key_char.as_ref() {
+                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
+                        if let Some(s) = self.find_query.as_mut() {
+                            s.push_str(ch);
+                        }
+                        self.recompute_find();
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
+    /// The floating filter box, anchored bottom-right while find is active.
+    fn render_find_box(&self, query: &str) -> impl IntoElement {
+        let count = self.find_results.len();
+        div()
+            .absolute()
+            .bottom(px(16.0))
+            .right(px(16.0))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_lg()
+            .bg(rgba(0x24242cf2))
+            .border_1()
+            .border_color(rgb(0x4a4a6a))
+            .shadow_lg()
+            .text_color(rgb(0xf0f0f4))
+            .child(div().flex_none().text_color(rgb(0x8a8a94)).child("Filter"))
+            .child(if query.is_empty() {
+                div()
+                    .min_w(px(80.0))
+                    .text_color(rgb(0x6f6f78))
+                    .child("type to filter…")
+            } else {
+                div().min_w(px(80.0)).child(query.to_string())
+            })
+            .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(0xc8c8d0)))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(0x8a8a94))
+                    .text_xs()
+                    .child(format!("{count}")),
+            )
     }
 
     /// Build macOS file-type icons for the current directory off the render
@@ -1050,28 +1327,134 @@ impl Shuffle {
             .children(items)
     }
 
+    /// The top bar: back/forward arrows then either the clickable breadcrumb
+    /// or, in edit mode, an editable text field.
+    fn render_path_bar(&self, cx: &Context<Self>) -> impl IntoElement {
+        let can_back = self.hist_pos > 0;
+        let can_fwd = self.hist_pos + 1 < self.history.len();
+
+        let content: AnyElement = if let Some(text) = &self.editing_path {
+            self.render_path_editor(text).into_any_element()
+        } else {
+            self.render_breadcrumb(cx).into_any_element()
+        };
+
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .border_b_1()
+            .border_color(rgb(0x303036))
+            .child(nav_arrow(
+                "nav-back",
+                "‹",
+                can_back,
+                cx.listener(|this, _, _, cx| this.go_back(cx)),
+            ))
+            .child(nav_arrow(
+                "nav-fwd",
+                "›",
+                can_fwd,
+                cx.listener(|this, _, _, cx| this.go_forward(cx)),
+            ))
+            .child(content)
+    }
+
+    /// Clickable breadcrumb. Segments up to and including the current directory
+    /// are bright; any deeper "forward tail" is grayed but still clickable.
+    /// Empty space to the right enters edit mode.
+    fn render_breadcrumb(&self, cx: &Context<Self>) -> impl IntoElement {
+        use std::path::Component;
+
+        // Show the deepest tail if the current dir is an ancestor of it.
+        let display = match &self.deepest {
+            Some(d) if d.starts_with(&self.current_dir) => d.clone(),
+            _ => self.current_dir.clone(),
+        };
+
+        let mut segs: Vec<AnyElement> = Vec::new();
+        let mut acc = PathBuf::new();
+        let mut idx = 0usize;
+        for comp in display.components() {
+            let (label, full) = match comp {
+                Component::RootDir => {
+                    acc.push("/");
+                    ("Macintosh HD".to_string(), acc.clone())
+                }
+                Component::Normal(s) => {
+                    acc.push(s);
+                    (s.to_string_lossy().into_owned(), acc.clone())
+                }
+                _ => continue,
+            };
+            if idx > 0 {
+                segs.push(breadcrumb_sep());
+            }
+            let active = self.current_dir.starts_with(&full);
+            segs.push(breadcrumb_seg(idx, label, full, active, cx));
+            idx += 1;
+        }
+
+        div()
+            .id("breadcrumb")
+            .flex()
+            .items_center()
+            .flex_1()
+            .min_w_0()
+            .h(px(22.0))
+            .children(segs)
+            // Filler captures clicks on the empty part of the bar → edit mode.
+            .child(
+                div()
+                    .id("path-edit-zone")
+                    .flex_1()
+                    .h_full()
+                    .min_w_0()
+                    .cursor_text()
+                    .on_click(cx.listener(|this, _, window, cx| this.begin_path_edit(window, cx))),
+            )
+    }
+
+    /// The editable address-bar field shown in edit mode.
+    fn render_path_editor(&self, text: &str) -> impl IntoElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .items_center()
+            .px_2()
+            .h(px(22.0))
+            .rounded_md()
+            .bg(rgb(0x2a2a30))
+            .border_1()
+            .border_color(rgb(0x4a4a6a))
+            .text_color(rgb(0xf0f0f4))
+            .child(div().min_w_0().child(text.to_string()))
+            // Blinking would need a timer; a static caret reads clearly enough.
+            .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(0xc8c8d0)))
+    }
+
     fn render_main(&self, cx: &Context<Self>) -> impl IntoElement {
-        let path_label = self.current_dir.display().to_string();
-        // A leading ".." row exists only when there's a parent to go up to.
-        let has_parent = self.current_dir.parent().is_some();
-        let item_count = self.entries.len() + usize::from(has_parent);
+        // In find mode the list shows the filtered results (no ".." row);
+        // otherwise the full directory with a leading ".." when there's a parent.
+        let find_active = self.find_query.is_some();
+        let has_parent = !find_active && self.current_dir.parent().is_some();
+        let item_count = if find_active {
+            self.find_results.len()
+        } else {
+            self.entries.len() + usize::from(has_parent)
+        };
 
         div()
             .flex_1()
             .flex()
             .flex_col()
             .min_w_0()
-            // Path bar.
-            .child(
-                div()
-                    .flex_none()
-                    .px_3()
-                    .py_2()
-                    .border_b_1()
-                    .border_color(rgb(0x303036))
-                    .text_color(rgb(0x9a9aa2))
-                    .child(path_label),
-            )
+            // Path bar: back/forward arrows + clickable breadcrumb (or editor).
+            .child(self.render_path_bar(cx))
             // Column header.
             .child(self.column_header(cx))
             // Virtualized listing: only the visible rows (and their icons) are
@@ -1098,7 +1481,8 @@ impl Shuffle {
                     item_count,
                     cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
                         let widths = this.widths;
-                        let has_parent = this.current_dir.parent().is_some();
+                        let find_active = this.find_query.is_some();
+                        let has_parent = !find_active && this.current_dir.parent().is_some();
                         let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
 
                         for ix in range {
@@ -1133,7 +1517,13 @@ impl Shuffle {
                                 continue;
                             }
 
-                            let entry_ix = if has_parent { ix - 1 } else { ix };
+                            let entry_ix = if find_active {
+                                this.find_results[ix]
+                            } else if has_parent {
+                                ix - 1
+                            } else {
+                                ix
+                            };
                             let entry = &this.entries[entry_ix];
                             let name = entry.name.clone();
                             let is_dir = entry.is_dir;
@@ -1287,6 +1677,9 @@ impl Render for Shuffle {
             .child(self.render_sidebar(cx))
             .child(self.render_main(cx));
 
+        if let Some(q) = &self.find_query {
+            root = root.child(self.render_find_box(q));
+        }
         if self.palette_open {
             root = root.child(self.render_palette(cx));
         }
@@ -1318,6 +1711,100 @@ fn push_nav(
         }),
     );
     items.push(item.into_any_element());
+}
+
+/// A back/forward navigation arrow. Dimmed and inert when `enabled` is false.
+fn nav_arrow(
+    id: &'static str,
+    glyph: &'static str,
+    enabled: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let base = div()
+        .id(id)
+        .flex_none()
+        .w(px(22.0))
+        .h(px(22.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded_md()
+        .text_color(if enabled { rgb(0xc8c8d0) } else { rgb(0x55555c) })
+        .child(glyph);
+    if enabled {
+        base.cursor_pointer()
+            .hover(|s| s.bg(rgb(0x303036)))
+            .on_click(on_click)
+            .into_any_element()
+    } else {
+        base.into_any_element()
+    }
+}
+
+/// One clickable breadcrumb segment that navigates to `full` when clicked.
+fn breadcrumb_seg(
+    idx: usize,
+    label: String,
+    full: PathBuf,
+    active: bool,
+    cx: &Context<Shuffle>,
+) -> AnyElement {
+    div()
+        .id(("crumb", idx))
+        .flex_none()
+        .px_1()
+        .h(px(20.0))
+        .flex()
+        .items_center()
+        .rounded_md()
+        .cursor_pointer()
+        .text_color(if active { rgb(0xd8d8e0) } else { rgb(0x70707a) })
+        .hover(|s| s.bg(rgb(0x303036)).text_color(rgb(0xf0f0f4)))
+        .child(label)
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.navigate_to(full.clone(), cx);
+            cx.stop_propagation();
+        }))
+        .into_any_element()
+}
+
+/// The "/" divider between breadcrumb segments.
+fn breadcrumb_sep() -> AnyElement {
+    div()
+        .flex_none()
+        .px(px(2.0))
+        .text_color(rgb(0x4a4a52))
+        .child("/")
+        .into_any_element()
+}
+
+/// Expand a leading `~` to the home directory.
+fn expand_path(s: &str) -> PathBuf {
+    if s == "~" {
+        home_dir()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        home_dir().join(rest)
+    } else {
+        PathBuf::from(s)
+    }
+}
+
+/// Open the Settings window (shared by the menu action and the palette).
+fn open_settings_window(cx: &mut App) {
+    let bounds = Bounds::centered(None, size(px(560.0), px(420.0)), cx);
+    cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("Settings".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        |_window, cx| cx.new(|_cx| Settings),
+    )
+    .ok();
+    cx.activate(true);
 }
 
 /// One clickable row in the right-click context menu.
@@ -1793,6 +2280,50 @@ fn dice(a: &str, b: &str) -> f32 {
 
 /// Typo-tolerant match score of a partial name against a candidate name.
 /// Combines exact/prefix/substring/subsequence signals with Dice similarity.
+/// Score one directory entry against the in-directory find query. Returns
+/// `None` for non-matches so they're filtered out. Subsequence matches rank
+/// highest; close typos (Sørensen–Dice ≥ 0.5) still match so "dcouments"
+/// finds "Documents".
+fn find_score(q: &str, name: &str) -> Option<i32> {
+    let ql = q.to_lowercase();
+    let nl = name.to_lowercase();
+    let penalty = nl.len() as i32 / 4;
+    if nl == ql {
+        return Some(100_000);
+    }
+    if nl.starts_with(&ql) {
+        return Some(50_000 - penalty);
+    }
+    if let Some(fs) = fuzzy_score(&ql, &nl) {
+        return Some(10_000 + fs - penalty);
+    }
+    let d = dice(&ql, &nl);
+    if d >= 0.5 {
+        return Some((d * 5_000.0) as i32 - penalty);
+    }
+    None
+}
+
+/// Built-in app commands whose name matches `q` (prefix or close typo), shown
+/// in the palette ahead of file results. Currently just "Settings".
+fn command_matches(q: &str) -> Vec<PaletteItem> {
+    let ql = q.to_lowercase();
+    let mut out = Vec::new();
+    let aliases = ["settings", "preferences", "config"];
+    let hit = aliases
+        .iter()
+        .any(|a| a.starts_with(&ql) || dice(&ql, a) >= 0.6);
+    if hit {
+        out.push(PaletteItem {
+            title: "Settings".to_string(),
+            subtitle: "Open Shuffle settings".to_string(),
+            action: Action::OpenSettings,
+            is_dir: false,
+        });
+    }
+    out
+}
+
 fn match_score(partial: &str, name: &str) -> i32 {
     let p = partial.to_lowercase();
     let n = name.to_lowercase();
@@ -2299,22 +2830,7 @@ fn main() {
             ],
         }]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
-        cx.on_action(|_: &OpenSettings, cx: &mut App| {
-            let bounds = Bounds::centered(None, size(px(560.0), px(420.0)), cx);
-            cx.open_window(
-                WindowOptions {
-                    window_bounds: Some(WindowBounds::Windowed(bounds)),
-                    titlebar: Some(TitlebarOptions {
-                        title: Some("Settings".into()),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                },
-                |_window, cx| cx.new(|_cx| Settings),
-            )
-            .ok();
-            cx.activate(true);
-        });
+        cx.on_action(|_: &OpenSettings, cx: &mut App| open_settings_window(cx));
 
         let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
 
