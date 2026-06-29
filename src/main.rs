@@ -21,7 +21,7 @@ use chrono::{DateTime, Local};
 use gpui::{
     actions, div, img, point, prelude::*, px, rgb, rgba, size, uniform_list, AnyElement, App,
     Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, FocusHandle, ImageSource,
-    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent,
+    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, Rgba,
     RenderImage, ScrollHandle, ScrollWheelEvent, TitlebarOptions, UniformListScrollHandle, Window,
     WindowBounds, WindowOptions,
 };
@@ -34,21 +34,412 @@ const RECENTS_CAP: usize = 12;
 // Menu-bar actions.
 actions!(shuffle, [OpenSettings, Quit]);
 
-/// The Settings window — empty for now; customization options will live here.
-struct Settings;
+// ----- theming ---------------------------------------------------------------
+
+/// A complete color theme. Every field is a 0xRRGGBB color.
+#[derive(Clone, Copy, PartialEq)]
+struct Theme {
+    bg: u32,            // app background
+    sidebar: u32,       // sidebar background
+    surface: u32,       // elevated surfaces (menus, panels, active nav)
+    hover: u32,         // row / item hover background (the "mouseover" color)
+    selected: u32,      // selected / highlighted background
+    border: u32,        // hairline borders
+    border_strong: u32, // stronger dividers
+    text: u32,          // primary text
+    text_muted: u32,    // secondary text (kind / date / size)
+    text_dim: u32,      // section headers, placeholders
+    accent: u32,        // folders, carets, active highlights
+}
+
+impl Theme {
+    /// A translucent variant of a base color, for floating panels. `a` is 0..=255.
+    fn alpha(color: u32, a: u32) -> Rgba {
+        rgba((color << 8) | (a & 0xff))
+    }
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        PRESETS[0].1
+    }
+}
+
+/// Clamp a channel value to 0..=255.
+const fn clamp8(x: u32) -> u32 {
+    if x > 0xff {
+        0xff
+    } else {
+        x
+    }
+}
+
+/// Scale every channel of an 0xRRGGBB color by `num/den` (lighten if >1, darken
+/// if <1), clamping each channel. Used to derive coherent shades from one base.
+const fn scale(c: u32, num: u32, den: u32) -> u32 {
+    let r = clamp8(((c >> 16) & 0xff) * num / den);
+    let g = clamp8(((c >> 8) & 0xff) * num / den);
+    let b = clamp8((c & 0xff) * num / den);
+    (r << 16) | (g << 8) | b
+}
+
+/// Build a coherent DARK theme from a background, text, and accent color.
+/// Surfaces are derived lighter than the background; muted/dim text darker.
+const fn dark_theme(bg: u32, text: u32, accent: u32) -> Theme {
+    Theme {
+        bg,
+        sidebar: scale(bg, 8, 10),
+        surface: scale(bg, 15, 10),
+        hover: scale(bg, 13, 10),
+        selected: scale(bg, 19, 10),
+        border: scale(bg, 14, 10),
+        border_strong: scale(bg, 20, 10),
+        text,
+        text_muted: scale(text, 7, 10),
+        text_dim: scale(text, 5, 10),
+        accent,
+    }
+}
+
+/// Build a coherent LIGHT theme. Surfaces are derived darker than the (light)
+/// background; muted/dim text lighter so it recedes.
+const fn light_theme(bg: u32, text: u32, accent: u32) -> Theme {
+    Theme {
+        bg,
+        sidebar: scale(bg, 95, 100),
+        surface: scale(bg, 90, 100),
+        hover: scale(bg, 93, 100),
+        selected: scale(bg, 84, 100),
+        border: scale(bg, 88, 100),
+        border_strong: scale(bg, 80, 100),
+        text,
+        text_muted: scale(text, 13, 10),
+        text_dim: scale(text, 16, 10),
+        accent,
+    }
+}
+
+/// Built-in palettes shown in Settings — a broad spread across hues, dark and
+/// light. (name, theme)
+const PRESETS: &[(&str, Theme)] = &[
+    // --- Hand-tuned signatures ---
+    (
+        "Shuffle Dark",
+        Theme {
+            bg: 0x1e1e22,
+            sidebar: 0x17171a,
+            surface: 0x2f2f3a,
+            hover: 0x2a2a30,
+            selected: 0x33334a,
+            border: 0x303036,
+            border_strong: 0x3a3a44,
+            text: 0xf0f0f4,
+            text_muted: 0x8a8a92,
+            text_dim: 0x6b6b73,
+            accent: 0x7aa2f7,
+        },
+    ),
+    (
+        "Catppuccin Mocha",
+        Theme {
+            bg: 0x1e1e2e,
+            sidebar: 0x181825,
+            surface: 0x313244,
+            hover: 0x2a2b3c,
+            selected: 0x45475a,
+            border: 0x313244,
+            border_strong: 0x45475a,
+            text: 0xcdd6f4,
+            text_muted: 0xa6adc8,
+            text_dim: 0x6c7086,
+            accent: 0x89b4fa,
+        },
+    ),
+    (
+        "Catppuccin Macchiato",
+        Theme {
+            bg: 0x24273a,
+            sidebar: 0x1e2030,
+            surface: 0x363a4f,
+            hover: 0x2e3148,
+            selected: 0x494d64,
+            border: 0x363a4f,
+            border_strong: 0x494d64,
+            text: 0xcad3f5,
+            text_muted: 0xa5adcb,
+            text_dim: 0x6e738d,
+            accent: 0x8aadf4,
+        },
+    ),
+    (
+        "Catppuccin Frappé",
+        Theme {
+            bg: 0x303446,
+            sidebar: 0x292c3c,
+            surface: 0x414559,
+            hover: 0x3a3e52,
+            selected: 0x51576d,
+            border: 0x414559,
+            border_strong: 0x51576d,
+            text: 0xc6d0f5,
+            text_muted: 0xa5adce,
+            text_dim: 0x737994,
+            accent: 0x8caaee,
+        },
+    ),
+    (
+        "Catppuccin Latte",
+        Theme {
+            bg: 0xeff1f5,
+            sidebar: 0xe6e9ef,
+            surface: 0xccd0da,
+            hover: 0xdce0e8,
+            selected: 0xbcc0cc,
+            border: 0xccd0da,
+            border_strong: 0xbcc0cc,
+            text: 0x4c4f69,
+            text_muted: 0x6c6f85,
+            text_dim: 0x9ca0b0,
+            accent: 0x1e66f5,
+        },
+    ),
+    // --- Popular dark themes (varied accent hues) ---
+    ("Dracula", dark_theme(0x282a36, 0xf8f8f2, 0xbd93f9)),
+    ("Nord", dark_theme(0x2e3440, 0xe5e9f0, 0x88c0d0)),
+    ("Tokyo Night", dark_theme(0x1a1b26, 0xc0caf5, 0x7aa2f7)),
+    ("Gruvbox Dark", dark_theme(0x282828, 0xebdbb2, 0xfe8019)),
+    ("One Dark", dark_theme(0x282c34, 0xabb2bf, 0x61afef)),
+    ("Solarized Dark", dark_theme(0x002b36, 0x93a1a1, 0x268bd2)),
+    ("Monokai", dark_theme(0x272822, 0xf8f8f2, 0xa6e22e)),
+    ("Everforest", dark_theme(0x2d353b, 0xd3c6aa, 0xa7c080)),
+    ("Rosé Pine", dark_theme(0x191724, 0xe0def4, 0xeb6f92)),
+    // --- Bold single-hue darks (green / red / blue / …) ---
+    ("Forest", dark_theme(0x10211a, 0xd6f5e3, 0x4ade80)),
+    ("Crimson", dark_theme(0x211315, 0xf8dcdc, 0xf87171)),
+    ("Ocean", dark_theme(0x0e1a26, 0xd6ecff, 0x38bdf8)),
+    ("Grape", dark_theme(0x1a1326, 0xece0f8, 0xc084fc)),
+    ("Amber", dark_theme(0x221a10, 0xf8ecd6, 0xfbbf24)),
+    ("Rose", dark_theme(0x241620, 0xf8dcee, 0xf472b6)),
+    ("Teal", dark_theme(0x0e201e, 0xd6f5f0, 0x2dd4bf)),
+    ("Sunset", dark_theme(0x241712, 0xfae5d8, 0xfb7185)),
+    // --- Light themes ---
+    ("Solarized Light", light_theme(0xfdf6e3, 0x586e75, 0x268bd2)),
+    ("GitHub Light", light_theme(0xffffff, 0x24292f, 0x0969da)),
+    ("Rosé Pine Dawn", light_theme(0xfaf4ed, 0x575279, 0xd7827e)),
+    ("Mint", light_theme(0xf0faf4, 0x14532d, 0x16a34a)),
+    ("Sky", light_theme(0xeff6ff, 0x1e3a5f, 0x2563eb)),
+    ("Lavender", light_theme(0xf6f2fe, 0x4c3a66, 0x8b5cf6)),
+];
+
+/// Curated per-property options shown in Settings alongside the presets.
+const BG_OPTIONS: &[u32] = &[0x1e1e22, 0x101014, 0x1e1e2e, 0x24273a, 0x303446, 0x232334, 0xeff1f5];
+const TEXT_OPTIONS: &[u32] = &[0xf0f0f4, 0xcdd6f4, 0xcad3f5, 0xc6d0f5, 0xb0b0b8, 0x4c4f69];
+const HOVER_OPTIONS: &[u32] = &[0x2a2a30, 0x313244, 0x363a4f, 0x414559, 0x3a3a44, 0xdce0e8];
+
+/// Wrapper so the theme lives in the GPUI global store and notifies observers.
+#[derive(Clone, Copy)]
+struct ThemeGlobal(Theme);
+impl gpui::Global for ThemeGlobal {}
+
+thread_local! {
+    /// The render-side copy of the active theme, read by all draw code on the
+    /// main thread without needing an `App` handle.
+    static ACTIVE_THEME: RefCell<Theme> = RefCell::new(Theme::default());
+}
+
+/// The active theme. Read this anywhere in render code.
+fn theme() -> Theme {
+    ACTIVE_THEME.with(|t| *t.borrow())
+}
+
+fn set_active_theme(t: Theme) {
+    ACTIVE_THEME.with(|c| *c.borrow_mut() = t);
+}
+
+/// Apply a theme everywhere: update the render-side copy, persist it, and store
+/// it in the global so observers (the main window) repaint.
+fn apply_theme(t: Theme, cx: &mut App) {
+    set_active_theme(t);
+    save_theme(&t);
+    cx.set_global(ThemeGlobal(t));
+    cx.refresh_windows();
+}
+
+/// The Settings window: a tabbed customization surface.
+struct Settings {
+    tab: usize,
+}
+
+impl Settings {
+    fn new() -> Self {
+        Settings { tab: 0 }
+    }
+}
 
 impl Render for Settings {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let tabs = ["Customization"];
+
+        // Left tab rail.
+        let mut tab_items: Vec<AnyElement> = Vec::new();
+        for (i, name) in tabs.iter().enumerate() {
+            let active = i == self.tab;
+            tab_items.push(
+                div()
+                    .id(("tab", i))
+                    .px_3()
+                    .py_2()
+                    .mx_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(if active { rgb(t.text) } else { rgb(t.text_muted) })
+                    .when(active, |s| s.bg(rgb(t.surface)))
+                    .when(!active, |s| s.hover(|s| s.bg(rgb(t.hover))))
+                    .child(name.to_string())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.tab = i;
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        let rail = div()
+            .flex_none()
+            .w(px(170.0))
+            .h_full()
+            .pt_4()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .bg(rgb(t.sidebar))
+            .border_r_1()
+            .border_color(rgb(t.border))
+            .children(tab_items);
+
         div()
             .flex()
             .size_full()
-            .items_center()
-            .justify_center()
-            .bg(rgb(0x1e1e22))
+            .bg(rgb(t.bg))
             .text_sm()
-            .text_color(rgb(0x6b6b73))
-            .child("Settings — customization options coming soon")
+            .text_color(rgb(t.text))
+            .child(rail)
+            .child(
+                div()
+                    .id("settings-content")
+                    .flex_1()
+                    .h_full()
+                    .overflow_y_scroll()
+                    .p_5()
+                    .child(self.render_customization(cx)),
+            )
     }
+}
+
+impl Settings {
+    fn render_customization(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+
+        // Preset palette cards.
+        let mut presets: Vec<AnyElement> = Vec::new();
+        for (i, (name, preset)) in PRESETS.iter().enumerate() {
+            let preset = *preset;
+            let selected = preset == t;
+            presets.push(
+                div()
+                    .id(("preset", i))
+                    .w(px(150.0))
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .p_3()
+                    .rounded_lg()
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(if selected { rgb(t.accent) } else { rgb(t.border) })
+                    .bg(rgb(preset.bg))
+                    .hover(|s| s.border_color(rgb(t.accent)))
+                    .child(
+                        // Mini preview: a few swatches from the preset.
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child(swatch_dot(preset.sidebar))
+                            .child(swatch_dot(preset.surface))
+                            .child(swatch_dot(preset.accent))
+                            .child(swatch_dot(preset.text)),
+                    )
+                    .child(div().text_color(rgb(preset.text)).child(name.to_string()))
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        apply_theme(preset, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_5()
+            .child(settings_title("Preset Palettes"))
+            .child(div().flex().flex_wrap().gap_3().children(presets))
+            .child(settings_title("Background"))
+            .child(self.color_row(BG_OPTIONS, t.bg, |t, c| t.bg = c, cx))
+            .child(settings_title("Text"))
+            .child(self.color_row(TEXT_OPTIONS, t.text, |t, c| t.text = c, cx))
+            .child(settings_title("Mouseover"))
+            .child(self.color_row(HOVER_OPTIONS, t.hover, |t, c| t.hover = c, cx))
+    }
+
+    /// A row of color swatches; clicking one sets a single theme field via `set`.
+    fn color_row(
+        &self,
+        options: &'static [u32],
+        current: u32,
+        set: fn(&mut Theme, u32),
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = theme();
+        let mut swatches: Vec<AnyElement> = Vec::new();
+        for &c in options {
+            let selected = c == current;
+            swatches.push(
+                div()
+                    .id(("swatch", c))
+                    .w(px(34.0))
+                    .h(px(34.0))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(c))
+                    .border_2()
+                    .border_color(if selected { rgb(t.accent) } else { rgb(t.border) })
+                    .hover(|s| s.border_color(rgb(t.accent)))
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        let mut nt = theme();
+                        set(&mut nt, c);
+                        apply_theme(nt, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        div().flex().flex_wrap().gap_2().children(swatches)
+    }
+}
+
+/// A small color dot used in preset previews.
+fn swatch_dot(color: u32) -> impl IntoElement {
+    div().w(px(14.0)).h(px(14.0)).rounded_full().bg(rgb(color))
+}
+
+/// A section heading inside Settings.
+fn settings_title(text: &str) -> impl IntoElement {
+    div()
+        .text_color(rgb(theme().text_muted))
+        .text_xs()
+        .child(text.to_uppercase())
 }
 
 // Default column widths for the main listing; all are user-resizable.
@@ -216,6 +607,12 @@ struct Shuffle {
 impl Shuffle {
     fn new(dir: PathBuf, cx: &mut Context<Self>) -> Self {
         ensure_base_icons(); // real folder/file icons ready before first render
+        // Sync + repaint whenever the theme changes (e.g. from Settings).
+        cx.observe_global::<ThemeGlobal>(|_, cx| {
+            set_active_theme(cx.global::<ThemeGlobal>().0);
+            cx.notify();
+        })
+        .detach();
         let entries = read_entries(&dir);
         Self {
             current_dir: dir.clone(),
@@ -390,10 +787,10 @@ impl Shuffle {
                     .top(px(menu.y))
                     .min_w(px(200.0))
                     .py_1()
-                    .bg(rgb(0x2a2a30))
+                    .bg(rgb(theme().surface))
                     .rounded_md()
                     .border_1()
-                    .border_color(rgb(0x3a3a44))
+                    .border_color(rgb(theme().border_strong))
                     .shadow_lg()
                     // Clicks inside the menu shouldn't close it via the backdrop.
                     .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
@@ -735,6 +1132,7 @@ impl Shuffle {
     }
 
     fn render_palette(&self, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
         // Fit the list to its content, capped — so there's no empty gray space
         // below a short result set, and it scrolls once it's long.
         let visible = self.palette_items.len().min(PALETTE_MAX_ROWS);
@@ -746,9 +1144,14 @@ impl Shuffle {
             .enumerate()
             .map(|(i, item)| {
                 let selected = i == self.selected;
-                // Real Finder icons: folder for dirs/commands, type icon for files.
-                let dir_like = item.is_dir || matches!(item.action, Action::CopyDir);
-                let icon = icon_element(Path::new(&item.subtitle), dir_like);
+                // Commands get a glyph (gear for Settings); files/dirs get real
+                // Finder icons.
+                let icon: AnyElement = if matches!(item.action, Action::OpenSettings) {
+                    div().text_color(rgb(t.text_muted)).child("⚙").into_any_element()
+                } else {
+                    let dir_like = item.is_dir || matches!(item.action, Action::CopyDir);
+                    icon_element(Path::new(&item.subtitle), dir_like)
+                };
                 let base = div()
                     .id(("pal", i))
                     .flex()
@@ -758,11 +1161,11 @@ impl Shuffle {
                     .h(px(PALETTE_ROW_H))
                     .cursor_pointer();
                 let base = if selected {
-                    base.bg(rgb(0x33334a))
+                    base.bg(rgb(t.selected))
                 } else {
-                    base.hover(|s| s.bg(rgb(0x2a2a30)))
+                    base.hover(|s| s.bg(rgb(t.hover)))
                 };
-                base.child(div().flex_none().w(px(18.0)).child(icon))
+                base.child(div().flex_none().w(px(18.0)).flex().justify_center().child(icon))
                     .child(
                         div()
                             .flex()
@@ -770,14 +1173,14 @@ impl Shuffle {
                             .gap_2()
                             .min_w_0()
                             .flex_1()
-                            .child(div().flex_none().text_color(rgb(0xf0f0f4)).child(item.title.clone()))
+                            .child(div().flex_none().text_color(rgb(t.text)).child(item.title.clone()))
                             .child(
                                 div()
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
                                     .text_xs()
-                                    .text_color(rgb(0x7c7c86))
+                                    .text_color(rgb(t.text_muted))
                                     .child(item.subtitle.clone()),
                             ),
                     )
@@ -792,11 +1195,11 @@ impl Shuffle {
         // Input line: query with a caret, or a dim placeholder.
         let input = if self.query.is_empty() {
             div()
-                .text_color(rgb(0x6b6b73))
+                .text_color(rgb(t.text_dim))
                 .child("Type a path, or a file/folder name…")
         } else {
             div()
-                .text_color(rgb(0xffffff))
+                .text_color(rgb(t.text))
                 .child(format!("{}\u{2502}", self.query))
         };
 
@@ -823,10 +1226,10 @@ impl Shuffle {
                     .flex_col()
                     .overflow_hidden()
                     // ~75% opaque so the explorer shows faintly through the menu.
-                    .bg(rgba(0x222228bf))
+                    .bg(Theme::alpha(t.surface, 0xbf))
                     .rounded_lg()
                     .border_1()
-                    .border_color(rgb(0x3a3a44))
+                    .border_color(rgb(t.border_strong))
                     .shadow_lg()
                     .child(
                         div()
@@ -836,8 +1239,8 @@ impl Shuffle {
                             .px_3()
                             .py_2()
                             .border_b_1()
-                            .border_color(rgb(0x3a3a44))
-                            .child(div().flex_none().text_color(rgb(0x7aa2f7)).child("›"))
+                            .border_color(rgb(t.border_strong))
+                            .child(div().flex_none().text_color(rgb(t.accent)).child("›"))
                             .child(input),
                     )
                     // Scrollable, height-capped results with a scroll indicator.
@@ -1145,6 +1548,7 @@ impl Shuffle {
 
     /// The floating filter box, anchored bottom-right while find is active.
     fn render_find_box(&self, query: &str) -> impl IntoElement {
+        let t = theme();
         let count = self.find_results.len();
         div()
             .absolute()
@@ -1156,25 +1560,25 @@ impl Shuffle {
             .px_3()
             .py_2()
             .rounded_lg()
-            .bg(rgba(0x24242cf2))
+            .bg(Theme::alpha(t.surface, 0xf2))
             .border_1()
-            .border_color(rgb(0x4a4a6a))
+            .border_color(rgb(t.accent))
             .shadow_lg()
-            .text_color(rgb(0xf0f0f4))
-            .child(div().flex_none().text_color(rgb(0x8a8a94)).child("Filter"))
+            .text_color(rgb(t.text))
+            .child(div().flex_none().text_color(rgb(t.text_muted)).child("Filter"))
             .child(if query.is_empty() {
                 div()
                     .min_w(px(80.0))
-                    .text_color(rgb(0x6f6f78))
+                    .text_color(rgb(t.text_dim))
                     .child("type to filter…")
             } else {
                 div().min_w(px(80.0)).child(query.to_string())
             })
-            .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(0xc8c8d0)))
+            .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(t.text)))
             .child(
                 div()
                     .flex_none()
-                    .text_color(rgb(0x8a8a94))
+                    .text_color(rgb(t.text_muted))
                     .text_xs()
                     .child(format!("{count}")),
             )
@@ -1265,14 +1669,14 @@ impl Shuffle {
                 .px_3()
                 .pt_4()
                 .pb_1()
-                .child(div().text_xs().text_color(rgb(0x6b6b73)).child("BOOKMARKS"))
+                .child(div().text_xs().text_color(rgb(theme().text_dim)).child("BOOKMARKS"))
                 .child(
                     div()
                         .id("add-bookmark")
                         .cursor_pointer()
                         .px_1()
-                        .text_color(rgb(0x6b6b73))
-                        .hover(|s| s.text_color(rgb(0xffffff)))
+                        .text_color(rgb(theme().text_dim))
+                        .hover(|s| s.text_color(rgb(theme().text)))
                         .child("+")
                         .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                             this.add_bookmark(cx);
@@ -1321,9 +1725,9 @@ impl Shuffle {
             .flex()
             .flex_col()
             .pb_3()
-            .bg(rgb(0x17171a))
+            .bg(rgb(theme().sidebar))
             .border_r_1()
-            .border_color(rgb(0x2a2a30))
+            .border_color(rgb(theme().border))
             .children(items)
     }
 
@@ -1347,7 +1751,7 @@ impl Shuffle {
             .px_2()
             .py_1()
             .border_b_1()
-            .border_color(rgb(0x303036))
+            .border_color(rgb(theme().border))
             .child(nav_arrow(
                 "nav-back",
                 "‹",
@@ -1420,6 +1824,7 @@ impl Shuffle {
 
     /// The editable address-bar field shown in edit mode.
     fn render_path_editor(&self, text: &str) -> impl IntoElement {
+        let t = theme();
         div()
             .flex_1()
             .min_w_0()
@@ -1428,13 +1833,13 @@ impl Shuffle {
             .px_2()
             .h(px(22.0))
             .rounded_md()
-            .bg(rgb(0x2a2a30))
+            .bg(rgb(t.surface))
             .border_1()
-            .border_color(rgb(0x4a4a6a))
-            .text_color(rgb(0xf0f0f4))
+            .border_color(rgb(t.accent))
+            .text_color(rgb(t.text))
             .child(div().min_w_0().child(text.to_string()))
             // Blinking would need a timer; a static caret reads clearly enough.
-            .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(0xc8c8d0)))
+            .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(t.text)))
     }
 
     fn render_main(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -1542,8 +1947,14 @@ impl Shuffle {
                                     ix,
                                     widths,
                                     icon,
-                                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                        this.navigate_to(target.clone(), cx);
+                                    cx.listener(move |this, ev: &ClickEvent, _, cx| {
+                                        // Folders open on a single click; files
+                                        // open (via `open`) on a double click.
+                                        if is_dir {
+                                            this.navigate_to(target.clone(), cx);
+                                        } else if ev.click_count() >= 2 {
+                                            this.open_path(target.clone(), false, cx);
+                                        }
                                     }),
                                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                                         let (x, y) = (
@@ -1583,9 +1994,9 @@ impl Shuffle {
             .px_3()
             .py_1()
             .text_xs()
-            .text_color(rgb(0x6b6b73))
+            .text_color(rgb(theme().text_dim))
             .border_b_1()
-            .border_color(rgb(0x303036))
+            .border_color(rgb(theme().border))
             .child(header_cell("Name", w.name, Column::Name, ICON_W + 8.0, false, cx))
             .child(header_cell("Kind", w.kind, Column::Kind, 0.0, false, cx))
             .child(header_cell(
@@ -1638,8 +2049,8 @@ fn header_cell(
                 .flex()
                 .justify_center()
                 .cursor(CursorStyle::ResizeLeftRight)
-                .child(div().w(px(1.0)).h_full().bg(rgb(0x3a3a46)))
-                .hover(|s| s.bg(rgb(0x34343e)))
+                .child(div().w(px(1.0)).h_full().bg(rgb(theme().border_strong)))
+                .hover(|s| s.bg(rgb(theme().selected)))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
@@ -1652,11 +2063,13 @@ fn header_cell(
 
 impl Render for Shuffle {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
         let mut root = div()
             .relative()
             .flex()
             .size_full()
-            .bg(rgb(0x1e1e22))
+            .bg(rgb(t.bg))
+            .text_color(rgb(t.text))
             .text_sm()
             // Focusable so it receives key events (Cmd+P, palette typing).
             .track_focus(&self.focus)
@@ -1720,6 +2133,7 @@ fn nav_arrow(
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
+    let t = theme();
     let base = div()
         .id(id)
         .flex_none()
@@ -1729,11 +2143,11 @@ fn nav_arrow(
         .items_center()
         .justify_center()
         .rounded_md()
-        .text_color(if enabled { rgb(0xc8c8d0) } else { rgb(0x55555c) })
+        .text_color(if enabled { rgb(t.text) } else { rgb(t.text_dim) })
         .child(glyph);
     if enabled {
         base.cursor_pointer()
-            .hover(|s| s.bg(rgb(0x303036)))
+            .hover(|s| s.bg(rgb(t.hover)))
             .on_click(on_click)
             .into_any_element()
     } else {
@@ -1749,6 +2163,7 @@ fn breadcrumb_seg(
     active: bool,
     cx: &Context<Shuffle>,
 ) -> AnyElement {
+    let t = theme();
     div()
         .id(("crumb", idx))
         .flex_none()
@@ -1758,8 +2173,8 @@ fn breadcrumb_seg(
         .items_center()
         .rounded_md()
         .cursor_pointer()
-        .text_color(if active { rgb(0xd8d8e0) } else { rgb(0x70707a) })
-        .hover(|s| s.bg(rgb(0x303036)).text_color(rgb(0xf0f0f4)))
+        .text_color(if active { rgb(t.text) } else { rgb(t.text_dim) })
+        .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
         .child(label)
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
             this.navigate_to(full.clone(), cx);
@@ -1773,7 +2188,7 @@ fn breadcrumb_sep() -> AnyElement {
     div()
         .flex_none()
         .px(px(2.0))
-        .text_color(rgb(0x4a4a52))
+        .text_color(rgb(theme().text_dim))
         .child("/")
         .into_any_element()
 }
@@ -1791,7 +2206,7 @@ fn expand_path(s: &str) -> PathBuf {
 
 /// Open the Settings window (shared by the menu action and the palette).
 fn open_settings_window(cx: &mut App) {
-    let bounds = Bounds::centered(None, size(px(560.0), px(420.0)), cx);
+    let bounds = Bounds::centered(None, size(px(760.0), px(560.0)), cx);
     cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -1801,7 +2216,7 @@ fn open_settings_window(cx: &mut App) {
             }),
             ..Default::default()
         },
-        |_window, cx| cx.new(|_cx| Settings),
+        |_window, cx| cx.new(|_cx| Settings::new()),
     )
     .ok();
     cx.activate(true);
@@ -1821,14 +2236,14 @@ fn ctx_item(
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .text_color(rgb(0xe0e0e6))
-        .hover(|s| s.bg(rgb(0x33334a)))
+        .text_color(rgb(theme().text))
+        .hover(|s| s.bg(rgb(theme().selected)))
         .child(label)
         .on_click(on_click)
 }
 
 fn ctx_separator() -> impl IntoElement {
-    div().my_1().mx_2().h(px(1.0)).bg(rgb(0x3a3a44))
+    div().my_1().mx_2().h(px(1.0)).bg(rgb(theme().border_strong))
 }
 
 /// A non-existing child path under `dir` based on `base` (adds " 2", " 3" …).
@@ -1856,7 +2271,7 @@ fn nav_item(
     active: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
-    let fg = if active { 0xffffff } else { 0xb0b0b8 };
+    let t = theme();
     let base = div()
         .id(("nav", key))
         .flex()
@@ -1866,11 +2281,11 @@ fn nav_item(
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .text_color(rgb(fg));
+        .text_color(rgb(if active { t.text } else { t.text_muted }));
     let base = if active {
-        base.bg(rgb(0x2f2f3a))
+        base.bg(rgb(t.surface))
     } else {
-        base.hover(|s| s.bg(rgb(0x232329)))
+        base.hover(|s| s.bg(rgb(t.hover)))
     };
     base.child(label).on_click(on_click)
 }
@@ -1881,7 +2296,7 @@ fn section_header(title: &str) -> impl IntoElement {
         .pt_4()
         .pb_1()
         .text_xs()
-        .text_color(rgb(0x6b6b73))
+        .text_color(rgb(theme().text_dim))
         .child(title.to_string())
 }
 
@@ -1889,7 +2304,7 @@ fn empty_hint(text: &str) -> impl IntoElement {
     div()
         .px_3()
         .py_1()
-        .text_color(rgb(0x55555c))
+        .text_color(rgb(theme().text_dim))
         .child(text.to_string())
 }
 
@@ -1905,9 +2320,10 @@ fn file_row(
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
+    let t = theme();
     let kind = kind_label(name, is_dir);
-    let name_color = if is_dir { 0x7aa2f7 } else { 0xe0e0e6 };
-    let meta_color = rgb(0x8a8a92);
+    let name_color = if is_dir { t.accent } else { t.text };
+    let meta_color = rgb(t.text_muted);
 
     div()
         .id(("row", key))
@@ -1916,7 +2332,7 @@ fn file_row(
         .px_3()
         .py_1()
         .cursor_pointer()
-        .hover(|s| s.bg(rgb(0x2a2a30)))
+        .hover(|s| s.bg(rgb(t.hover)))
         // Name (icon + label). Long names truncate with an ellipsis.
         .child(
             div()
@@ -2753,6 +3169,49 @@ fn write_path_list(name: &str, paths: &[PathBuf]) {
     }
 }
 
+/// Persist the active theme (all eleven colors as hex, one per line).
+fn save_theme(t: &Theme) {
+    if let Some(file) = config_file("theme.txt") {
+        if let Some(parent) = file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let v = [
+            t.bg, t.sidebar, t.surface, t.hover, t.selected, t.border, t.border_strong, t.text,
+            t.text_muted, t.text_dim, t.accent,
+        ];
+        let body: String = v.iter().map(|c| format!("{c:06x}\n")).collect();
+        let _ = fs::write(&file, body);
+    }
+}
+
+/// Load the saved theme, falling back to the default if absent/corrupt.
+fn load_theme() -> Theme {
+    if let Some(file) = config_file("theme.txt") {
+        if let Ok(s) = fs::read_to_string(&file) {
+            let v: Vec<u32> = s
+                .lines()
+                .filter_map(|l| u32::from_str_radix(l.trim(), 16).ok())
+                .collect();
+            if v.len() == 11 {
+                return Theme {
+                    bg: v[0],
+                    sidebar: v[1],
+                    surface: v[2],
+                    hover: v[3],
+                    selected: v[4],
+                    border: v[5],
+                    border_strong: v[6],
+                    text: v[7],
+                    text_muted: v[8],
+                    text_dim: v[9],
+                    accent: v[10],
+                };
+            }
+        }
+    }
+    Theme::default()
+}
+
 fn main() {
     // Hidden benchmark mode: `shuffle --index-bench <query>` builds the ~/ index
     // and runs a search, printing timings and the top hits, then exits.
@@ -2816,6 +3275,11 @@ fn main() {
     }
 
     Application::new().run(|cx: &mut App| {
+        // Load the saved theme into both the render-side copy and the global.
+        let saved_theme = load_theme();
+        set_active_theme(saved_theme);
+        cx.set_global(ThemeGlobal(saved_theme));
+
         // Menu bar: app menu with Settings + Quit, plus their shortcuts.
         cx.bind_keys([
             KeyBinding::new("cmd-,", OpenSettings, None),
