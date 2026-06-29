@@ -19,8 +19,8 @@ use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    actions, div, img, point, prelude::*, px, rgb, rgba, size, uniform_list, AnyElement, App,
-    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, FocusHandle, ImageSource,
+    actions, div, img, point, prelude::*, px, relative, rgb, rgba, size, uniform_list, AnyElement, App,
+    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, FocusHandle, ImageSource,
     KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, Rgba,
     RenderImage, ScrollHandle, ScrollWheelEvent, TitlebarOptions, UniformListScrollHandle, Window,
     WindowBounds, WindowOptions,
@@ -449,6 +449,10 @@ const MIN_COL_W: f32 = 50.0;
 // Command-palette result row height, and how many show before scrolling.
 const PALETTE_ROW_H: f32 = 26.0;
 const PALETTE_MAX_ROWS: usize = 7;
+/// Sidebar width; also the left edge of the content/canvas area.
+const SIDEBAR_W: f32 = 220.0;
+/// Tab strip row height.
+const TAB_H: f32 = 30.0;
 
 /// The four resizable columns of the main listing.
 #[derive(Clone, Copy, PartialEq)]
@@ -519,9 +523,10 @@ struct Resize {
     start_w: f32,
 }
 
-/// An in-progress scrollbar-thumb drag.
+/// An in-progress scrollbar-thumb drag (which pane's list is being scrolled).
 #[derive(Clone, Copy)]
 struct ScrollDrag {
+    pane: usize,
     start_y: f32,
     start_scrolled: f32,
 }
@@ -548,6 +553,8 @@ enum Action {
 struct ContextMenu {
     x: f32,
     y: f32,
+    /// The pane whose active tab this menu acts on (for refresh after FS ops).
+    pane: usize,
     target: Option<(PathBuf, bool)>,
 }
 
@@ -568,12 +575,11 @@ struct Entry {
     modified: Option<SystemTime>,
 }
 
-/// The root view.
-struct Shuffle {
+/// One open tab: an independent directory view with its own history, scroll,
+/// find, and path-edit state.
+struct Tab {
     current_dir: PathBuf,
     entries: Vec<Entry>,
-    recents: Vec<PathBuf>,
-    bookmarks: Vec<PathBuf>,
     /// Back/forward navigation history and our position within it.
     history: Vec<PathBuf>,
     hist_pos: usize,
@@ -587,9 +593,93 @@ struct Shuffle {
     /// `find_results` holds the matching `entries` indices, best match first.
     find_query: Option<String>,
     find_results: Vec<usize>,
+    scroll_handle: UniformListScrollHandle,
+    /// Horizontal scroll of the columns (when they're wider than the pane).
+    h_scroll: ScrollHandle,
+}
+
+impl Tab {
+    fn new(dir: PathBuf) -> Self {
+        let entries = read_entries(&dir);
+        Tab {
+            current_dir: dir.clone(),
+            entries,
+            history: vec![dir.clone()],
+            hist_pos: 0,
+            deepest: Some(dir),
+            editing_path: None,
+            find_query: None,
+            find_results: Vec::new(),
+            scroll_handle: UniformListScrollHandle::new(),
+            h_scroll: ScrollHandle::new(),
+        }
+    }
+}
+
+/// A pane: a column in the canvas holding a stack of tabs.
+struct Pane {
+    tabs: Vec<Tab>,
+    active: usize,
+}
+
+impl Pane {
+    fn new(dir: PathBuf) -> Self {
+        Pane {
+            tabs: vec![Tab::new(dir)],
+            active: 0,
+        }
+    }
+
+    fn active_tab(&self) -> &Tab {
+        &self.tabs[self.active]
+    }
+
+    fn active_tab_mut(&mut self) -> &mut Tab {
+        &mut self.tabs[self.active]
+    }
+}
+
+/// Payload for a tab drag: which pane/tab is being dragged.
+#[derive(Clone, Copy)]
+struct TabDrag {
+    pane: usize,
+    tab: usize,
+}
+
+/// The floating preview rendered under the cursor while dragging a tab.
+struct TabDragPreview {
+    label: String,
+}
+
+impl Render for TabDragPreview {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        div()
+            .px_3()
+            .py_1()
+            .rounded_md()
+            .bg(Theme::alpha(t.surface, 0xf2))
+            .border_1()
+            .border_color(rgb(t.accent))
+            .text_color(rgb(t.text))
+            .text_sm()
+            .shadow_lg()
+            .child(self.label.clone())
+    }
+}
+
+/// The root view: a workspace of one or two side-by-side panes.
+struct Shuffle {
+    panes: Vec<Pane>,
+    active_pane: usize,
+    /// Left pane's width fraction when two panes are shown (0.2..0.8).
+    split_ratio: f32,
+    /// True while the user drags the divider between two panes.
+    divider_drag: bool,
+    recents: Vec<PathBuf>,
+    bookmarks: Vec<PathBuf>,
     widths: ColumnWidths,
     resize: Option<Resize>,
-    scroll_handle: UniformListScrollHandle,
     scroll_drag: Option<ScrollDrag>,
     // Command palette (Cmd+P).
     focus: FocusHandle,
@@ -613,21 +703,15 @@ impl Shuffle {
             cx.notify();
         })
         .detach();
-        let entries = read_entries(&dir);
         Self {
-            current_dir: dir.clone(),
-            entries,
+            panes: vec![Pane::new(dir)],
+            active_pane: 0,
+            split_ratio: 0.5,
+            divider_drag: false,
             recents: read_path_list("recents.txt"),
             bookmarks: read_path_list("bookmarks.txt"),
-            history: vec![dir.clone()],
-            hist_pos: 0,
-            deepest: Some(dir),
-            editing_path: None,
-            find_query: None,
-            find_results: Vec::new(),
             widths: ColumnWidths::default(),
             resize: None,
-            scroll_handle: UniformListScrollHandle::new(),
             scroll_drag: None,
             focus: cx.focus_handle(),
             palette_open: false,
@@ -641,10 +725,33 @@ impl Shuffle {
         }
     }
 
+    // ----- pane / tab accessors -----
+
+    fn pane(&self, ix: usize) -> &Pane {
+        &self.panes[ix]
+    }
+
+    fn pane_mut(&mut self, ix: usize) -> &mut Pane {
+        &mut self.panes[ix]
+    }
+
+    fn tab(&self, pane: usize) -> &Tab {
+        self.panes[pane].active_tab()
+    }
+
+    fn tab_mut(&mut self, pane: usize) -> &mut Tab {
+        self.panes[pane].active_tab_mut()
+    }
+
+    fn active_tab(&self) -> &Tab {
+        self.tab(self.active_pane)
+    }
+
     // ----- right-click context menu -----
 
-    fn open_context_menu(&mut self, x: f32, y: f32, target: Option<(PathBuf, bool)>, cx: &mut Context<Self>) {
-        self.context_menu = Some(ContextMenu { x, y, target });
+    fn open_context_menu(&mut self, pane: usize, x: f32, y: f32, target: Option<(PathBuf, bool)>, cx: &mut Context<Self>) {
+        self.active_pane = pane.min(self.panes.len() - 1);
+        self.context_menu = Some(ContextMenu { x, y, pane: self.active_pane, target });
         cx.notify();
     }
 
@@ -654,42 +761,44 @@ impl Shuffle {
         }
     }
 
-    /// Re-read the current directory's contents (after a create/trash).
-    fn refresh_current(&mut self, cx: &mut Context<Self>) {
-        self.entries = read_entries(&self.current_dir);
+    /// Re-read a pane's current directory contents (after a create/trash).
+    fn refresh_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
+        let dir = self.tab(pane).current_dir.clone();
+        self.tab_mut(pane).entries = read_entries(&dir);
         cx.notify();
     }
 
-    fn new_folder(&mut self, cx: &mut Context<Self>) {
-        let path = unique_child(&self.current_dir, "untitled folder");
+    fn new_folder(&mut self, pane: usize, cx: &mut Context<Self>) {
+        let path = unique_child(&self.tab(pane).current_dir, "untitled folder");
         if fs::create_dir(&path).is_ok() {
-            self.refresh_current(cx);
+            self.refresh_pane(pane, cx);
         }
     }
 
-    fn new_file(&mut self, cx: &mut Context<Self>) {
-        let path = unique_child(&self.current_dir, "untitled file");
+    fn new_file(&mut self, pane: usize, cx: &mut Context<Self>) {
+        let path = unique_child(&self.tab(pane).current_dir, "untitled file");
         if fs::File::create(&path).is_ok() {
-            self.refresh_current(cx);
+            self.refresh_pane(pane, cx);
         }
     }
 
-    fn open_path(&mut self, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
+    fn open_path(&mut self, pane: usize, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
         if is_dir {
-            self.navigate_to(path, cx);
+            self.navigate_in(pane, path, cx);
         } else {
             let _ = Command::new("open").arg(&path).spawn();
         }
     }
 
-    fn move_to_trash(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+    fn move_to_trash(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
         if trash_path(&path) {
-            self.refresh_current(cx);
+            self.refresh_pane(pane, cx);
         }
     }
 
     fn render_context_menu(&self, cx: &Context<Self>) -> impl IntoElement {
         let menu = self.context_menu.as_ref().expect("called only when open");
+        let pane = menu.pane;
         let mut items: Vec<AnyElement> = Vec::new();
 
         if let Some((path, is_dir)) = menu.target.clone() {
@@ -700,7 +809,7 @@ impl Shuffle {
                     if is_dir { "Open" } else { "Open" },
                     cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_context_menu(cx);
-                        this.open_path(p_open.clone(), is_dir2, cx);
+                        this.open_path(pane, p_open.clone(), is_dir2, cx);
                     }),
                 )
                 .into_any_element(),
@@ -735,7 +844,7 @@ impl Shuffle {
                     "Move to Trash",
                     cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_context_menu(cx);
-                        this.move_to_trash(p_trash.clone(), cx);
+                        this.move_to_trash(pane, p_trash.clone(), cx);
                     }),
                 )
                 .into_any_element(),
@@ -748,7 +857,7 @@ impl Shuffle {
                 "New Folder",
                 cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.close_context_menu(cx);
-                    this.new_folder(cx);
+                    this.new_folder(pane, cx);
                 }),
             )
             .into_any_element(),
@@ -758,7 +867,7 @@ impl Shuffle {
                 "New File",
                 cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.close_context_menu(cx);
-                    this.new_file(cx);
+                    this.new_file(pane, cx);
                 }),
             )
             .into_any_element(),
@@ -814,15 +923,16 @@ impl Shuffle {
     }
 
     /// Current scrolled distance from the top, in pixels.
-    fn current_scrolled(&self) -> f32 {
-        let state = self.scroll_handle.0.borrow();
+    fn current_scrolled(&self, pane: usize) -> f32 {
+        let state = self.tab(pane).scroll_handle.0.borrow();
         (-(f64::from(state.base_handle.offset().y) as f32)).max(0.0)
     }
 
-    fn begin_scroll_drag(&mut self, y: f32) {
+    fn begin_scroll_drag(&mut self, pane: usize, y: f32) {
         self.scroll_drag = Some(ScrollDrag {
+            pane,
             start_y: y,
-            start_scrolled: self.current_scrolled(),
+            start_scrolled: self.current_scrolled(pane),
         });
     }
 
@@ -830,7 +940,10 @@ impl Shuffle {
         let Some(drag) = self.scroll_drag else {
             return;
         };
-        let state = self.scroll_handle.0.borrow();
+        if drag.pane >= self.panes.len() {
+            return;
+        }
+        let state = self.tab(drag.pane).scroll_handle.0.borrow();
         let base = &state.base_handle;
         let viewport = f64::from(base.bounds().size.height) as f32;
         let max = f64::from(base.max_offset().height) as f32;
@@ -875,7 +988,7 @@ impl Shuffle {
     fn default_commands(&self) -> Vec<PaletteItem> {
         vec![PaletteItem {
             title: "Copy current directory".to_string(),
-            subtitle: self.current_dir.to_string_lossy().into_owned(),
+            subtitle: self.active_tab().current_dir.to_string_lossy().into_owned(),
             action: Action::CopyDir,
             is_dir: true,
         }]
@@ -1056,7 +1169,7 @@ impl Shuffle {
                 self.navigate_to(target, cx);
             }
             Action::CopyDir => {
-                let text = self.current_dir.to_string_lossy().into_owned();
+                let text = self.active_tab().current_dir.to_string_lossy().into_owned();
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
                 self.close_palette(cx);
             }
@@ -1075,19 +1188,30 @@ impl Shuffle {
         let key = ks.key.as_str();
 
         // While editing the path bar, keys feed the text field.
-        if self.editing_path.is_some() {
+        if self.active_tab().editing_path.is_some() {
             self.handle_path_edit_key(ev, cx);
             return;
         }
 
         // While the in-directory find bar is open, keys feed the filter.
-        if self.find_query.is_some() {
+        if self.active_tab().find_query.is_some() {
             self.handle_find_key(ev, cx);
             return;
         }
 
         if cmd && key == "p" {
             self.toggle_palette(window, cx);
+            return;
+        }
+        // Tab management.
+        if cmd && key == "t" {
+            self.new_tab_in(self.active_pane, cx);
+            return;
+        }
+        if cmd && key == "w" {
+            let p = self.active_pane;
+            let active = self.panes[p].active;
+            self.close_tab(p, active, cx);
             return;
         }
         if key == "escape" && self.context_menu.is_some() {
@@ -1097,7 +1221,7 @@ impl Shuffle {
         if !self.palette_open {
             // Typing "/" in the listing opens the in-directory find filter.
             if !cmd && key == "/" {
-                self.open_find(cx);
+                self.open_find(self.active_pane, cx);
             }
             return;
         }
@@ -1269,8 +1393,8 @@ impl Shuffle {
 
     /// A floating, draggable scrollbar thumb sized/positioned from the list's
     /// scroll state. Returns `None` when the content fits (or isn't measured yet).
-    fn scrollbar_thumb(&self, cx: &Context<Self>) -> Option<AnyElement> {
-        let state = self.scroll_handle.0.borrow();
+    fn scrollbar_thumb(&self, pane: usize, cx: &Context<Self>) -> Option<AnyElement> {
+        let state = self.tab(pane).scroll_handle.0.borrow();
         let base = &state.base_handle;
         let viewport = f64::from(base.bounds().size.height) as f32;
         let max = f64::from(base.max_offset().height) as f32;
@@ -1283,8 +1407,9 @@ impl Shuffle {
         let thumb_h = (viewport * viewport / content).clamp(min_thumb, viewport);
         let thumb_top = (viewport - thumb_h) * (scrolled / max);
 
-        // Brighter while being dragged.
-        let color = if self.scroll_drag.is_some() {
+        // Brighter while this pane's thumb is being dragged.
+        let dragging = self.scroll_drag.is_some_and(|d| d.pane == pane);
+        let color = if dragging {
             rgba(0xffffff66)
         } else {
             rgba(0xffffff33)
@@ -1292,7 +1417,7 @@ impl Shuffle {
 
         Some(
             div()
-                .id("scrollbar-thumb")
+                .id(("scrollbar-thumb", pane))
                 .absolute()
                 .top(px(thumb_top))
                 .right(px(2.0))
@@ -1304,8 +1429,8 @@ impl Shuffle {
                 .hover(|s| s.bg(rgba(0xffffff55)))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                        this.begin_scroll_drag(f64::from(ev.position.y) as f32);
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        this.begin_scroll_drag(pane, f64::from(ev.position.y) as f32);
                         cx.notify();
                     }),
                 )
@@ -1332,25 +1457,26 @@ impl Shuffle {
         self.resize = None;
     }
 
-    /// Load `dir` as the current directory: re-read contents, update the
+    /// Load `dir` as a pane's current directory: re-read contents, update the
     /// breadcrumb's deepest-tail, record it as most-recent, and persist. Does
     /// NOT touch back/forward history (callers manage that).
-    fn load_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        self.entries = read_entries(&dir);
+    fn load_dir_in(&mut self, pane: usize, dir: PathBuf, cx: &mut Context<Self>) {
+        let tab = self.tab_mut(pane);
+        tab.entries = read_entries(&dir);
         // Keep the grayed-out forward tail in the breadcrumb when moving to an
         // ancestor of where we were; otherwise the tail resets to here.
-        let keep = self.deepest.as_ref().is_some_and(|d| d.starts_with(&dir));
+        let keep = tab.deepest.as_ref().is_some_and(|d| d.starts_with(&dir));
         if !keep {
-            self.deepest = Some(dir.clone());
+            tab.deepest = Some(dir.clone());
         }
-        self.current_dir = dir;
-        self.editing_path = None;
-        self.find_query = None;
-        self.find_results.clear();
-        save_last_dir(&self.current_dir);
+        tab.current_dir = dir.clone();
+        tab.editing_path = None;
+        tab.find_query = None;
+        tab.find_results.clear();
+        save_last_dir(&dir);
 
-        self.recents.retain(|p| p != &self.current_dir);
-        self.recents.insert(0, self.current_dir.clone());
+        self.recents.retain(|p| p != &dir);
+        self.recents.insert(0, dir);
         self.recents.truncate(RECENTS_CAP);
         write_path_list("recents.txt", &self.recents);
 
@@ -1358,77 +1484,91 @@ impl Shuffle {
         self.prewarm_icons(cx);
     }
 
-    /// Navigate into `dir` if it is a directory. New navigation truncates any
-    /// forward history, then appends `dir` as the new tip.
+    /// Navigate a pane into `dir` if it is a directory. New navigation truncates
+    /// any forward history, then appends `dir` as the new tip.
+    fn navigate_in(&mut self, pane: usize, dir: PathBuf, cx: &mut Context<Self>) {
+        if !dir.is_dir() || dir == self.tab(pane).current_dir {
+            return;
+        }
+        self.active_pane = pane;
+        let tab = self.tab_mut(pane);
+        tab.history.truncate(tab.hist_pos + 1);
+        tab.history.push(dir.clone());
+        tab.hist_pos = tab.history.len() - 1;
+        self.load_dir_in(pane, dir, cx);
+    }
+
+    /// Navigate the active pane (used by the palette).
     fn navigate_to(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        if !dir.is_dir() || dir == self.current_dir {
-            return;
-        }
-        self.history.truncate(self.hist_pos + 1);
-        self.history.push(dir.clone());
-        self.hist_pos = self.history.len() - 1;
-        self.load_dir(dir, cx);
+        self.navigate_in(self.active_pane, dir, cx);
     }
 
-    /// Go to the previous directory in history (the back arrow).
-    fn go_back(&mut self, cx: &mut Context<Self>) {
-        if self.hist_pos == 0 {
+    /// Go to the previous directory in a pane's history (the back arrow).
+    fn go_back(&mut self, pane: usize, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        let tab = self.tab_mut(pane);
+        if tab.hist_pos == 0 {
             return;
         }
-        self.hist_pos -= 1;
-        let dir = self.history[self.hist_pos].clone();
-        self.load_dir(dir, cx);
+        tab.hist_pos -= 1;
+        let dir = tab.history[tab.hist_pos].clone();
+        self.load_dir_in(pane, dir, cx);
     }
 
-    /// Go to the next directory in history (the forward arrow).
-    fn go_forward(&mut self, cx: &mut Context<Self>) {
-        if self.hist_pos + 1 >= self.history.len() {
+    /// Go to the next directory in a pane's history (the forward arrow).
+    fn go_forward(&mut self, pane: usize, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        let tab = self.tab_mut(pane);
+        if tab.hist_pos + 1 >= tab.history.len() {
             return;
         }
-        self.hist_pos += 1;
-        let dir = self.history[self.hist_pos].clone();
-        self.load_dir(dir, cx);
+        tab.hist_pos += 1;
+        let dir = tab.history[tab.hist_pos].clone();
+        self.load_dir_in(pane, dir, cx);
     }
 
-    /// Enter path-edit mode: the bar becomes an editable text field.
-    fn begin_path_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.editing_path = Some(self.current_dir.display().to_string());
+    /// Enter path-edit mode for a pane: the bar becomes an editable text field.
+    fn begin_path_edit(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        let text = self.tab(pane).current_dir.display().to_string();
+        self.tab_mut(pane).editing_path = Some(text);
         window.focus(&self.focus);
         cx.notify();
     }
 
-    /// Keystrokes while the path bar is being edited.
+    /// Keystrokes while the path bar is being edited (acts on the active pane).
     fn handle_path_edit_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let cmd = ks.modifiers.platform;
+        let pane = self.active_pane;
         match ks.key.as_str() {
             "escape" => {
-                self.editing_path = None;
+                self.tab_mut(pane).editing_path = None;
                 cx.notify();
             }
             "enter" => {
-                if let Some(text) = self.editing_path.take() {
+                if let Some(text) = self.tab_mut(pane).editing_path.take() {
                     let path = expand_path(text.trim());
                     if path.is_dir() {
-                        self.navigate_to(path, cx);
+                        self.navigate_in(pane, path, cx);
                     }
                 }
                 cx.notify();
             }
             "backspace" => {
-                if let Some(s) = self.editing_path.as_mut() {
+                if let Some(s) = self.tab_mut(pane).editing_path.as_mut() {
                     s.pop();
                 }
                 cx.notify();
             }
             "c" if cmd => {
-                if let Some(s) = &self.editing_path {
+                if let Some(s) = &self.tab(pane).editing_path {
                     cx.write_to_clipboard(ClipboardItem::new_string(s.clone()));
                 }
             }
             "v" if cmd => {
                 if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                    if let Some(s) = self.editing_path.as_mut() {
+                    if let Some(s) = self.tab_mut(pane).editing_path.as_mut() {
                         s.push_str(t.trim());
                     }
                     cx.notify();
@@ -1440,7 +1580,7 @@ impl Shuffle {
                 }
                 if let Some(ch) = ks.key_char.as_ref() {
                     if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        if let Some(s) = self.editing_path.as_mut() {
+                        if let Some(s) = self.tab_mut(pane).editing_path.as_mut() {
                             s.push_str(ch);
                         }
                         cx.notify();
@@ -1452,25 +1592,27 @@ impl Shuffle {
 
     // ----- in-directory find (the "/" filter) -----
 
-    /// Open the find bar, filtering only the current directory.
-    fn open_find(&mut self, cx: &mut Context<Self>) {
-        self.find_query = Some(String::new());
-        self.recompute_find();
+    /// Open the find bar for a pane, filtering only its current directory.
+    fn open_find(&mut self, pane: usize, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        self.tab_mut(pane).find_query = Some(String::new());
+        self.recompute_find(pane);
         cx.notify();
     }
 
-    /// Recompute `find_results` from the current find query. Empty query shows
-    /// every entry; otherwise filters + ranks by similarity (typo-tolerant).
-    fn recompute_find(&mut self) {
-        let Some(q) = self.find_query.as_deref() else {
+    /// Recompute a pane's `find_results`. Empty query shows every entry;
+    /// otherwise filters + ranks by similarity (typo-tolerant).
+    fn recompute_find(&mut self, pane: usize) {
+        let tab = self.tab_mut(pane);
+        let Some(q) = tab.find_query.as_deref() else {
             return;
         };
         let q = q.trim();
         if q.is_empty() {
-            self.find_results = (0..self.entries.len()).collect();
+            tab.find_results = (0..tab.entries.len()).collect();
             return;
         }
-        let mut scored: Vec<(i32, usize)> = self
+        let mut scored: Vec<(i32, usize)> = tab
             .entries
             .iter()
             .enumerate()
@@ -1479,53 +1621,57 @@ impl Shuffle {
         // Best score first; ties → dirs first, then alphabetical.
         scored.sort_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| self.entries[b.1].is_dir.cmp(&self.entries[a.1].is_dir))
+                .then_with(|| tab.entries[b.1].is_dir.cmp(&tab.entries[a.1].is_dir))
                 .then_with(|| {
-                    self.entries[a.1]
+                    tab.entries[a.1]
                         .name
                         .to_lowercase()
-                        .cmp(&self.entries[b.1].name.to_lowercase())
+                        .cmp(&tab.entries[b.1].name.to_lowercase())
                 })
         });
-        self.find_results = scored.into_iter().map(|(_, i)| i).collect();
+        tab.find_results = scored.into_iter().map(|(_, i)| i).collect();
     }
 
-    /// Keystrokes while the find bar is open.
+    /// Keystrokes while the find bar is open (acts on the active pane).
     fn handle_find_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let cmd = ks.modifiers.platform;
+        let pane = self.active_pane;
         match ks.key.as_str() {
             "escape" => {
-                self.find_query = None;
-                self.find_results.clear();
+                let tab = self.tab_mut(pane);
+                tab.find_query = None;
+                tab.find_results.clear();
                 cx.notify();
             }
             "enter" => {
                 // Open the top match: navigate into dirs, open files.
-                if let Some(&i) = self.find_results.first() {
-                    let entry = &self.entries[i];
-                    let target = self.current_dir.join(&entry.name);
+                let tab = self.tab(pane);
+                if let Some(&i) = tab.find_results.first() {
+                    let entry = &tab.entries[i];
+                    let target = tab.current_dir.join(&entry.name);
                     let is_dir = entry.is_dir;
-                    self.find_query = None;
-                    self.find_results.clear();
-                    self.open_path(target, is_dir, cx);
+                    let t = self.tab_mut(pane);
+                    t.find_query = None;
+                    t.find_results.clear();
+                    self.open_path(pane, target, is_dir, cx);
                 } else {
                     cx.notify();
                 }
             }
             "backspace" => {
-                if let Some(s) = self.find_query.as_mut() {
+                if let Some(s) = self.tab_mut(pane).find_query.as_mut() {
                     s.pop();
                 }
-                self.recompute_find();
+                self.recompute_find(pane);
                 cx.notify();
             }
             "v" if cmd => {
                 if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                    if let Some(s) = self.find_query.as_mut() {
+                    if let Some(s) = self.tab_mut(pane).find_query.as_mut() {
                         s.push_str(t.trim());
                     }
-                    self.recompute_find();
+                    self.recompute_find(pane);
                     cx.notify();
                 }
             }
@@ -1535,10 +1681,10 @@ impl Shuffle {
                 }
                 if let Some(ch) = ks.key_char.as_ref() {
                     if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        if let Some(s) = self.find_query.as_mut() {
+                        if let Some(s) = self.tab_mut(pane).find_query.as_mut() {
                             s.push_str(ch);
                         }
-                        self.recompute_find();
+                        self.recompute_find(pane);
                         cx.notify();
                     }
                 }
@@ -1546,10 +1692,123 @@ impl Shuffle {
         }
     }
 
+    // ----- tabs & split panes -----
+
+    /// Open a new tab in `pane`, starting in that pane's current directory.
+    fn new_tab_in(&mut self, pane: usize, cx: &mut Context<Self>) {
+        let dir = self.tab(pane).current_dir.clone();
+        let p = self.pane_mut(pane);
+        p.tabs.push(Tab::new(dir));
+        p.active = p.tabs.len() - 1;
+        self.active_pane = pane;
+        cx.notify();
+        self.prewarm_icons(cx);
+    }
+
+    /// Select a tab in a pane.
+    fn select_tab(&mut self, pane: usize, tab: usize, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        let p = self.pane_mut(pane);
+        if tab < p.tabs.len() {
+            p.active = tab;
+        }
+        cx.notify();
+        self.prewarm_icons(cx);
+    }
+
+    /// Close a tab. Closing a pane's last tab removes the pane (collapsing the
+    /// split); closing the last tab of the last pane is a no-op.
+    fn close_tab(&mut self, pane: usize, tab: usize, cx: &mut Context<Self>) {
+        if pane >= self.panes.len() || tab >= self.panes[pane].tabs.len() {
+            return;
+        }
+        if self.panes[pane].tabs.len() > 1 {
+            let p = self.pane_mut(pane);
+            p.tabs.remove(tab);
+            if p.active >= p.tabs.len() {
+                p.active = p.tabs.len() - 1;
+            } else if tab < p.active {
+                p.active -= 1;
+            }
+        } else if self.panes.len() > 1 {
+            self.panes.remove(pane);
+            self.split_ratio = 0.5;
+        } else {
+            return; // last tab of the only pane — keep it
+        }
+        if self.active_pane >= self.panes.len() {
+            self.active_pane = self.panes.len() - 1;
+        }
+        cx.notify();
+    }
+
+    /// Move a dragged tab to a destination pane at `to_index`. `to_pane ==
+    /// panes.len()` means "create a new pane on the right" (the drag-to-split).
+    fn move_tab(&mut self, from: TabDrag, to_pane: usize, to_index: usize, cx: &mut Context<Self>) {
+        if from.pane >= self.panes.len() || from.tab >= self.panes[from.pane].tabs.len() {
+            return;
+        }
+        let splitting = to_pane >= self.panes.len();
+        // Don't bother splitting when the source pane has a single tab and we'd
+        // just move it to a brand-new pane (no visible change).
+        if splitting && self.panes[from.pane].tabs.len() == 1 && self.panes.len() == 1 {
+            return;
+        }
+        let tab = self.panes[from.pane].tabs.remove(from.tab);
+        // Fix up the source pane's active index after removal.
+        {
+            let p = &mut self.panes[from.pane];
+            if !p.tabs.is_empty() {
+                if p.active >= p.tabs.len() {
+                    p.active = p.tabs.len() - 1;
+                } else if from.tab < p.active {
+                    p.active -= 1;
+                }
+            }
+        }
+
+        if splitting {
+            // New pane on the right with just this tab.
+            self.panes.push(Pane { tabs: vec![tab], active: 0 });
+            self.split_ratio = 0.5;
+            // Drop the source pane if it's now empty.
+            if self.panes[from.pane].tabs.is_empty() {
+                self.panes.remove(from.pane);
+            }
+            self.active_pane = self.panes.len() - 1;
+        } else {
+            // Account for removal shifting indices when within the same pane.
+            let mut dst = to_pane;
+            let mut idx = to_index;
+            if to_pane == from.pane && from.tab < to_index {
+                idx = idx.saturating_sub(1);
+            }
+            // Insert, then prune an emptied source pane (which may shift dst).
+            let src_now_empty = self.panes[from.pane].tabs.is_empty();
+            let at = idx.min(self.panes[dst].tabs.len());
+            self.panes[dst].tabs.insert(at, tab);
+            let new_len = self.panes[dst].tabs.len();
+            self.panes[dst].active = at.min(new_len - 1);
+            if src_now_empty && from.pane != dst {
+                self.panes.remove(from.pane);
+                if from.pane < dst {
+                    dst -= 1;
+                }
+                self.split_ratio = 0.5;
+            }
+            self.active_pane = dst;
+        }
+        if self.active_pane >= self.panes.len() {
+            self.active_pane = self.panes.len() - 1;
+        }
+        cx.notify();
+        self.prewarm_icons(cx);
+    }
+
     /// The floating filter box, anchored bottom-right while find is active.
-    fn render_find_box(&self, query: &str) -> impl IntoElement {
+    fn render_find_box(&self, pane: usize, query: &str) -> impl IntoElement {
         let t = theme();
-        let count = self.find_results.len();
+        let count = self.tab(pane).find_results.len();
         div()
             .absolute()
             .bottom(px(16.0))
@@ -1593,18 +1852,22 @@ impl Shuffle {
         ICON_CACHE.with(|cache| {
             let cache = cache.borrow();
             let mut has_dir = false;
-            for entry in &self.entries {
-                if entry.is_dir {
-                    has_dir = true;
-                    continue;
-                }
-                let path = self.current_dir.join(&entry.name);
-                if let Some(key) = icon_key(&path) {
-                    // Skip types we've already built or already queued.
-                    if cache.contains_key(&key) || !seen.insert(key.clone()) {
+            // Warm icons for the active tab of every visible pane.
+            for pane in &self.panes {
+                let tab = pane.active_tab();
+                for entry in &tab.entries {
+                    if entry.is_dir {
+                        has_dir = true;
                         continue;
                     }
-                    jobs.push((key, path));
+                    let path = tab.current_dir.join(&entry.name);
+                    if let Some(key) = icon_key(&path) {
+                        // Skip types we've already built or already queued.
+                        if cache.contains_key(&key) || !seen.insert(key.clone()) {
+                            continue;
+                        }
+                        jobs.push((key, path));
+                    }
                 }
             }
             // The shared generic folder icon, built once for all directories.
@@ -1636,7 +1899,7 @@ impl Shuffle {
 
     /// Pin the current directory to bookmarks (no-op if already pinned).
     fn add_bookmark(&mut self, cx: &mut Context<Self>) {
-        let dir = self.current_dir.clone();
+        let dir = self.active_tab().current_dir.clone();
         if !self.bookmarks.iter().any(|b| b == &dir) {
             self.bookmarks.push(dir);
             write_path_list("bookmarks.txt", &self.bookmarks);
@@ -1645,7 +1908,8 @@ impl Shuffle {
     }
 
     fn render_sidebar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let current = self.current_dir.as_path();
+        let current = self.active_tab().current_dir.clone();
+        let current = current.as_path();
         let home = home_dir();
         let mut items: Vec<AnyElement> = Vec::new();
         let mut key = 0usize;
@@ -1719,7 +1983,7 @@ impl Shuffle {
         div()
             .id("sidebar")
             .flex_none()
-            .w(px(220.0))
+            .w(px(SIDEBAR_W))
             .h_full()
             .overflow_y_scroll()
             .flex()
@@ -1731,16 +1995,17 @@ impl Shuffle {
             .children(items)
     }
 
-    /// The top bar: back/forward arrows then either the clickable breadcrumb
-    /// or, in edit mode, an editable text field.
-    fn render_path_bar(&self, cx: &Context<Self>) -> impl IntoElement {
-        let can_back = self.hist_pos > 0;
-        let can_fwd = self.hist_pos + 1 < self.history.len();
+    /// The top bar for a pane: back/forward arrows then either the clickable
+    /// breadcrumb or, in edit mode, an editable text field.
+    fn render_path_bar(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
+        let tab = self.tab(pane);
+        let can_back = tab.hist_pos > 0;
+        let can_fwd = tab.hist_pos + 1 < tab.history.len();
 
-        let content: AnyElement = if let Some(text) = &self.editing_path {
+        let content: AnyElement = if let Some(text) = &tab.editing_path {
             self.render_path_editor(text).into_any_element()
         } else {
-            self.render_breadcrumb(cx).into_any_element()
+            self.render_breadcrumb(pane, cx).into_any_element()
         };
 
         div()
@@ -1753,30 +2018,32 @@ impl Shuffle {
             .border_b_1()
             .border_color(rgb(theme().border))
             .child(nav_arrow(
-                "nav-back",
+                ("nav-back", pane),
                 "‹",
                 can_back,
-                cx.listener(|this, _, _, cx| this.go_back(cx)),
+                cx.listener(move |this, _, _, cx| this.go_back(pane, cx)),
             ))
             .child(nav_arrow(
-                "nav-fwd",
+                ("nav-fwd", pane),
                 "›",
                 can_fwd,
-                cx.listener(|this, _, _, cx| this.go_forward(cx)),
+                cx.listener(move |this, _, _, cx| this.go_forward(pane, cx)),
             ))
             .child(content)
     }
 
-    /// Clickable breadcrumb. Segments up to and including the current directory
-    /// are bright; any deeper "forward tail" is grayed but still clickable.
-    /// Empty space to the right enters edit mode.
-    fn render_breadcrumb(&self, cx: &Context<Self>) -> impl IntoElement {
+    /// Clickable breadcrumb for a pane. Segments up to and including the current
+    /// directory are bright; any deeper "forward tail" is grayed but still
+    /// clickable. Empty space to the right enters edit mode.
+    fn render_breadcrumb(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
         use std::path::Component;
 
+        let tab = self.tab(pane);
+        let current_dir = tab.current_dir.clone();
         // Show the deepest tail if the current dir is an ancestor of it.
-        let display = match &self.deepest {
-            Some(d) if d.starts_with(&self.current_dir) => d.clone(),
-            _ => self.current_dir.clone(),
+        let display = match &tab.deepest {
+            Some(d) if d.starts_with(&current_dir) => d.clone(),
+            _ => current_dir.clone(),
         };
 
         let mut segs: Vec<AnyElement> = Vec::new();
@@ -1797,13 +2064,13 @@ impl Shuffle {
             if idx > 0 {
                 segs.push(breadcrumb_sep());
             }
-            let active = self.current_dir.starts_with(&full);
-            segs.push(breadcrumb_seg(idx, label, full, active, cx));
+            let active = current_dir.starts_with(&full);
+            segs.push(breadcrumb_seg(pane * 4096 + idx, pane, label, full, active, cx));
             idx += 1;
         }
 
         div()
-            .id("breadcrumb")
+            .id(("breadcrumb", pane))
             .flex()
             .items_center()
             .flex_1()
@@ -1813,12 +2080,14 @@ impl Shuffle {
             // Filler captures clicks on the empty part of the bar → edit mode.
             .child(
                 div()
-                    .id("path-edit-zone")
+                    .id(("path-edit-zone", pane))
                     .flex_1()
                     .h_full()
                     .min_w_0()
                     .cursor_text()
-                    .on_click(cx.listener(|this, _, window, cx| this.begin_path_edit(window, cx))),
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.begin_path_edit(pane, window, cx)
+                    })),
             )
     }
 
@@ -1842,58 +2111,297 @@ impl Shuffle {
             .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(t.text)))
     }
 
-    fn render_main(&self, cx: &Context<Self>) -> impl IntoElement {
-        // In find mode the list shows the filtered results (no ".." row);
-        // otherwise the full directory with a leading ".." when there's a parent.
-        let find_active = self.find_query.is_some();
-        let has_parent = !find_active && self.current_dir.parent().is_some();
-        let item_count = if find_active {
-            self.find_results.len()
+    /// The canvas: one full-width pane, or two panes split by a draggable
+    /// divider, plus a right-edge drop zone (shown while dragging a tab).
+    fn render_content(&self, cx: &Context<Self>) -> impl IntoElement {
+        let mut row = div().flex_1().flex().min_w_0().h_full().relative();
+
+        if self.panes.len() == 1 {
+            row = row.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .child(self.render_pane(0, cx)),
+            );
         } else {
-            self.entries.len() + usize::from(has_parent)
-        };
+            row = row
+                .child(
+                    div()
+                        .flex_none()
+                        .w(relative(self.split_ratio))
+                        .min_w_0()
+                        .h_full()
+                        .child(self.render_pane(0, cx)),
+                )
+                .child(self.render_divider(cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(self.render_pane(1, cx)),
+                );
+        }
+
+        // Right-edge split target — only present while a tab is being dragged,
+        // so it never blocks normal interaction.
+        if cx.has_active_drag() {
+            let new_pane = self.panes.len();
+            row = row.child(
+                div()
+                    .id("split-zone")
+                    .absolute()
+                    .top_0()
+                    .right_0()
+                    .bottom_0()
+                    .w(relative(0.32))
+                    .border_l_2()
+                    .border_color(rgb(theme().border))
+                    .drag_over::<TabDrag>(|s, _, _, _| {
+                        s.bg(Theme::alpha(theme().accent, 0x33))
+                            .border_color(rgb(theme().accent))
+                    })
+                    .on_drop(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                        this.move_tab(*drag, new_pane, 0, cx);
+                    })),
+            );
+        }
+        row
+    }
+
+    /// The draggable divider between two panes.
+    fn render_divider(&self, cx: &Context<Self>) -> impl IntoElement {
+        div()
+            .id("pane-divider")
+            .flex_none()
+            .w(px(6.0))
+            .h_full()
+            .flex()
+            .justify_center()
+            .cursor(CursorStyle::ResizeLeftRight)
+            .child(div().w(px(1.0)).h_full().bg(rgb(theme().border_strong)))
+            .hover(|s| s.bg(rgb(theme().hover)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                    this.divider_drag = true;
+                    cx.notify();
+                }),
+            )
+    }
+
+    /// Width of a pane's list viewport (≈ pane width), from its scroll state.
+    fn pane_list_width(&self, pane: usize) -> f32 {
+        let st = self.tab(pane).scroll_handle.0.borrow();
+        f64::from(st.base_handle.bounds().size.width) as f32
+    }
+
+    /// Update the split ratio while dragging the divider. `x` is window-relative.
+    fn update_divider(&mut self, x: f32, cx: &mut Context<Self>) {
+        if !self.divider_drag || self.panes.len() < 2 {
+            return;
+        }
+        let content_w = (self.pane_list_width(0) + self.pane_list_width(1)).max(1.0);
+        self.split_ratio = ((x - SIDEBAR_W) / content_w).clamp(0.2, 0.8);
+        cx.notify();
+    }
+
+    /// The tab strip atop a pane: draggable tab chips + a "+" button.
+    fn render_tab_strip(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let p = self.pane(pane);
+        let mut chips: Vec<AnyElement> = Vec::new();
+        for (i, tab) in p.tabs.iter().enumerate() {
+            let active = i == p.active && pane == self.active_pane;
+            let label = path_label(&tab.current_dir);
+            let drag = TabDrag { pane, tab: i };
+            chips.push(
+                div()
+                    .id(("tab", pane * 4096 + i))
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .h(px(TAB_H - 6.0))
+                    .max_w(px(180.0))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(if active { rgb(t.text) } else { rgb(t.text_muted) })
+                    .bg(if active { rgb(t.surface) } else { rgba(0x00000000) })
+                    .hover(|s| s.bg(rgb(t.hover)))
+                    // Drag this tab (live floating preview).
+                    .on_drag(drag, move |_, _, _, cx| {
+                        cx.new(|_| TabDragPreview {
+                            label: label.clone(),
+                        })
+                    })
+                    // Drop another tab here → insert at this position.
+                    .drag_over::<TabDrag>(|s, _, _, _| s.bg(Theme::alpha(theme().accent, 0x33)))
+                    .on_drop(cx.listener(move |this, from: &TabDrag, _, cx| {
+                        this.move_tab(*from, pane, i, cx);
+                    }))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.select_tab(pane, i, cx);
+                    }))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(path_label(&tab.current_dir)),
+                    )
+                    .child(
+                        div()
+                            .id(("tab-close", pane * 4096 + i))
+                            .flex_none()
+                            .px_1()
+                            .rounded_sm()
+                            .text_color(rgb(t.text_dim))
+                            .hover(|s| s.text_color(rgb(t.text)).bg(rgb(t.selected)))
+                            .child("×")
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.close_tab(pane, i, cx);
+                                cx.stop_propagation();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
 
         div()
-            .flex_1()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .px_1()
+            .h(px(TAB_H))
+            .bg(rgb(t.sidebar))
+            .border_b_1()
+            .border_color(rgb(t.border))
+            // Dropping on empty strip space appends to this pane.
+            .drag_over::<TabDrag>(|s, _, _, _| s.bg(rgb(theme().hover)))
+            .on_drop(cx.listener(move |this, from: &TabDrag, _, cx| {
+                let len = this.pane(pane).tabs.len();
+                this.move_tab(*from, pane, len, cx);
+            }))
+            .children(chips)
+            .child(
+                div()
+                    .id(("tab-add", pane))
+                    .flex_none()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(rgb(t.text_muted))
+                    .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+                    .child("+")
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.new_tab_in(pane, cx);
+                    })),
+            )
+    }
+
+    /// Render one pane: tab strip → path bar → column header → virtualized
+    /// listing + scrollbar, plus the right-edge split drop zone.
+    fn render_pane(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
+        let tab = self.tab(pane);
+        // In find mode the list shows the filtered results (no ".." row);
+        // otherwise the full directory with a leading ".." when there's a parent.
+        let find_active = tab.find_query.is_some();
+        let has_parent = !find_active && tab.current_dir.parent().is_some();
+        let item_count = if find_active {
+            tab.find_results.len()
+        } else {
+            tab.entries.len() + usize::from(has_parent)
+        };
+        let scroll = tab.scroll_handle.clone();
+        let h_scroll = tab.h_scroll.clone();
+        // Total natural width of all columns (+ row horizontal padding). When the
+        // pane is narrower than this, the columns scroll horizontally instead of
+        // overflowing into the neighbouring pane.
+        let total_w =
+            self.widths.name + self.widths.kind + self.widths.date + self.widths.size + 24.0;
+        // Highlight the active pane's border (only meaningful when split).
+        let split = self.panes.len() > 1;
+        let active = pane == self.active_pane;
+
+        div()
             .flex()
             .flex_col()
             .min_w_0()
+            .h_full()
+            .when(split && active, |s| {
+                s.border_color(rgb(theme().accent))
+            })
+            // Clicking anywhere in the pane focuses it.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _: &MouseDownEvent, _, _| {
+                    this.active_pane = pane;
+                }),
+            )
+            .child(self.render_tab_strip(pane, cx))
             // Path bar: back/forward arrows + clickable breadcrumb (or editor).
-            .child(self.render_path_bar(cx))
-            // Column header.
-            .child(self.column_header(cx))
-            // Virtualized listing: only the visible rows (and their icons) are
-            // ever built, so cost is constant regardless of directory size.
-            // Wrapped in a relative container so the scrollbar can overlay it.
+            .child(self.render_path_bar(pane, cx))
+            // Body: clips to the pane; the vertical scrollbar + find box overlay it.
             .child(
                 div()
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    // Right-click on empty list space → New Folder/File menu.
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, ev: &MouseDownEvent, _, cx| {
-                            let (x, y) = (
-                                f64::from(ev.position.x) as f32,
-                                f64::from(ev.position.y) as f32,
-                            );
-                            this.open_context_menu(x, y, None, cx);
-                        }),
-                    )
-                    .child(uniform_list(
-                    "file-list",
+                    .child(
+                        // Horizontal scroller holding the column header + rows, so
+                        // they scroll sideways together and never overflow the pane.
+                        div()
+                            .id(("hscroll", pane))
+                            .size_full()
+                            .overflow_x_scroll()
+                            .track_scroll(&h_scroll)
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .h_full()
+                                    .w_full()
+                                    .min_w(px(total_w))
+                                    .child(self.column_header(cx))
+                                    .child(
+                                        div()
+                                            .relative()
+                                            .flex_1()
+                                            .min_h_0()
+                                            // Right-click empty space → New menu.
+                                            .on_mouse_down(
+                                                MouseButton::Right,
+                                                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                                    let (x, y) = (
+                                                        f64::from(ev.position.x) as f32,
+                                                        f64::from(ev.position.y) as f32,
+                                                    );
+                                                    this.open_context_menu(pane, x, y, None, cx);
+                                                }),
+                                            )
+                                            .child(uniform_list(
+                    ("file-list", pane),
                     item_count,
                     cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
                         let widths = this.widths;
-                        let find_active = this.find_query.is_some();
-                        let has_parent = !find_active && this.current_dir.parent().is_some();
+                        let tab = this.tab(pane);
+                        let find_active = tab.find_query.is_some();
+                        let has_parent = !find_active && tab.current_dir.parent().is_some();
+                        let base_dir = tab.current_dir.clone();
                         let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
 
                         for ix in range {
+                            let row_key = pane * 100_000 + ix;
                             if has_parent && ix == 0 {
                                 let parent =
-                                    this.current_dir.parent().unwrap_or(Path::new("/")).to_path_buf();
+                                    base_dir.parent().unwrap_or(Path::new("/")).to_path_buf();
                                 let icon = icon_element(&parent, true);
                                 items.push(
                                     file_row(
@@ -1901,19 +2409,19 @@ impl Shuffle {
                                         true,
                                         0,
                                         None,
-                                        ix,
+                                        row_key,
                                         widths,
                                         icon,
                                         cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                            this.navigate_to(parent.clone(), cx);
+                                            this.navigate_in(pane, parent.clone(), cx);
                                         }),
                                         // ".." → background (New Folder/File) menu.
-                                        cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                                             let (x, y) = (
                                                 f64::from(ev.position.x) as f32,
                                                 f64::from(ev.position.y) as f32,
                                             );
-                                            this.open_context_menu(x, y, None, cx);
+                                            this.open_context_menu(pane, x, y, None, cx);
                                             cx.stop_propagation();
                                         }),
                                     )
@@ -1922,19 +2430,20 @@ impl Shuffle {
                                 continue;
                             }
 
+                            let tab = this.tab(pane);
                             let entry_ix = if find_active {
-                                this.find_results[ix]
+                                tab.find_results[ix]
                             } else if has_parent {
                                 ix - 1
                             } else {
                                 ix
                             };
-                            let entry = &this.entries[entry_ix];
+                            let entry = &tab.entries[entry_ix];
                             let name = entry.name.clone();
                             let is_dir = entry.is_dir;
                             let entry_size = entry.size;
                             let modified = entry.modified;
-                            let target = this.current_dir.join(&name);
+                            let target = base_dir.join(&name);
                             let ctx_target = target.clone();
                             let icon = icon_element(&target, is_dir);
 
@@ -1944,16 +2453,16 @@ impl Shuffle {
                                     is_dir,
                                     entry_size,
                                     modified,
-                                    ix,
+                                    row_key,
                                     widths,
                                     icon,
                                     cx.listener(move |this, ev: &ClickEvent, _, cx| {
                                         // Folders open on a single click; files
                                         // open (via `open`) on a double click.
                                         if is_dir {
-                                            this.navigate_to(target.clone(), cx);
+                                            this.navigate_in(pane, target.clone(), cx);
                                         } else if ev.click_count() >= 2 {
-                                            this.open_path(target.clone(), false, cx);
+                                            this.open_path(pane, target.clone(), false, cx);
                                         }
                                     }),
                                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
@@ -1962,6 +2471,7 @@ impl Shuffle {
                                             f64::from(ev.position.y) as f32,
                                         );
                                         this.open_context_menu(
+                                            pane,
                                             x,
                                             y,
                                             Some((ctx_target.clone(), is_dir)),
@@ -1977,11 +2487,53 @@ impl Shuffle {
                     }),
                 )
                 .size_full()
-                .track_scroll(self.scroll_handle.clone())
-                .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| cx.notify())),
-                )
-                .children(self.scrollbar_thumb(cx)),
+                .track_scroll(scroll)
+                .on_scroll_wheel(cx.listener(move |this, _: &ScrollWheelEvent, _, cx| {
+                    this.active_pane = pane;
+                    cx.notify()
+                })),
+                                            ) // close listing div .child(uniform_list)
+                                    ) // close content flex_col .child(listing div)
+                            ) // close hscroll .child(content)
+                    ) // close body .child(hscroll)
+                    // Vertical scrollbar, pinned to the pane's right edge.
+                    .children(self.scrollbar_thumb(pane, cx))
+                    // Horizontal scrollbar, shown when columns overflow.
+                    .children(self.h_scrollbar_thumb(pane, total_w))
+                    // Floating filter box, when this pane's find is active.
+                    .children(
+                        self.tab(pane)
+                            .find_query
+                            .as_ref()
+                            .map(|q| self.render_find_box(pane, q).into_any_element()),
+                    ),
             )
+    }
+
+    /// Read-only horizontal scroll indicator for a pane's columns. Returns
+    /// `None` when the columns fit (no horizontal overflow).
+    fn h_scrollbar_thumb(&self, pane: usize, _total_w: f32) -> Option<AnyElement> {
+        let base = &self.tab(pane).h_scroll;
+        let viewport = f64::from(base.bounds().size.width) as f32;
+        let max = f64::from(base.max_offset().width) as f32;
+        if viewport <= 1.0 || max <= 1.0 {
+            return None;
+        }
+        let scrolled = (-(f64::from(base.offset().x) as f32)).clamp(0.0, max);
+        let content = viewport + max;
+        let thumb_w = (viewport * viewport / content).clamp(28.0, viewport);
+        let thumb_left = (viewport - thumb_w) * (scrolled / max);
+        Some(
+            div()
+                .absolute()
+                .bottom(px(2.0))
+                .left(px(thumb_left))
+                .h(px(8.0))
+                .w(px(thumb_w))
+                .rounded_full()
+                .bg(rgba(0xffffff33))
+                .into_any_element(),
+        )
     }
 
     /// The non-scrolling header row with labels and drag-to-resize handles.
@@ -2077,22 +2629,22 @@ impl Render for Shuffle {
             // Track column drags anywhere in the window so the cursor can leave
             // the thin handle without dropping the resize.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
-                this.update_resize(f64::from(ev.position.x) as f32, cx);
+                let x = f64::from(ev.position.x) as f32;
+                this.update_resize(x, cx);
                 this.update_scroll_drag(f64::from(ev.position.y) as f32, cx);
+                this.update_divider(x, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, _| {
                     this.end_resize();
                     this.end_scroll_drag();
+                    this.divider_drag = false;
                 }),
             )
             .child(self.render_sidebar(cx))
-            .child(self.render_main(cx));
+            .child(self.render_content(cx));
 
-        if let Some(q) = &self.find_query {
-            root = root.child(self.render_find_box(q));
-        }
         if self.palette_open {
             root = root.child(self.render_palette(cx));
         }
@@ -2128,7 +2680,7 @@ fn push_nav(
 
 /// A back/forward navigation arrow. Dimmed and inert when `enabled` is false.
 fn nav_arrow(
-    id: &'static str,
+    id: impl Into<ElementId>,
     glyph: &'static str,
     enabled: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -2155,9 +2707,10 @@ fn nav_arrow(
     }
 }
 
-/// One clickable breadcrumb segment that navigates to `full` when clicked.
+/// One clickable breadcrumb segment that navigates `pane` to `full` when clicked.
 fn breadcrumb_seg(
-    idx: usize,
+    key: usize,
+    pane: usize,
     label: String,
     full: PathBuf,
     active: bool,
@@ -2165,7 +2718,7 @@ fn breadcrumb_seg(
 ) -> AnyElement {
     let t = theme();
     div()
-        .id(("crumb", idx))
+        .id(("crumb", key))
         .flex_none()
         .px_1()
         .h(px(20.0))
@@ -2177,7 +2730,7 @@ fn breadcrumb_seg(
         .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
         .child(label)
         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.navigate_to(full.clone(), cx);
+            this.navigate_in(pane, full.clone(), cx);
             cx.stop_propagation();
         }))
         .into_any_element()
