@@ -25,7 +25,11 @@ use gpui::{
     RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, TitlebarOptions,
     UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
-use objc2_app_kit::{NSImage, NSWorkspace};
+use objc2::AllocAnyThread;
+use objc2_app_kit::{
+    NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace, NSGraphicsContext, NSImage,
+    NSWorkspace,
+};
 use objc2_foundation::{NSData, NSFileManager, NSString, NSURL};
 use rayon::prelude::*;
 
@@ -4160,9 +4164,10 @@ impl Shuffle {
 
         cx.spawn(async move |this, cx| {
             for (key, path) in jobs {
-                // The AppKit fetch is quick and must be on the main thread; the
-                // heavy TIFF decode/resize runs on a background thread so it
-                // never blocks rendering during navigation.
+                // AppKit's icon fetch must stay on the main thread (calling it
+                // off-main can deadlock), but it's the cheap part. The heavy TIFF
+                // decode/resize runs on a background thread so it never blocks
+                // rendering.
                 let tiff = icon_tiff(&path);
                 let built = match tiff {
                     Some(t) => cx.background_spawn(async move { decode_icon(&t) }).await,
@@ -4172,12 +4177,10 @@ impl Shuffle {
                     cache.borrow_mut().insert(key, built);
                 });
                 // Repaint so the freshly-built icon appears; stop if the view
-                // is gone.
+                // is gone. (The decode already happened off-thread above.)
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
                 }
-                // Yield so frames can render between builds.
-                cx.background_executor().timer(Duration::from_millis(1)).await;
             }
         })
         .detach();
@@ -6159,14 +6162,44 @@ fn ensure_base_icons() {
 /// Ask NSWorkspace for `path`'s icon, decode it, and convert to a GPUI image.
 /// This is the expensive part (AppKit + TIFF decode + resize), so it runs only
 /// off the render path, in the background pre-warm task.
-/// Fetch the raw TIFF bytes for a file's macOS icon. Touches AppKit, so this
-/// must run on the main thread; it's the cheap part of building an icon.
+/// Fetch a file's macOS icon as TIFF bytes, rendered at a small fixed size.
+///
+/// `iconForFile` is instant, but `NSImage::TIFFRepresentation` renders *every*
+/// representation up to 1024px (tens to hundreds of ms). Instead we draw the
+/// icon once into a 128px bitmap and serialize only that — a few ms. Touches
+/// AppKit, so it must run on the main thread.
 fn icon_tiff(path: &Path) -> Option<Vec<u8>> {
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
     let path_str = path.to_str()?;
     let workspace = NSWorkspace::sharedWorkspace();
     let ns_path = NSString::from_str(path_str);
     let image: objc2::rc::Retained<NSImage> = workspace.iconForFile(&ns_path);
-    let data: objc2::rc::Retained<NSData> = image.TIFFRepresentation()?;
+
+    let rep = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            128,
+            128,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            0,
+            0,
+        )
+    }?;
+    let ctx = NSGraphicsContext::graphicsContextWithBitmapImageRep(&rep)?;
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&ctx));
+    let dst = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(128.0, 128.0));
+    let zero = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+    image.drawInRect_fromRect_operation_fraction(dst, zero, NSCompositingOperation::Copy, 1.0);
+    NSGraphicsContext::restoreGraphicsState_class();
+
+    let data: objc2::rc::Retained<NSData> = rep.TIFFRepresentation()?;
     if data.len() == 0 {
         return None;
     }
@@ -6420,13 +6453,10 @@ fn read_entries_fast(dir: &Path) -> Vec<Entry> {
     entries
 }
 
-/// The default ordering (folders first, then case-insensitive by name).
+/// The default ordering (folders first, then case-insensitive by name). Uses
+/// `sort_by_cached_key` so each name is lowercased once, not on every compare.
 fn sort_default(entries: &mut [Entry]) {
-    entries.sort_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-    });
+    entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
 }
 
 thread_local! {
@@ -6450,29 +6480,24 @@ fn clear_column_cache() {
     COL_ENTRIES.with(|c| c.borrow_mut().clear());
 }
 
-/// Sort a directory listing in place by the given criterion/direction.
+/// Sort a directory listing in place by the given criterion/direction. Uses
+/// `sort_by_cached_key` for name/kind so strings are lowercased once per item
+/// (not on every comparison) — important for large folders.
 fn sort_entries(entries: &mut [Entry], key: SortKey, asc: bool) {
     match key {
         SortKey::None => {
-            entries.sort_by(|a, b| {
-                b.is_dir
-                    .cmp(&a.is_dir)
-                    .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            });
+            sort_default(entries);
             return;
         }
-        SortKey::Name => {
-            entries.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+        SortKey::Name => entries.sort_by_cached_key(|e| e.name.to_lowercase()),
+        SortKey::Kind => {
+            entries.sort_by_cached_key(|e| {
+                (kind_label(&e.name, e.is_dir).to_lowercase(), e.name.to_lowercase())
+            });
         }
-        SortKey::Kind => entries.sort_by(|a, b| {
-            kind_label(&a.name, a.is_dir)
-                .to_lowercase()
-                .cmp(&kind_label(&b.name, b.is_dir).to_lowercase())
-                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-        }),
-        SortKey::Modified => entries.sort_by(|a, b| a.modified.cmp(&b.modified)),
-        SortKey::Created => entries.sort_by(|a, b| a.created.cmp(&b.created)),
-        SortKey::Size => entries.sort_by(|a, b| a.size.cmp(&b.size)),
+        SortKey::Modified => entries.sort_by_key(|e| e.modified),
+        SortKey::Created => entries.sort_by_key(|e| e.created),
+        SortKey::Size => entries.sort_by_key(|e| e.size),
     }
     if !asc {
         entries.reverse();
@@ -7201,6 +7226,78 @@ fn main() {
                 hits.iter().map(|h| h.0.clone()).collect::<Vec<_>>()
             );
         }
+        return;
+    }
+
+    // Hidden timing bench: `shuffle --dir-bench <path>` reports how long each
+    // load phase takes for a real folder.
+    if args.len() >= 3 && args[1] == "--dir-bench" {
+        let p = PathBuf::from(&args[2]);
+
+        let t = std::time::Instant::now();
+        let fast = read_entries_fast(&p);
+        eprintln!(
+            "read_entries_fast: {} entries in {} ms",
+            fast.len(),
+            t.elapsed().as_millis()
+        );
+
+        let t = std::time::Instant::now();
+        let full = read_entries(&p);
+        eprintln!(
+            "read_entries (stat each): {} entries in {} ms",
+            full.len(),
+            t.elapsed().as_millis()
+        );
+
+        // Distinct file types (what prewarm actually builds).
+        let mut types: HashSet<String> = HashSet::new();
+        for e in &fast {
+            if let Some(k) = icon_key(&p.join(&e.name)) {
+                types.insert(k);
+            }
+        }
+        eprintln!("distinct file types: {}", types.len());
+
+        ensure_base_icons();
+        // Separate iconForFile from TIFFRepresentation to see which is slow.
+        for e in fast.iter().filter(|e| !e.is_dir).take(3) {
+            let path = p.join(&e.name);
+            let ps = path.to_str().unwrap();
+            let ws = NSWorkspace::sharedWorkspace();
+            let ns = NSString::from_str(ps);
+            let t1 = std::time::Instant::now();
+            let img = ws.iconForFile(&ns);
+            let icon_ms = t1.elapsed().as_millis();
+            let t2 = std::time::Instant::now();
+            let _ = img.TIFFRepresentation();
+            let tiff_ms = t2.elapsed().as_millis();
+            eprintln!("{}: iconForFile {icon_ms} ms, TIFFRepresentation {tiff_ms} ms", e.name);
+        }
+
+        let t = std::time::Instant::now();
+        let mut total_tiff = 0u128;
+        let mut seen: HashSet<String> = HashSet::new();
+        for e in &fast {
+            if e.is_dir {
+                continue;
+            }
+            let path = p.join(&e.name);
+            if let Some(k) = icon_key(&path) {
+                if !seen.insert(k) {
+                    continue;
+                }
+                let t1 = std::time::Instant::now();
+                let _ = icon_tiff(&path);
+                total_tiff += t1.elapsed().as_millis();
+            }
+        }
+        eprintln!(
+            "all distinct icon TIFF fetches: {} types in {} ms (total wall {} ms)",
+            seen.len(),
+            total_tiff,
+            t.elapsed().as_millis()
+        );
         return;
     }
 
