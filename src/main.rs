@@ -1125,6 +1125,8 @@ struct Entry {
     size: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
+    /// Whether size/dates have been read (the fast first pass leaves them empty).
+    loaded: bool,
 }
 
 /// How the listing is sorted. `None` is the default (folders first, by name).
@@ -1194,11 +1196,15 @@ struct Tab {
     col_chain: Vec<PathBuf>,
     /// Column view: which column currently has keyboard focus.
     col_active: usize,
+    /// Generation of the latest load, so a stale background metadata fill is
+    /// discarded if the user navigated away.
+    load_gen: u64,
 }
 
 impl Tab {
     fn new(dir: PathBuf) -> Self {
-        let entries = read_entries(&dir);
+        // Fast first paint; full metadata is filled in from the background.
+        let entries = read_entries_fast(&dir);
         Tab {
             current_dir: dir.clone(),
             entries,
@@ -1217,6 +1223,7 @@ impl Tab {
             view: ViewMode::List,
             col_chain: Vec::new(),
             col_active: 0,
+            load_gen: 0,
         }
     }
 }
@@ -1309,6 +1316,8 @@ struct Shuffle {
     sort_menu: Option<(usize, f32, f32)>,
     /// Pending "move to Trash" confirmation: (pane, paths).
     confirm_delete: Option<(usize, Vec<PathBuf>)>,
+    /// Monotonic counter tagging each directory load (for stale-result guards).
+    next_load_gen: u64,
     /// In-progress marquee (box) selection: (pane, start, current) window coords.
     marquee: Option<(usize, (f32, f32), (f32, f32))>,
     // Terminal mode (the bottom command bar).
@@ -1361,6 +1370,7 @@ impl Shuffle {
             rename: None,
             sort_menu: None,
             confirm_delete: None,
+            next_load_gen: 0,
             marquee: None,
             term_input: String::new(),
             term_output: Vec::new(),
@@ -1423,10 +1433,44 @@ impl Shuffle {
     /// Re-read a pane's current directory contents (after a create/trash).
     fn refresh_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
         clear_column_cache();
+        self.reload_pane(pane, cx);
+    }
+
+    /// Load (or reload) a pane's directory: a near-instant cheap pass for first
+    /// paint, then a background pass that fills in sizes/dates without blocking.
+    fn reload_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
         let dir = self.tab(pane).current_dir.clone();
-        self.tab_mut(pane).entries = read_entries(&dir);
+        self.tab_mut(pane).entries = read_entries_fast(&dir);
+        self.next_load_gen += 1;
+        let gen = self.next_load_gen;
+        self.tab_mut(pane).load_gen = gen;
         self.sort_tab(pane);
+        if self.tab(pane).find_query.is_some() {
+            self.recompute_find(pane);
+        }
         cx.notify();
+        self.prewarm_icons(cx);
+
+        // Fill full metadata in the background, then swap it in if still current.
+        cx.spawn(async move |this, cx| {
+            let d = dir.clone();
+            let full = cx.background_spawn(async move { read_entries(&d) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if pane < this.panes.len()
+                    && this.tab(pane).load_gen == gen
+                    && this.tab(pane).current_dir == dir
+                {
+                    this.tab_mut(pane).entries = full;
+                    this.sort_tab(pane);
+                    if this.tab(pane).find_query.is_some() {
+                        this.recompute_find(pane);
+                    }
+                    cx.notify();
+                    this.prewarm_icons(cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Re-apply this tab's sort criterion to its entries.
@@ -1537,11 +1581,8 @@ impl Shuffle {
     fn refresh_all_panes(&mut self, cx: &mut Context<Self>) {
         clear_column_cache();
         for p in 0..self.panes.len() {
-            let dir = self.tab(p).current_dir.clone();
-            self.tab_mut(p).entries = read_entries(&dir);
-            self.sort_tab(p);
+            self.reload_pane(p, cx);
         }
-        cx.notify();
     }
 
     /// Move `src` into `dest_dir` (a drag-and-drop between folders/panes). No-op
@@ -2967,22 +3008,24 @@ impl Shuffle {
     /// NOT touch back/forward history (callers manage that).
     fn load_dir_in(&mut self, pane: usize, dir: PathBuf, cx: &mut Context<Self>) {
         self.rename = None;
-        let tab = self.tab_mut(pane);
-        tab.entries = read_entries(&dir);
-        // Keep the grayed-out forward tail in the breadcrumb when moving to an
-        // ancestor of where we were; otherwise the tail resets to here.
-        let keep = tab.deepest.as_ref().is_some_and(|d| d.starts_with(&dir));
-        if !keep {
-            tab.deepest = Some(dir.clone());
+        clear_column_cache();
+        {
+            let tab = self.tab_mut(pane);
+            // Keep the grayed-out forward tail in the breadcrumb when moving to an
+            // ancestor of where we were; otherwise the tail resets to here.
+            let keep = tab.deepest.as_ref().is_some_and(|d| d.starts_with(&dir));
+            if !keep {
+                tab.deepest = Some(dir.clone());
+            }
+            tab.current_dir = dir.clone();
+            tab.editing_path = None;
+            tab.find_query = None;
+            tab.find_results.clear();
+            tab.selection.clear();
+            tab.anchor = None;
+            tab.col_chain.clear();
+            tab.col_active = 0;
         }
-        tab.current_dir = dir.clone();
-        tab.editing_path = None;
-        tab.find_query = None;
-        tab.find_results.clear();
-        tab.selection.clear();
-        tab.anchor = None;
-        tab.col_chain.clear();
-        tab.col_active = 0;
         save_last_dir(&dir);
 
         self.recents.retain(|p| p != &dir);
@@ -2990,9 +3033,8 @@ impl Shuffle {
         self.recents.truncate(RECENTS_CAP);
         write_path_list("recents.txt", &self.recents);
 
-        self.sort_tab(pane);
-        cx.notify();
-        self.prewarm_icons(cx);
+        // Fast first paint + background metadata fill.
+        self.reload_pane(pane, cx);
     }
 
     /// Navigate a pane into `dir` if it is a directory. New navigation truncates
@@ -3212,8 +3254,8 @@ impl Shuffle {
         p.tabs.push(Tab::new(dir));
         p.active = p.tabs.len() - 1;
         self.active_pane = pane;
-        cx.notify();
-        self.prewarm_icons(cx);
+        // Fill the new tab's metadata in the background.
+        self.reload_pane(pane, cx);
     }
 
     /// Select a tab in a pane.
@@ -3225,6 +3267,10 @@ impl Shuffle {
         }
         cx.notify();
         self.prewarm_icons(cx);
+        // If this tab only got the fast pass, finish loading its metadata.
+        if self.tab(pane).entries.iter().any(|e| !e.loaded) {
+            self.reload_pane(pane, cx);
+        }
     }
 
     /// Close a tab. Closing a pane's last tab removes the pane (collapsing the
@@ -4114,7 +4160,14 @@ impl Shuffle {
 
         cx.spawn(async move |this, cx| {
             for (key, path) in jobs {
-                let built = build_macos_icon(&path);
+                // The AppKit fetch is quick and must be on the main thread; the
+                // heavy TIFF decode/resize runs on a background thread so it
+                // never blocks rendering during navigation.
+                let tiff = icon_tiff(&path);
+                let built = match tiff {
+                    Some(t) => cx.background_spawn(async move { decode_icon(&t) }).await,
+                    None => None,
+                };
                 ICON_CACHE.with(|cache| {
                     cache.borrow_mut().insert(key, built);
                 });
@@ -4123,7 +4176,7 @@ impl Shuffle {
                 if this.update(cx, |_, cx| cx.notify()).is_err() {
                     break;
                 }
-                // Yield to the executor so frames can render between builds.
+                // Yield so frames can render between builds.
                 cx.background_executor().timer(Duration::from_millis(1)).await;
             }
         })
@@ -4749,6 +4802,7 @@ impl Shuffle {
                                         true,
                                         0,
                                         None,
+                                        true,        // ".." has no metadata to load
                                         row_key,
                                         false,
                                         widths,
@@ -4793,6 +4847,7 @@ impl Shuffle {
                             let is_dir = entry.is_dir;
                             let entry_size = entry.size;
                             let modified = entry.modified;
+                            let entry_loaded = entry.loaded;
                             let target = base_dir.join(&name);
                             let ctx_target = target.clone();
                             let drop_target = target.clone();
@@ -4816,6 +4871,7 @@ impl Shuffle {
                                     is_dir,
                                     entry_size,
                                     modified,
+                                    entry_loaded,
                                     row_key,
                                     is_selected,
                                     widths,
@@ -5704,6 +5760,7 @@ fn file_row(
     is_dir: bool,
     size: u64,
     modified: Option<SystemTime>,
+    loaded: bool,
     key: usize,
     selected: bool,
     widths: ColumnWidths,
@@ -5809,7 +5866,7 @@ fn file_row(
                 .text_color(meta_color)
                 .child(kind),
         )
-        // Date modified.
+        // Date modified ("--" until the background metadata pass fills it in).
         .child(
             div()
                 .flex_none()
@@ -5817,7 +5874,7 @@ fn file_row(
                 .pr_3()
                 .truncate()
                 .text_color(meta_color)
-                .child(format_date(modified)),
+                .child(if loaded { format_date(modified) } else { "--".to_string() }),
         )
         // Size (right-aligned).
         .child(
@@ -5827,7 +5884,7 @@ fn file_row(
                 .flex()
                 .justify_end()
                 .text_color(meta_color)
-                .child(format_size(is_dir, size)),
+                .child(if loaded { format_size(is_dir, size) } else { "--".to_string() }),
         )
         // Slack space after the last column (keeps row hover full-width).
         .child(div().flex_1())
@@ -6102,23 +6159,26 @@ fn ensure_base_icons() {
 /// Ask NSWorkspace for `path`'s icon, decode it, and convert to a GPUI image.
 /// This is the expensive part (AppKit + TIFF decode + resize), so it runs only
 /// off the render path, in the background pre-warm task.
-fn build_macos_icon(path: &Path) -> Option<Arc<RenderImage>> {
+/// Fetch the raw TIFF bytes for a file's macOS icon. Touches AppKit, so this
+/// must run on the main thread; it's the cheap part of building an icon.
+fn icon_tiff(path: &Path) -> Option<Vec<u8>> {
     let path_str = path.to_str()?;
-    let tiff: Vec<u8> = {
-        let workspace = NSWorkspace::sharedWorkspace();
-        let ns_path = NSString::from_str(path_str);
-        let image: objc2::rc::Retained<NSImage> = workspace.iconForFile(&ns_path);
-        let data: objc2::rc::Retained<NSData> = image.TIFFRepresentation()?;
-        if data.len() == 0 {
-            return None;
-        }
-        data.to_vec()
-    };
+    let workspace = NSWorkspace::sharedWorkspace();
+    let ns_path = NSString::from_str(path_str);
+    let image: objc2::rc::Retained<NSImage> = workspace.iconForFile(&ns_path);
+    let data: objc2::rc::Retained<NSData> = image.TIFFRepresentation()?;
+    if data.len() == 0 {
+        return None;
+    }
+    Some(data.to_vec())
+}
 
-    let decoded = image::load_from_memory(&tiff).ok()?;
-    // Cache at 128px so icons stay crisp in the large Icons/Gallery views (the
-    // GPU downscales cleanly to 16px in list view). Lanczos3 keeps it sharp;
-    // each cached icon is ~64KB and there's only one per file type.
+/// Decode TIFF icon bytes and convert to a 128px GPUI image. Pure CPU (the
+/// expensive part — the large TIFF decode), safe to run off the main thread.
+fn decode_icon(tiff: &[u8]) -> Option<Arc<RenderImage>> {
+    let decoded = image::load_from_memory(tiff).ok()?;
+    // 128px stays crisp in the Icons/Gallery views; the GPU downscales cleanly
+    // to 16px in list view. One cached icon per file type.
     let decoded = decoded.resize_exact(128, 128, image::imageops::FilterType::Lanczos3);
     let rgba = decoded.to_rgba8();
     let (w, h) = rgba.dimensions();
@@ -6128,8 +6188,15 @@ fn build_macos_icon(path: &Path) -> Option<Arc<RenderImage>> {
         px.swap(0, 2);
     }
     let buffer = image::RgbaImage::from_raw(w, h, raw)?;
-    let frame = image::Frame::new(buffer);
-    Some(Arc::new(RenderImage::new(vec![frame])))
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+}
+
+/// Build a file's icon synchronously (AppKit fetch + decode). Used only at
+/// startup for the base folder/file icons; the per-type prewarm splits these
+/// across threads to keep navigation smooth.
+fn build_macos_icon(path: &Path) -> Option<Arc<RenderImage>> {
+    let tiff = icon_tiff(path)?;
+    decode_icon(&tiff)
 }
 
 thread_local! {
@@ -6297,8 +6364,9 @@ fn format_size(is_dir: bool, size: u64) -> String {
     }
 }
 
-/// Read a directory's entries, sorted directories-first then case-insensitive
-/// by name. Unreadable directories yield an empty list.
+/// Read a directory's entries with full metadata (one `stat` per entry), sorted
+/// directories-first then case-insensitive by name. This is the slow path; the
+/// UI shows `read_entries_fast` first and swaps this in from the background.
 fn read_entries(dir: &Path) -> Vec<Entry> {
     let mut entries: Vec<Entry> = Vec::new();
     if let Ok(read_dir) = fs::read_dir(dir) {
@@ -6316,17 +6384,49 @@ fn read_entries(dir: &Path) -> Vec<Entry> {
                 size,
                 modified,
                 created,
+                loaded: true,
             });
         }
     }
-    // Default order (folders first, by name). Re-sorted later if the tab has a
-    // different sort criterion.
+    sort_default(&mut entries);
+    entries
+}
+
+/// Read a directory's entries cheaply — names + folder/file from the readdir
+/// `d_type`, with **no** per-file `stat` (only symlinks are resolved). This is
+/// near-instant even for very large folders; size/dates fill in later.
+fn read_entries_fast(dir: &Path) -> Vec<Entry> {
+    let mut entries: Vec<Entry> = Vec::new();
+    if let Ok(read_dir) = fs::read_dir(dir) {
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let is_dir = match entry.file_type() {
+                Ok(t) if t.is_dir() => true,
+                // Resolving a symlink needs a stat, but symlinks are rare.
+                Ok(t) if t.is_symlink() => entry.path().is_dir(),
+                _ => false,
+            };
+            entries.push(Entry {
+                name,
+                is_dir,
+                size: 0,
+                modified: None,
+                created: None,
+                loaded: false,
+            });
+        }
+    }
+    sort_default(&mut entries);
+    entries
+}
+
+/// The default ordering (folders first, then case-insensitive by name).
+fn sort_default(entries: &mut [Entry]) {
     entries.sort_by(|a, b| {
         b.is_dir
             .cmp(&a.is_dir)
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
-    entries
 }
 
 thread_local! {
@@ -6340,7 +6440,8 @@ fn column_entries(dir: &Path) -> Vec<Entry> {
     if let Some(v) = COL_ENTRIES.with(|c| c.borrow().get(dir).cloned()) {
         return v;
     }
-    let v = read_entries(dir);
+    // Columns only show name + icon, so the cheap (no-stat) read is enough.
+    let v = read_entries_fast(dir);
     COL_ENTRIES.with(|c| c.borrow_mut().insert(dir.to_path_buf(), v.clone()));
     v
 }
@@ -7148,9 +7249,11 @@ fn main() {
             },
             |window, cx| {
                 let view = cx.new(|cx| {
-                    let finder = Shuffle::new(load_last_dir(), cx);
+                    let mut finder = Shuffle::new(load_last_dir(), cx);
                     finder.prewarm_icons(cx);
                     finder.build_index(cx);
+                    // Fill the initial folder's metadata in the background.
+                    finder.reload_pane(0, cx);
                     finder
                 });
                 // Focus the root so it receives keystrokes (Cmd+P) immediately.
