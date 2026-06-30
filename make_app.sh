@@ -11,6 +11,14 @@ mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/shuffle "$APP/Contents/MacOS/shuffle"
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
+# Compile the native "Remove Background" helper (Vision framework) next to the
+# main binary. Best-effort: if swiftc is missing the feature just won't appear.
+if command -v swiftc >/dev/null 2>&1; then
+    swiftc -O removebg.swift -o "$APP/Contents/MacOS/removebg" 2>/dev/null \
+        && echo "Built removebg helper" \
+        || echo "WARNING: removebg helper failed to compile (Remove Background disabled)"
+fi
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

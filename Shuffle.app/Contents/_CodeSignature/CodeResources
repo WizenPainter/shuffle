@@ -6,16 +6,25 @@
 	<dict>
 		<key>Resources/AppIcon.icns</key>
 		<data>
-		LfGxsyafaOZetad5c6FzW8zhlcQ=
+		gfeFhEFIsfoxkwWq0pgFb4A1QBI=
 		</data>
 	</dict>
 	<key>files2</key>
 	<dict>
+		<key>MacOS/removebg</key>
+		<dict>
+			<key>cdhash</key>
+			<data>
+			7bjKYY2PStqs83NRGuy+m+dRqFM=
+			</data>
+			<key>requirement</key>
+			<string>cdhash H"edb8ca618d8f4adaacf373511aecbe9be751a853"</string>
+		</dict>
 		<key>Resources/AppIcon.icns</key>
 		<dict>
 			<key>hash2</key>
 			<data>
-			BTosQbqHItp2o6skB0wX4C/yiFhA4tdZsg3G+Pf3B4A=
+			d2Vz8pB9CAHGml9CIRBkMosvzDP+ub4oX020SRzVVxo=
 			</data>
 		</dict>
 	</dict>
