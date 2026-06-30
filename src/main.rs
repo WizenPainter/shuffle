@@ -22,7 +22,7 @@ use gpui::{
     actions, anchored, div, img, point, prelude::*, px, relative, rgb, rgba, size, uniform_list, AnyElement, App,
     Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, FocusHandle, ImageSource,
     KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Rgba,
-    RenderImage, ScrollHandle, ScrollWheelEvent, SharedString, TitlebarOptions,
+    RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, TitlebarOptions,
     UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use objc2_app_kit::{NSImage, NSWorkspace};
@@ -267,8 +267,8 @@ fn apply_theme(t: Theme, cx: &mut App) {
 
 // ----- feature preferences (the General tab toggles) -------------------------
 
-/// User-toggleable features, all off by default.
-#[derive(Clone, Copy, Default)]
+/// User-toggleable features.
+#[derive(Clone, Copy)]
 struct Prefs {
     /// Show a terminal-style command input at the bottom of the explorer.
     terminal: bool,
@@ -278,6 +278,20 @@ struct Prefs {
     preview: bool,
     /// Show file information in the inspector when a file is selected.
     info: bool,
+    /// Show the leading ".." row that goes up one level.
+    show_parent: bool,
+}
+
+impl Default for Prefs {
+    fn default() -> Self {
+        Prefs {
+            terminal: false,
+            term_history: false,
+            preview: false,
+            info: false,
+            show_parent: true,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -290,6 +304,7 @@ thread_local! {
         term_history: false,
         preview: false,
         info: false,
+        show_parent: true,
     }) };
 }
 
@@ -310,21 +325,224 @@ fn apply_prefs(p: Prefs, cx: &mut App) {
     cx.refresh_windows();
 }
 
+// ----- keybindings -----------------------------------------------------------
+
+/// Every rebindable action.
+#[derive(Clone, Copy, PartialEq)]
+enum KeyAction {
+    CommandPalette,
+    NewTab,
+    CloseTab,
+    Find,
+    SelectAll,
+    NewFile,
+    NewFolder,
+    Rename,
+    CopyPath,
+    Duplicate,
+    MakeAlias,
+    Compress,
+    MoveToTrash,
+    RevealInFinder,
+    Open,
+}
+
+impl KeyAction {
+    const ALL: &'static [KeyAction] = &[
+        KeyAction::CommandPalette,
+        KeyAction::NewTab,
+        KeyAction::CloseTab,
+        KeyAction::Find,
+        KeyAction::SelectAll,
+        KeyAction::NewFile,
+        KeyAction::NewFolder,
+        KeyAction::Rename,
+        KeyAction::CopyPath,
+        KeyAction::Duplicate,
+        KeyAction::MakeAlias,
+        KeyAction::Compress,
+        KeyAction::MoveToTrash,
+        KeyAction::RevealInFinder,
+        KeyAction::Open,
+    ];
+
+    fn id(self) -> usize {
+        Self::ALL.iter().position(|a| *a == self).unwrap()
+    }
+
+    /// Stable key used for persistence.
+    fn key(self) -> &'static str {
+        match self {
+            KeyAction::CommandPalette => "command_palette",
+            KeyAction::NewTab => "new_tab",
+            KeyAction::CloseTab => "close_tab",
+            KeyAction::Find => "find",
+            KeyAction::SelectAll => "select_all",
+            KeyAction::NewFile => "new_file",
+            KeyAction::NewFolder => "new_folder",
+            KeyAction::Rename => "rename",
+            KeyAction::CopyPath => "copy_path",
+            KeyAction::Duplicate => "duplicate",
+            KeyAction::MakeAlias => "make_alias",
+            KeyAction::Compress => "compress",
+            KeyAction::MoveToTrash => "move_to_trash",
+            KeyAction::RevealInFinder => "reveal_in_finder",
+            KeyAction::Open => "open",
+        }
+    }
+
+    /// Human label shown in Settings.
+    fn label(self) -> &'static str {
+        match self {
+            KeyAction::CommandPalette => "Command palette",
+            KeyAction::NewTab => "New tab",
+            KeyAction::CloseTab => "Close tab",
+            KeyAction::Find => "Filter current folder",
+            KeyAction::SelectAll => "Select all",
+            KeyAction::NewFile => "New file",
+            KeyAction::NewFolder => "New folder",
+            KeyAction::Rename => "Rename",
+            KeyAction::CopyPath => "Copy path",
+            KeyAction::Duplicate => "Duplicate",
+            KeyAction::MakeAlias => "Make alias",
+            KeyAction::Compress => "Compress",
+            KeyAction::MoveToTrash => "Move to Trash",
+            KeyAction::RevealInFinder => "Reveal in Finder",
+            KeyAction::Open => "Open",
+        }
+    }
+
+    /// Default keystroke (some actions are unbound by default).
+    fn default_binding(self) -> Option<&'static str> {
+        match self {
+            KeyAction::CommandPalette => Some("cmd-p"),
+            KeyAction::NewTab => Some("cmd-t"),
+            KeyAction::CloseTab => Some("cmd-w"),
+            KeyAction::Find => Some("/"),
+            KeyAction::SelectAll => Some("cmd-a"),
+            _ => None,
+        }
+    }
+}
+
+/// The active key bindings (one optional keystroke per action).
+#[derive(Clone)]
+struct Keymap {
+    binds: Vec<Option<String>>,
+}
+
+impl Keymap {
+    fn defaults() -> Self {
+        Keymap {
+            binds: KeyAction::ALL
+                .iter()
+                .map(|a| a.default_binding().map(String::from))
+                .collect(),
+        }
+    }
+    fn get(&self, a: KeyAction) -> Option<&str> {
+        self.binds[a.id()].as_deref()
+    }
+    fn set(&mut self, a: KeyAction, b: Option<String>) {
+        self.binds[a.id()] = b;
+    }
+    /// The action bound to keystroke `ks`, if any.
+    fn action_for(&self, ks: &str) -> Option<KeyAction> {
+        KeyAction::ALL.iter().copied().find(|a| self.get(*a) == Some(ks))
+    }
+}
+
+#[derive(Clone)]
+struct KeymapGlobal(Keymap);
+impl gpui::Global for KeymapGlobal {}
+
+thread_local! {
+    static ACTIVE_KEYMAP: RefCell<Keymap> = RefCell::new(Keymap::defaults());
+}
+
+fn keymap() -> Keymap {
+    ACTIVE_KEYMAP.with(|k| k.borrow().clone())
+}
+
+fn set_active_keymap(k: Keymap) {
+    ACTIVE_KEYMAP.with(|c| *c.borrow_mut() = k);
+}
+
+fn apply_keymap(k: Keymap, cx: &mut App) {
+    set_active_keymap(k.clone());
+    save_keymap(&k);
+    cx.set_global(KeymapGlobal(k));
+    cx.refresh_windows();
+}
+
+/// Canonical string for a keystroke, e.g. "cmd-shift-p" or "/".
+fn canon_keystroke(ks: &gpui::Keystroke) -> String {
+    let m = &ks.modifiers;
+    let mut s = String::new();
+    if m.platform {
+        s.push_str("cmd-");
+    }
+    if m.control {
+        s.push_str("ctrl-");
+    }
+    if m.alt {
+        s.push_str("alt-");
+    }
+    if m.shift {
+        s.push_str("shift-");
+    }
+    s.push_str(&ks.key);
+    s
+}
+
 /// The Settings window: a tabbed customization surface.
 struct Settings {
     tab: usize,
+    focus: FocusHandle,
+    /// The action whose keystroke is currently being recorded, if any.
+    recording: Option<KeyAction>,
 }
 
 impl Settings {
-    fn new() -> Self {
-        Settings { tab: 0 }
+    fn new(cx: &mut Context<Self>) -> Self {
+        Settings {
+            tab: 0,
+            focus: cx.focus_handle(),
+            recording: None,
+        }
+    }
+
+    /// Capture the next keystroke for the action being rebound.
+    fn handle_keybind_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some(action) = self.recording else {
+            return;
+        };
+        let ks = &ev.keystroke;
+        let key = ks.key.as_str();
+        match key {
+            "escape" => {}
+            "backspace" | "delete" => {
+                let mut km = keymap();
+                km.set(action, None);
+                apply_keymap(km, cx);
+            }
+            // Ignore lone modifier presses; wait for a real key.
+            "cmd" | "ctrl" | "alt" | "shift" | "function" => return,
+            _ => {
+                let mut km = keymap();
+                km.set(action, Some(canon_keystroke(ks)));
+                apply_keymap(km, cx);
+            }
+        }
+        self.recording = None;
+        cx.notify();
     }
 }
 
 impl Render for Settings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
-        let tabs = ["General", "Customization"];
+        let tabs = ["General", "Keybinds", "Customization"];
 
         // Left tab rail.
         let mut tab_items: Vec<AnyElement> = Vec::new();
@@ -363,12 +581,22 @@ impl Render for Settings {
             .border_color(rgb(t.border))
             .children(tab_items);
 
+        let content = match self.tab {
+            0 => self.render_general(cx).into_any_element(),
+            1 => self.render_keybinds(cx).into_any_element(),
+            _ => self.render_customization(cx).into_any_element(),
+        };
+
         div()
             .flex()
             .size_full()
             .bg(rgb(t.bg))
             .text_sm()
             .text_color(rgb(t.text))
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
+                this.handle_keybind_key(ev, cx);
+            }))
             .child(rail)
             .child(
                 div()
@@ -378,11 +606,7 @@ impl Render for Settings {
                     .h_full()
                     .overflow_y_scroll()
                     .p_5()
-                    .child(if self.tab == 0 {
-                        self.render_general(cx).into_any_element()
-                    } else {
-                        self.render_customization(cx).into_any_element()
-                    }),
+                    .child(content),
             )
     }
 }
@@ -448,6 +672,83 @@ impl Settings {
                     cx.notify();
                 }),
             ))
+            .child(toggle_row(
+                "tg-show-parent",
+                "Show “..” (up one level)",
+                "Show the leading “..” entry in list view that navigates to the \
+                 parent folder.",
+                p.show_parent,
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut np = prefs();
+                    np.show_parent = !np.show_parent;
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }),
+            ))
+    }
+
+    fn render_keybinds(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let km = keymap();
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for action in KeyAction::ALL.iter().copied() {
+            let recording = self.recording == Some(action);
+            let binding = km.get(action);
+            // The binding chip: shows the keystroke, "Unbound", or a recording hint.
+            let (chip_text, chip_dim) = if recording {
+                ("Press keys… (⌫ clear, esc cancel)".to_string(), false)
+            } else {
+                match binding {
+                    Some(b) => (pretty_keystroke(b), false),
+                    None => ("Unbound".to_string(), true),
+                }
+            };
+            rows.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .py_1()
+                    .child(div().text_color(rgb(t.text)).child(action.label()))
+                    .child(
+                        div()
+                            .id(("kb", action.id()))
+                            .flex_none()
+                            .min_w(px(150.0))
+                            .px_2()
+                            .py(px(2.0))
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_xs()
+                            .bg(rgb(t.surface))
+                            .border_1()
+                            .border_color(if recording { rgb(t.accent) } else { rgb(t.border) })
+                            .text_color(if chip_dim { rgb(t.text_dim) } else { rgb(t.text) })
+                            .hover(|s| s.border_color(rgb(t.accent)))
+                            .child(chip_text)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                                this.recording = Some(action);
+                                window.focus(&this.focus);
+                                cx.notify();
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(settings_title("Keyboard shortcuts"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(t.text_muted))
+                    .pb_2()
+                    .child("Click a shortcut, then press the keys. ⌫ clears it; Esc cancels."),
+            )
+            .children(rows)
     }
 
     fn render_customization(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -569,6 +870,42 @@ fn info_row(label: &str, value: &str) -> impl IntoElement {
         )
 }
 
+/// Pretty-print a stored keystroke string ("cmd-shift-p") with Mac symbols.
+fn pretty_keystroke(s: &str) -> String {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() == 1 {
+        return key_symbol(parts[0]);
+    }
+    let mut out = String::new();
+    for m in &parts[..parts.len() - 1] {
+        out.push_str(match *m {
+            "cmd" => "⌘",
+            "ctrl" => "⌃",
+            "alt" => "⌥",
+            "shift" => "⇧",
+            o => o,
+        });
+    }
+    out.push_str(&key_symbol(parts[parts.len() - 1]));
+    out
+}
+
+fn key_symbol(k: &str) -> String {
+    match k {
+        "enter" => "↩".into(),
+        "escape" => "⎋".into(),
+        "backspace" => "⌫".into(),
+        "delete" => "⌦".into(),
+        "up" => "↑".into(),
+        "down" => "↓".into(),
+        "left" => "←".into(),
+        "right" => "→".into(),
+        "space" => "␣".into(),
+        "tab" => "⇥".into(),
+        o => o.to_uppercase(),
+    }
+}
+
 /// A section heading inside Settings.
 fn settings_title(text: &str) -> impl IntoElement {
     div()
@@ -643,6 +980,8 @@ const PALETTE_MAX_ROWS: usize = 7;
 const SIDEBAR_W: f32 = 220.0;
 /// Tab strip row height.
 const TAB_H: f32 = 30.0;
+/// Fixed list-row height (so marquee selection can map y-coordinates to rows).
+const ROW_H: f32 = 24.0;
 
 /// The four resizable columns of the main listing.
 #[derive(Clone, Copy, PartialEq)]
@@ -779,6 +1118,7 @@ struct PaletteItem {
 }
 
 /// One row in the main listing, with the metadata we display.
+#[derive(Clone)]
 struct Entry {
     name: String,
     is_dir: bool,
@@ -816,6 +1156,7 @@ impl SortKey {
 enum ViewMode {
     List,
     Icons,
+    Columns,
     Gallery,
 }
 
@@ -840,13 +1181,19 @@ struct Tab {
     scroll_handle: UniformListScrollHandle,
     /// Horizontal scroll of the columns (when they're wider than the pane).
     h_scroll: ScrollHandle,
-    /// The file selected by a single click (for the preview/info inspector).
-    selected: Option<PathBuf>,
+    /// The set of selected items.
+    selection: HashSet<PathBuf>,
+    /// The focused item (last clicked): used for shift-range and the inspector.
+    anchor: Option<PathBuf>,
     /// Sort criterion and direction for this tab's listing.
     sort_key: SortKey,
     sort_asc: bool,
     /// How items are displayed.
     view: ViewMode,
+    /// Column view: the chain of folders selected, one per cascading column.
+    col_chain: Vec<PathBuf>,
+    /// Column view: which column currently has keyboard focus.
+    col_active: usize,
 }
 
 impl Tab {
@@ -863,10 +1210,13 @@ impl Tab {
             find_results: Vec::new(),
             scroll_handle: UniformListScrollHandle::new(),
             h_scroll: ScrollHandle::new(),
-            selected: None,
+            selection: HashSet::new(),
+            anchor: None,
             sort_key: SortKey::None,
             sort_asc: true,
             view: ViewMode::List,
+            col_chain: Vec::new(),
+            col_active: 0,
         }
     }
 }
@@ -957,6 +1307,10 @@ struct Shuffle {
     rename: Option<Rename>,
     /// Open "Sort By" dropdown: (pane, x, y) in window coords.
     sort_menu: Option<(usize, f32, f32)>,
+    /// Pending "move to Trash" confirmation: (pane, paths).
+    confirm_delete: Option<(usize, Vec<PathBuf>)>,
+    /// In-progress marquee (box) selection: (pane, start, current) window coords.
+    marquee: Option<(usize, (f32, f32), (f32, f32))>,
     // Terminal mode (the bottom command bar).
     term_input: String,
     term_output: Vec<String>,
@@ -976,6 +1330,12 @@ impl Shuffle {
         // Sync + repaint whenever feature prefs change.
         cx.observe_global::<PrefsGlobal>(|_, cx| {
             set_active_prefs(cx.global::<PrefsGlobal>().0);
+            cx.notify();
+        })
+        .detach();
+        // Sync the keymap when it changes (e.g. from the Settings window).
+        cx.observe_global::<KeymapGlobal>(|_, cx| {
+            set_active_keymap(cx.global::<KeymapGlobal>().0.clone());
             cx.notify();
         })
         .detach();
@@ -1000,6 +1360,8 @@ impl Shuffle {
             context_menu: None,
             rename: None,
             sort_menu: None,
+            confirm_delete: None,
+            marquee: None,
             term_input: String::new(),
             term_output: Vec::new(),
             term_focused: false,
@@ -1060,6 +1422,7 @@ impl Shuffle {
 
     /// Re-read a pane's current directory contents (after a create/trash).
     fn refresh_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
+        clear_column_cache();
         let dir = self.tab(pane).current_dir.clone();
         self.tab_mut(pane).entries = read_entries(&dir);
         self.sort_tab(pane);
@@ -1094,9 +1457,9 @@ impl Shuffle {
     fn set_view(&mut self, pane: usize, mode: ViewMode, cx: &mut Context<Self>) {
         self.active_pane = pane;
         self.tab_mut(pane).view = mode;
-        // Gallery needs a selection + its preview to show something immediately.
+        // Gallery needs a focused item + its preview to show something at once.
         if mode == ViewMode::Gallery {
-            let sel = self.tab(pane).selected.clone().or_else(|| {
+            let sel = self.tab(pane).anchor.clone().or_else(|| {
                 let dir = self.tab(pane).current_dir.clone();
                 self.tab(pane)
                     .entries
@@ -1105,7 +1468,7 @@ impl Shuffle {
                     .map(|e| dir.join(&e.name))
             });
             if let Some(p) = sel {
-                self.tab_mut(pane).selected = Some(p.clone());
+                self.tab_mut(pane).anchor = Some(p.clone());
                 self.ensure_preview(p, true, cx);
             }
         }
@@ -1140,8 +1503,39 @@ impl Shuffle {
         }
     }
 
+    /// Ask to move the current selection (or the focused item) to Trash.
+    fn request_delete(&mut self, pane: usize, cx: &mut Context<Self>) {
+        let mut paths: Vec<PathBuf> = self.tab(pane).selection.iter().cloned().collect();
+        if paths.is_empty() {
+            if let Some(a) = self.tab(pane).anchor.clone() {
+                paths.push(a);
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        paths.sort();
+        self.confirm_delete = Some((pane, paths));
+        cx.notify();
+    }
+
+    /// Carry out a confirmed delete: move every path to Trash.
+    fn perform_delete(&mut self, cx: &mut Context<Self>) {
+        if let Some((pane, paths)) = self.confirm_delete.take() {
+            for p in &paths {
+                trash_path(p);
+            }
+            let tab = self.tab_mut(pane);
+            tab.selection.clear();
+            tab.anchor = None;
+            self.refresh_pane(pane, cx);
+        }
+        cx.notify();
+    }
+
     /// Re-read every pane's directory (after a move that may affect two panes).
     fn refresh_all_panes(&mut self, cx: &mut Context<Self>) {
+        clear_column_cache();
         for p in 0..self.panes.len() {
             let dir = self.tab(p).current_dir.clone();
             self.tab_mut(p).entries = read_entries(&dir);
@@ -1196,8 +1590,12 @@ impl Shuffle {
                 if let Some(parent) = r.path.parent() {
                     let dest = parent.join(new);
                     if dest != r.path && !dest.exists() && fs::rename(&r.path, &dest).is_ok() {
-                        if self.tab(r.pane).selected.as_deref() == Some(r.path.as_path()) {
-                            self.tab_mut(r.pane).selected = Some(dest);
+                        let tab = self.tab_mut(r.pane);
+                        if tab.selection.remove(&r.path) {
+                            tab.selection.insert(dest.clone());
+                        }
+                        if tab.anchor.as_deref() == Some(r.path.as_path()) {
+                            tab.anchor = Some(dest);
                         }
                         self.refresh_pane(r.pane, cx);
                     }
@@ -1396,7 +1794,7 @@ impl Shuffle {
             c.borrow_mut().remove(&path);
         });
         self.refresh_pane(pane, cx);
-        if self.tab(pane).selected.as_deref() == Some(path.as_path()) {
+        if self.tab(pane).anchor.as_deref() == Some(path.as_path()) {
             let gallery = self.tab(pane).view == ViewMode::Gallery;
             self.ensure_preview(path.clone(), gallery, cx);
             self.ensure_info(path, cx);
@@ -1820,6 +2218,91 @@ impl Shuffle {
             )
     }
 
+    /// The "Move to Trash" confirmation modal.
+    fn render_confirm_delete(&self, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let (_, paths) = self.confirm_delete.as_ref().expect("only when open");
+        let msg = if paths.len() == 1 {
+            format!("Move “{}” to the Trash?", path_label(&paths[0]))
+        } else {
+            format!("Move {} items to the Trash?", paths.len())
+        };
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000066))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.confirm_delete = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .w(px(360.0))
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .p_5()
+                    .rounded_lg()
+                    .bg(rgb(t.surface))
+                    .border_1()
+                    .border_color(rgb(t.border_strong))
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
+                    .child(div().text_color(rgb(t.text)).child(msg))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(t.text_muted))
+                            .child("They can be recovered from the Trash."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("del-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(rgb(t.text))
+                                    .bg(rgb(t.hover))
+                                    .hover(|s| s.bg(rgb(t.selected)))
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.confirm_delete = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("del-confirm")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(rgb(0xffffff))
+                                    .bg(rgb(0xd9544f))
+                                    .hover(|s| s.bg(rgb(0xc6433e)))
+                                    .child("Move to Trash")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.perform_delete(cx);
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     /// Build the ~/ fuzzy index on a background thread, then store it.
     fn build_index(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
@@ -2094,11 +2577,83 @@ impl Shuffle {
         }
     }
 
+    /// Run a bound key action against the active pane.
+    fn run_key_action(&mut self, action: KeyAction, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.active_pane;
+        let anchor = self.tab(pane).anchor.clone();
+        match action {
+            KeyAction::CommandPalette => self.toggle_palette(window, cx),
+            KeyAction::NewTab => self.new_tab_in(pane, cx),
+            KeyAction::CloseTab => {
+                let a = self.panes[pane].active;
+                self.close_tab(pane, a, cx);
+            }
+            KeyAction::Find => self.open_find(pane, cx),
+            KeyAction::SelectAll => {
+                let all: HashSet<PathBuf> = self.display_paths(pane).into_iter().collect();
+                self.tab_mut(pane).selection = all;
+                cx.notify();
+            }
+            KeyAction::NewFile => self.new_file(pane, cx),
+            KeyAction::NewFolder => self.new_folder(pane, cx),
+            KeyAction::Rename => {
+                if let Some(p) = anchor {
+                    self.begin_rename(pane, p, window, cx);
+                }
+            }
+            KeyAction::CopyPath => {
+                if let Some(p) = anchor {
+                    cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()));
+                }
+            }
+            KeyAction::Duplicate => {
+                if let Some(p) = anchor {
+                    self.duplicate_entry(pane, p, cx);
+                }
+            }
+            KeyAction::MakeAlias => {
+                if let Some(p) = anchor {
+                    self.make_alias(pane, p, cx);
+                }
+            }
+            KeyAction::Compress => {
+                if let Some(p) = anchor {
+                    self.compress_entry(pane, p, cx);
+                }
+            }
+            KeyAction::MoveToTrash => self.request_delete(pane, cx),
+            KeyAction::RevealInFinder => {
+                if let Some(p) = anchor {
+                    let _ = Command::new("open").arg("-R").arg(&p).spawn();
+                }
+            }
+            KeyAction::Open => {
+                if let Some(p) = anchor {
+                    let is_dir = p.is_dir();
+                    self.open_path(pane, p, is_dir, cx);
+                }
+            }
+        }
+    }
+
     /// Top-level key handling: Cmd+P toggles; while open, drive the palette.
     fn on_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let cmd = ks.modifiers.platform;
         let key = ks.key.as_str();
+
+        // The delete-confirmation dialog captures Enter (confirm) / Esc (cancel).
+        if self.confirm_delete.is_some() {
+            match key {
+                "enter" => self.perform_delete(cx),
+                "escape" => {
+                    self.confirm_delete = None;
+                    cx.notify();
+                }
+                _ => {}
+            }
+            return;
+        }
 
         // While an inline rename is active, keys feed the rename field.
         if self.rename.is_some() {
@@ -2125,36 +2680,53 @@ impl Shuffle {
             return;
         }
 
-        if cmd && key == "p" {
-            self.toggle_palette(window, cx);
-            return;
-        }
-        // Tab management.
-        if cmd && key == "t" {
-            self.new_tab_in(self.active_pane, cx);
-            return;
-        }
-        if cmd && key == "w" {
-            let p = self.active_pane;
-            let active = self.panes[p].active;
-            self.close_tab(p, active, cx);
-            return;
+        // Dispatch a configured keybinding. When the palette is open only its
+        // own toggle acts, so typed characters still reach the query.
+        let kc = canon_keystroke(ks);
+        if let Some(action) = keymap().action_for(&kc) {
+            if !self.palette_open || action == KeyAction::CommandPalette {
+                self.run_key_action(action, window, cx);
+                return;
+            }
         }
         if key == "escape" && self.context_menu.is_some() {
             self.close_context_menu(cx);
             return;
         }
         if !self.palette_open {
-            // Typing "/" in the listing opens the in-directory find filter.
-            if !cmd && key == "/" {
-                self.open_find(self.active_pane, cx);
+            // Arrow keys move the selection within the active pane.
+            if !cmd {
+                let pane = self.active_pane;
+                match key {
+                    "up" => {
+                        self.arrow_move(pane, 0, -1, cx);
+                        return;
+                    }
+                    "down" => {
+                        self.arrow_move(pane, 0, 1, cx);
+                        return;
+                    }
+                    "left" => {
+                        self.arrow_move(pane, -1, 0, cx);
+                        return;
+                    }
+                    "right" => {
+                        self.arrow_move(pane, 1, 0, cx);
+                        return;
+                    }
+                    _ => {}
+                }
             }
-            // Enter renames the selected file (Finder-style).
+            // Enter renames the focused file (Finder-style; not rebindable).
             if !cmd && key == "enter" {
                 let pane = self.active_pane;
-                if let Some(sel) = self.tab(pane).selected.clone() {
+                if let Some(sel) = self.tab(pane).anchor.clone() {
                     self.begin_rename(pane, sel, window, cx);
                 }
+            }
+            // Backspace / Delete asks to move the selection to Trash.
+            if !cmd && (key == "backspace" || key == "delete") {
+                self.request_delete(self.active_pane, cx);
             }
             return;
         }
@@ -2407,6 +2979,10 @@ impl Shuffle {
         tab.editing_path = None;
         tab.find_query = None;
         tab.find_results.clear();
+        tab.selection.clear();
+        tab.anchor = None;
+        tab.col_chain.clear();
+        tab.col_active = 0;
         save_last_dir(&dir);
 
         self.recents.retain(|p| p != &dir);
@@ -2740,20 +3316,367 @@ impl Shuffle {
         self.prewarm_icons(cx);
     }
 
-    // ----- preview / information inspector -----
+    // ----- selection -----
 
-    /// Single-click selects a file (for the preview/info inspector).
-    fn select_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
-        self.active_pane = pane;
-        if self.tab(pane).selected.as_deref() == Some(path.as_path()) {
-            return;
+    /// The paths shown in `pane`, in display order (respecting the find filter).
+    fn display_paths(&self, pane: usize) -> Vec<PathBuf> {
+        let tab = self.tab(pane);
+        let dir = &tab.current_dir;
+        if tab.find_query.is_some() {
+            tab.find_results
+                .iter()
+                .map(|&i| dir.join(&tab.entries[i].name))
+                .collect()
+        } else {
+            tab.entries.iter().map(|e| dir.join(&e.name)).collect()
         }
-        self.rename = None; // selecting a different file cancels any rename
+    }
+
+    /// Make `path` the inspector focus and load its preview/info.
+    fn focus_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
         let gallery = self.tab(pane).view == ViewMode::Gallery;
-        self.tab_mut(pane).selected = Some(path.clone());
-        cx.notify();
+        self.tab_mut(pane).anchor = Some(path.clone());
         self.ensure_preview(path.clone(), gallery, cx);
         self.ensure_info(path, cx);
+    }
+
+    /// Single-click: select just this item.
+    fn select_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        self.rename = None;
+        {
+            let tab = self.tab_mut(pane);
+            tab.selection.clear();
+            tab.selection.insert(path.clone());
+        }
+        cx.notify();
+        self.focus_entry(pane, path, cx);
+    }
+
+    /// Cmd-click: toggle this item's membership in the selection.
+    fn toggle_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        self.rename = None;
+        let now_selected = {
+            let tab = self.tab_mut(pane);
+            if tab.selection.contains(&path) {
+                tab.selection.remove(&path);
+                false
+            } else {
+                tab.selection.insert(path.clone());
+                true
+            }
+        };
+        cx.notify();
+        if now_selected {
+            self.focus_entry(pane, path, cx);
+        }
+    }
+
+    /// Shift-click: select the contiguous range from the anchor to this item.
+    fn range_select(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        self.rename = None;
+        let paths = self.display_paths(pane);
+        let to = paths.iter().position(|p| p == &path);
+        let from = self
+            .tab(pane)
+            .anchor
+            .as_ref()
+            .and_then(|a| paths.iter().position(|p| p == a));
+        let sel: HashSet<PathBuf> = match (from, to) {
+            (Some(a), Some(b)) => {
+                let (lo, hi) = (a.min(b), a.max(b));
+                paths[lo..=hi].iter().cloned().collect()
+            }
+            _ => std::iter::once(path.clone()).collect(),
+        };
+        self.tab_mut(pane).selection = sel;
+        cx.notify();
+        // Keep the existing anchor; just refresh the inspector to the clicked one.
+        self.focus_entry(pane, path, cx);
+    }
+
+    /// Dispatch a left-click on an item, honoring Cmd / Shift modifiers.
+    fn click_entry(
+        &mut self,
+        pane: usize,
+        path: PathBuf,
+        is_dir: bool,
+        ev: &ClickEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_pane = pane;
+        self.term_focused = false;
+        let mods = ev.modifiers();
+        if mods.platform {
+            self.toggle_entry(pane, path, cx);
+        } else if mods.shift {
+            self.range_select(pane, path, cx);
+        } else if is_dir {
+            self.navigate_in(pane, path, cx);
+        } else if ev.click_count() >= 2 {
+            self.open_path(pane, path, false, cx);
+        } else {
+            self.select_entry(pane, path, cx);
+        }
+    }
+
+    /// Start a marquee (rubber-band) selection from empty list space.
+    fn begin_marquee(&mut self, pane: usize, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        self.term_focused = false;
+        self.rename = None;
+        {
+            let tab = self.tab_mut(pane);
+            tab.selection.clear();
+            tab.anchor = None;
+        }
+        self.marquee = Some((pane, (x, y), (x, y)));
+        cx.notify();
+    }
+
+    /// Update the marquee end point and recompute which rows it covers.
+    fn update_marquee(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        let Some((pane, start, _)) = self.marquee else {
+            return;
+        };
+        self.marquee = Some((pane, start, (x, y)));
+
+        // Map the vertical span to row indices using the list's geometry.
+        let (list_top, scrolled) = {
+            let st = self.tab(pane).scroll_handle.0.borrow();
+            let top = f64::from(st.base_handle.bounds().origin.y) as f32;
+            let scr = (-(f64::from(st.base_handle.offset().y) as f32)).max(0.0);
+            (top, scr)
+        };
+        let y0 = start.1.min(y);
+        let y1 = start.1.max(y);
+        let c0 = (y0 - list_top + scrolled).max(0.0);
+        let c1 = (y1 - list_top + scrolled).max(0.0);
+        let i0 = (c0 / ROW_H).floor() as i64;
+        let i1 = (c1 / ROW_H).floor() as i64;
+        // Row 0 is the ".." entry when present; offset to display indices.
+        let has_parent =
+            self.tab(pane).find_query.is_none() && prefs().show_parent && self.tab(pane).current_dir.parent().is_some();
+        let off = i64::from(has_parent);
+        let paths = self.display_paths(pane);
+        let mut sel = HashSet::new();
+        for i in i0..=i1 {
+            let di = i - off;
+            if di >= 0 && (di as usize) < paths.len() {
+                sel.insert(paths[di as usize].clone());
+            }
+        }
+        self.tab_mut(pane).selection = sel;
+        cx.notify();
+    }
+
+    fn end_marquee(&mut self, cx: &mut Context<Self>) {
+        if self.marquee.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The visible marquee rectangle for `pane` (in the listing-local frame).
+    fn marquee_rect(&self, pane: usize) -> Option<AnyElement> {
+        let (mp, start, cur) = self.marquee?;
+        if mp != pane {
+            return None;
+        }
+        let (ox, oy) = {
+            let st = self.tab(pane).scroll_handle.0.borrow();
+            let o = st.base_handle.bounds().origin;
+            (f64::from(o.x) as f32, f64::from(o.y) as f32)
+        };
+        let x = start.0.min(cur.0) - ox;
+        let y = start.1.min(cur.1) - oy;
+        let w = (start.0 - cur.0).abs();
+        let h = (start.1 - cur.1).abs();
+        let t = theme();
+        Some(
+            div()
+                .absolute()
+                .left(px(x.max(0.0)))
+                .top(px(y.max(0.0)))
+                .w(px(w))
+                .h(px(h))
+                .bg(Theme::alpha(t.accent, 0x22))
+                .border_1()
+                .border_color(rgb(t.accent))
+                .into_any_element(),
+        )
+    }
+
+    // ----- column (Miller) view -----
+
+    /// Handle a click in column `col_index` of the Column view.
+    fn column_click(
+        &mut self,
+        pane: usize,
+        col_index: usize,
+        target: PathBuf,
+        is_dir: bool,
+        ev: &ClickEvent,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_pane = pane;
+        self.term_focused = false;
+        if is_dir {
+            if ev.click_count() >= 2 {
+                // Double-click drills in as the new root.
+                self.navigate_in(pane, target, cx);
+                return;
+            }
+            let tab = self.tab_mut(pane);
+            tab.col_chain.truncate(col_index);
+            tab.col_chain.push(target.clone());
+            tab.selection.clear();
+            tab.selection.insert(target);
+            tab.anchor = None;
+            cx.notify();
+        } else {
+            {
+                let tab = self.tab_mut(pane);
+                tab.col_chain.truncate(col_index);
+                tab.selection.clear();
+                tab.selection.insert(target.clone());
+            }
+            if ev.click_count() >= 2 {
+                self.open_path(pane, target, false, cx);
+            } else {
+                cx.notify();
+                self.focus_entry(pane, target, cx);
+            }
+        }
+    }
+
+    // ----- keyboard arrow navigation -----
+
+    /// Columns across the grid in Icons view (from the last measured width).
+    fn icon_cols(&self, pane: usize) -> usize {
+        let width = self.pane_list_width(pane).max(240.0);
+        ((width / 108.0).floor() as usize).max(1)
+    }
+
+    /// Move the selection with an arrow key. `dx`/`dy` are -1/0/1.
+    fn arrow_move(&mut self, pane: usize, dx: i32, dy: i32, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        match self.tab(pane).view {
+            ViewMode::Columns => self.arrow_columns(pane, dx, dy, cx),
+            ViewMode::Icons => {
+                let cols = self.icon_cols(pane) as i32;
+                self.arrow_grid(pane, dx + dy * cols, cx);
+            }
+            // List & Gallery are 1-D: only up/down move.
+            _ => {
+                if dy != 0 {
+                    self.arrow_grid(pane, dy, cx);
+                }
+            }
+        }
+    }
+
+    /// Move the anchor by `delta` positions in display order (List/Icons/Gallery).
+    fn arrow_grid(&mut self, pane: usize, delta: i32, cx: &mut Context<Self>) {
+        let paths = self.display_paths(pane);
+        if paths.is_empty() {
+            return;
+        }
+        let cur = self
+            .tab(pane)
+            .anchor
+            .as_ref()
+            .and_then(|a| paths.iter().position(|p| p == a));
+        let ni = match cur {
+            Some(i) => (i as i32 + delta).clamp(0, paths.len() as i32 - 1),
+            None => 0,
+        };
+        let target = paths[ni as usize].clone();
+        {
+            let tab = self.tab_mut(pane);
+            tab.selection.clear();
+            tab.selection.insert(target.clone());
+        }
+        // Keep the row/cell visible (List uses a ".." offset; Icons rows of N).
+        let view = self.tab(pane).view;
+        let offset = usize::from(
+            self.tab(pane).find_query.is_none()
+                && prefs().show_parent
+                && self.tab(pane).current_dir.parent().is_some(),
+        );
+        let item = match view {
+            ViewMode::Icons => ni as usize / self.icon_cols(pane),
+            _ => ni as usize + offset,
+        };
+        self.tab(pane).scroll_handle.scroll_to_item(item, ScrollStrategy::Center);
+        self.focus_entry(pane, target, cx);
+    }
+
+    /// Arrow navigation within the Column (Miller) view.
+    fn arrow_columns(&mut self, pane: usize, dx: i32, dy: i32, cx: &mut Context<Self>) {
+        let base = self.tab(pane).current_dir.clone();
+        let mut dirs: Vec<PathBuf> = vec![base];
+        dirs.extend(self.tab(pane).col_chain.iter().cloned());
+        let mut k = self.tab(pane).col_active.min(dirs.len() - 1);
+
+        if dx < 0 {
+            // Move focus to the parent column.
+            if k > 0 {
+                self.tab_mut(pane).col_active = k - 1;
+                cx.notify();
+            }
+            return;
+        }
+        if dx > 0 {
+            // Move into the selected folder's column, if any.
+            if k + 1 < dirs.len() {
+                self.tab_mut(pane).col_active = k + 1;
+                k += 1;
+                // Select the first entry of the new column.
+                self.column_set(pane, k, &dirs, 0, cx);
+            }
+            return;
+        }
+
+        // Up / down within column k.
+        let dir = dirs[k].clone();
+        let entries = column_entries(&dir);
+        if entries.is_empty() {
+            return;
+        }
+        let sel_k = if k < self.tab(pane).col_chain.len() {
+            Some(self.tab(pane).col_chain[k].clone())
+        } else {
+            self.tab(pane).anchor.clone()
+        };
+        let cur = sel_k.and_then(|p| entries.iter().position(|e| dir.join(&e.name) == p));
+        let ni = match cur {
+            Some(i) => (i as i32 + dy).clamp(0, entries.len() as i32 - 1) as usize,
+            None => 0,
+        };
+        self.column_set(pane, k, &dirs, ni, cx);
+    }
+
+    /// Select entry `idx` in column `k` of the Column view (keyboard-driven).
+    fn column_set(&mut self, pane: usize, k: usize, dirs: &[PathBuf], idx: usize, cx: &mut Context<Self>) {
+        let dir = dirs[k].clone();
+        let entries = column_entries(&dir);
+        let Some(e) = entries.get(idx) else { return };
+        let target = dir.join(&e.name);
+        let is_dir = e.is_dir;
+        {
+            let tab = self.tab_mut(pane);
+            tab.col_chain.truncate(k);
+            if is_dir {
+                tab.col_chain.push(target.clone());
+            }
+            tab.col_active = k;
+            tab.selection.clear();
+            tab.selection.insert(target.clone());
+        }
+        cx.notify();
+        self.focus_entry(pane, target, cx);
     }
 
     /// Gather file info for `path` in the background (once), then repaint.
@@ -2803,7 +3726,7 @@ impl Shuffle {
         if !show_preview && !p.info {
             return None;
         }
-        let sel = self.active_tab().selected.clone()?;
+        let sel = self.active_tab().anchor.clone()?;
         let t = theme();
 
         let mut col = div()
@@ -3325,6 +4248,8 @@ impl Shuffle {
             .gap_1()
             .px_2()
             .py_1()
+            .min_w_0()
+            .overflow_hidden()
             .border_b_1()
             .border_color(rgb(theme().border))
             .child(nav_arrow(
@@ -3350,7 +4275,7 @@ impl Shuffle {
         let btn = |id: &'static str, glyph: &'static str, mode: ViewMode, cx: &Context<Self>| {
             let on = view == mode;
             div()
-                .id(id)
+                .id((id, pane)) // ids must be unique per pane, or only one pane works
                 .flex_none()
                 .w(px(24.0))
                 .h(px(22.0))
@@ -3375,11 +4300,12 @@ impl Shuffle {
             .pl_2()
             .child(btn("view-list", "☰", ViewMode::List, cx))
             .child(btn("view-icons", "▦", ViewMode::Icons, cx))
+            .child(btn("view-columns", "▥", ViewMode::Columns, cx))
             .child(btn("view-gallery", "▭", ViewMode::Gallery, cx))
             .child(
                 // Sort-By button — opens a dropdown at the click location.
                 div()
-                    .id("sort-by")
+                    .id(("sort-by", pane))
                     .flex_none()
                     .px_2()
                     .h(px(22.0))
@@ -3448,6 +4374,9 @@ impl Shuffle {
             .items_center()
             .flex_1()
             .min_w_0()
+            // Clip so long paths can't paint over the view/sort toolbar (or
+            // bleed into the neighbouring pane) when a pane is narrow.
+            .overflow_hidden()
             .h(px(22.0))
             .children(segs)
             // Filler captures clicks on the empty part of the bar → edit mode.
@@ -3697,6 +4626,7 @@ impl Shuffle {
         let body: AnyElement = match view {
             ViewMode::List => self.render_list_body(pane, cx),
             ViewMode::Icons => self.render_icons_body(pane, cx),
+            ViewMode::Columns => self.render_columns_body(pane, cx),
             ViewMode::Gallery => self.render_gallery_body(pane, cx),
         };
 
@@ -3728,7 +4658,7 @@ impl Shuffle {
         // In find mode the list shows the filtered results (no ".." row);
         // otherwise the full directory with a leading ".." when there's a parent.
         let find_active = tab.find_query.is_some();
-        let has_parent = !find_active && tab.current_dir.parent().is_some();
+        let has_parent = !find_active && prefs().show_parent && tab.current_dir.parent().is_some();
         let item_count = if find_active {
             tab.find_results.len()
         } else {
@@ -3781,6 +4711,21 @@ impl Shuffle {
                                                     this.open_context_menu(pane, x, y, None, cx);
                                                 }),
                                             )
+                                            // Press on empty space → start a marquee
+                                            // (rows stop_propagation so this only
+                                            // fires on blank area).
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                                    this.begin_marquee(
+                                                        pane,
+                                                        f64::from(ev.position.x) as f32,
+                                                        f64::from(ev.position.y) as f32,
+                                                        cx,
+                                                    );
+                                                }),
+                                            )
+                                            .children(self.marquee_rect(pane))
                                             .child(uniform_list(
                     ("file-list", pane),
                     item_count,
@@ -3788,7 +4733,7 @@ impl Shuffle {
                         let widths = this.widths;
                         let tab = this.tab(pane);
                         let find_active = tab.find_query.is_some();
-                        let has_parent = !find_active && tab.current_dir.parent().is_some();
+                        let has_parent = !find_active && prefs().show_parent && tab.current_dir.parent().is_some();
                         let base_dir = tab.current_dir.clone();
                         let mut items: Vec<AnyElement> = Vec::with_capacity(range.len());
 
@@ -3851,7 +4796,7 @@ impl Shuffle {
                             let target = base_dir.join(&name);
                             let ctx_target = target.clone();
                             let drop_target = target.clone();
-                            let is_selected = tab.selected.as_deref() == Some(target.as_path());
+                            let is_selected = tab.selection.contains(&target);
                             let rename_text = this
                                 .rename
                                 .as_ref()
@@ -3879,15 +4824,9 @@ impl Shuffle {
                                     is_dir,            // folders accept drops
                                     rename_text,       // editable name when renaming
                                     cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                                        // Folders open on a single click; files
-                                        // select on single click, open on double.
-                                        if is_dir {
-                                            this.navigate_in(pane, target.clone(), cx);
-                                        } else if ev.click_count() >= 2 {
-                                            this.open_path(pane, target.clone(), false, cx);
-                                        } else {
-                                            this.select_entry(pane, target.clone(), cx);
-                                        }
+                                        // Cmd/Shift extend the selection; otherwise
+                                        // folders open and files select / double-open.
+                                        this.click_entry(pane, target.clone(), is_dir, ev, cx);
                                     }),
                                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                                         let (x, y) = (
@@ -3988,7 +4927,7 @@ impl Shuffle {
                                 let name = entry.name.clone();
                                 let is_dir = entry.is_dir;
                                 let target = base_dir.join(&name);
-                                let selected = tab.selected.as_deref() == Some(target.as_path());
+                                let selected = tab.selection.contains(&target);
                                 cells.push(icon_cell(pane, name, target, is_dir, selected, cell_w, cx));
                             }
                             out.push(div().flex().w_full().px_2().children(cells).into_any_element());
@@ -4013,12 +4952,60 @@ impl Shuffle {
             .into_any_element()
     }
 
+    /// The Column (Miller) view body: cascading folder columns.
+    fn render_columns_body(&self, pane: usize, cx: &Context<Self>) -> AnyElement {
+        let t = theme();
+        let tab = self.tab(pane);
+        let mut dirs: Vec<PathBuf> = vec![tab.current_dir.clone()];
+        dirs.extend(tab.col_chain.iter().cloned());
+        let anchor = tab.anchor.clone();
+
+        let mut cols: Vec<AnyElement> = Vec::new();
+        for (i, dir) in dirs.iter().enumerate() {
+            let entries = column_entries(dir);
+            let next_dir = dirs.get(i + 1).cloned();
+            let mut rows: Vec<AnyElement> = Vec::new();
+            for e in &entries {
+                let target = dir.join(&e.name);
+                let selected = next_dir.as_deref() == Some(target.as_path())
+                    || anchor.as_deref() == Some(target.as_path());
+                rows.push(column_row(pane, i, &e.name, target, e.is_dir, selected, cx));
+            }
+            cols.push(
+                div()
+                    .id(("col", pane * 100 + i))
+                    .flex_none()
+                    .w(px(230.0))
+                    .h_full()
+                    .overflow_y_scroll()
+                    .border_r_1()
+                    .border_color(rgb(t.border))
+                    .flex()
+                    .flex_col()
+                    .py_1()
+                    .children(rows)
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .id(("columns", pane))
+            .flex_1()
+            .min_h_0()
+            .overflow_x_scroll()
+            .track_scroll(&tab.h_scroll)
+            .flex()
+            .flex_row()
+            .children(cols)
+            .into_any_element()
+    }
+
     /// The Gallery view body: a large preview on top + a filmstrip below.
     fn render_gallery_body(&self, pane: usize, cx: &Context<Self>) -> AnyElement {
         let t = theme();
         let tab = self.tab(pane);
         let pane_dir = tab.current_dir.clone();
-        let sel = tab.selected.clone();
+        let sel = tab.anchor.clone();
 
         // Top preview area (white page so documents stay readable).
         let preview: AnyElement = match &sel {
@@ -4043,7 +5030,7 @@ impl Shuffle {
             let name = entry.name.clone();
             let is_dir = entry.is_dir;
             let target = pane_dir.join(&name);
-            let selected = sel.as_deref() == Some(target.as_path());
+            let selected = tab.selection.contains(&target);
             let nav_t = target.clone();
             strip.push(
                 div()
@@ -4264,16 +5251,19 @@ impl Render for Shuffle {
             // the thin handle without dropping the resize.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
                 let x = f64::from(ev.position.x) as f32;
+                let y = f64::from(ev.position.y) as f32;
                 this.update_resize(x, cx);
-                this.update_scroll_drag(f64::from(ev.position.y) as f32, cx);
+                this.update_scroll_drag(y, cx);
                 this.update_divider(x, cx);
+                this.update_marquee(x, y, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| {
+                cx.listener(|this, _, _, cx| {
                     this.end_resize();
                     this.end_scroll_drag();
                     this.divider_drag = None;
+                    this.end_marquee(cx);
                 }),
             )
             .child(main_row);
@@ -4291,6 +5281,9 @@ impl Render for Shuffle {
         }
         if let Some((p, x, y)) = self.sort_menu {
             root = root.child(self.render_sort_menu(p, x, y, cx));
+        }
+        if self.confirm_delete.is_some() {
+            root = root.child(self.render_confirm_delete(cx));
         }
         root
     }
@@ -4460,7 +5453,11 @@ fn open_settings_window(cx: &mut App) {
             }),
             ..Default::default()
         },
-        |_window, cx| cx.new(|_cx| Settings::new()),
+        |window, cx| {
+            let view = cx.new(Settings::new);
+            window.focus(&view.read(cx).focus);
+            view
+        },
     )
     .ok();
     cx.activate(true);
@@ -4766,10 +5763,12 @@ fn file_row(
         .flex()
         .items_center()
         .px_3()
-        .py_1()
+        .h(px(ROW_H))
         .cursor_pointer()
         .when(selected, |s| s.bg(rgb(t.selected)))
         .hover(|s| s.bg(rgb(t.hover)))
+        // Press on a row shouldn't start a marquee on the list behind it.
+        .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
         // Draggable rows show a floating label under the cursor.
         .when_some(drag_path, |row, p| {
             row.on_drag(FileDrag { path: p }, move |_, _, _, cx| {
@@ -4885,13 +5884,7 @@ fn icon_cell(
                 .child(name),
         )
         .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-            if is_dir {
-                this.navigate_in(pane, click_t.clone(), cx);
-            } else if ev.click_count() >= 2 {
-                this.open_path(pane, click_t.clone(), false, cx);
-            } else {
-                this.select_entry(pane, click_t.clone(), cx);
-            }
+            this.click_entry(pane, click_t.clone(), is_dir, ev, cx);
         }))
         .on_mouse_down(
             MouseButton::Right,
@@ -4912,6 +5905,59 @@ fn icon_cell(
             }));
     }
     cell.into_any_element()
+}
+
+/// One row in a Column-view column: icon · name · (chevron for folders).
+fn column_row(
+    pane: usize,
+    col_index: usize,
+    name: &str,
+    target: PathBuf,
+    is_dir: bool,
+    selected: bool,
+    cx: &Context<Shuffle>,
+) -> AnyElement {
+    let t = theme();
+    let icon = icon_element(&target, is_dir);
+    let click_t = target.clone();
+    let ctx_t = target.clone();
+    div()
+        .id(SharedString::from(format!("colrow:{col_index}:{}", target.to_string_lossy())))
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .h(px(ROW_H))
+        .cursor_pointer()
+        .when(selected, |s| s.bg(rgb(t.selected)))
+        .hover(|s| s.bg(rgb(t.hover)))
+        .child(div().flex_none().w(px(ICON_W)).flex().justify_center().child(icon))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_color(rgb(if is_dir { t.accent } else { t.text }))
+                .child(name.to_string()),
+        )
+        .when(is_dir, |r| {
+            r.child(div().flex_none().text_color(rgb(t.text_dim)).child("›"))
+        })
+        .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
+            this.column_click(pane, col_index, click_t.clone(), is_dir, ev, cx);
+        }))
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                let (x, y) = (
+                    f64::from(ev.position.x) as f32,
+                    f64::from(ev.position.y) as f32,
+                );
+                this.open_context_menu(pane, x, y, Some((ctx_t.clone(), is_dir)), cx);
+                cx.stop_propagation();
+            }),
+        )
+        .into_any_element()
 }
 
 /// A human-readable kind label for a file (e.g. "Microsoft Excel", "DWG File").
@@ -5281,6 +6327,26 @@ fn read_entries(dir: &Path) -> Vec<Entry> {
             .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
     });
     entries
+}
+
+thread_local! {
+    /// Cache of directory listings for Column view, so it isn't re-read from
+    /// disk on every frame. Cleared whenever the filesystem might have changed.
+    static COL_ENTRIES: RefCell<HashMap<PathBuf, Vec<Entry>>> = RefCell::new(HashMap::new());
+}
+
+/// Directory listing for a column (cached). Default sort (folders first, name).
+fn column_entries(dir: &Path) -> Vec<Entry> {
+    if let Some(v) = COL_ENTRIES.with(|c| c.borrow().get(dir).cloned()) {
+        return v;
+    }
+    let v = read_entries(dir);
+    COL_ENTRIES.with(|c| c.borrow_mut().insert(dir.to_path_buf(), v.clone()));
+    v
+}
+
+fn clear_column_cache() {
+    COL_ENTRIES.with(|c| c.borrow_mut().clear());
 }
 
 /// Sort a directory listing in place by the given criterion/direction.
@@ -5911,11 +6977,44 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\ninfo={}\n",
-            p.terminal, p.term_history, p.preview, p.info
+            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\n",
+            p.terminal, p.term_history, p.preview, p.info, p.show_parent
         );
         let _ = fs::write(&file, body);
     }
+}
+
+/// Persist the keymap as `action=keystroke` lines (empty = unbound).
+fn save_keymap(k: &Keymap) {
+    if let Some(file) = config_file("keymap.txt") {
+        if let Some(parent) = file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let body: String = KeyAction::ALL
+            .iter()
+            .map(|a| format!("{}={}\n", a.key(), k.get(*a).unwrap_or("")))
+            .collect();
+        let _ = fs::write(&file, body);
+    }
+}
+
+/// Load the keymap, starting from defaults and applying saved overrides.
+fn load_keymap() -> Keymap {
+    let mut k = Keymap::defaults();
+    if let Some(file) = config_file("keymap.txt") {
+        if let Ok(s) = fs::read_to_string(&file) {
+            for line in s.lines() {
+                let Some((name, val)) = line.split_once('=') else {
+                    continue;
+                };
+                if let Some(a) = KeyAction::ALL.iter().copied().find(|a| a.key() == name.trim()) {
+                    let v = val.trim();
+                    k.set(a, if v.is_empty() { None } else { Some(v.to_string()) });
+                }
+            }
+        }
+    }
+    k
 }
 
 /// Load feature prefs, defaulting everything to off.
@@ -5933,6 +7032,7 @@ fn load_prefs() -> Prefs {
                     "term_history" => p.term_history = on,
                     "preview" => p.preview = on,
                     "info" => p.info = on,
+                    "show_parent" => p.show_parent = on,
                     _ => {}
                 }
             }
@@ -6013,6 +7113,11 @@ fn main() {
         let saved_prefs = load_prefs();
         set_active_prefs(saved_prefs);
         cx.set_global(PrefsGlobal(saved_prefs));
+
+        // Load key bindings.
+        let saved_keymap = load_keymap();
+        set_active_keymap(saved_keymap.clone());
+        cx.set_global(KeymapGlobal(saved_keymap));
 
         // Menu bar: app menu with Settings + Quit, plus their shortcuts.
         cx.bind_keys([
