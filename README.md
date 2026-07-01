@@ -1,55 +1,55 @@
 <div align="center">
 
-<img src="logo2.png" width="120" alt="Shuffle logo" />
+<img src="logo2%20Background%20Removed.png" width="120" alt="Shuffle logo" />
 
 # Shuffle
 
-**A modern file explorer for macOS — built for speed.**
+**A modern file explorer for macOS, built for speed.**
 
-Inspired by [File Pilot](https://filepilot.tech) on Windows: an open-source,
-GPU-rendered file manager focused on the best performance, the smoothest feel,
-and a deep set of power-user features and customization.
+Inspired by [File Pilot](https://filepilot.tech) on Windows: an open source,
+GPU rendered file manager focused on the best performance, the smoothest feel,
+and a deep set of power user features and customization.
 
 </div>
-
----
 
 ## Philosophy
 
 macOS file managers are either too limited or too slow. Shuffle is a single,
 small, native app that stays instant no matter how big the directory or how fast
-you move — and gives power users real tools instead of getting in the way.
+you move, and gives power users real tools instead of getting in the way.
 
-- **Fast.** GPU-rendered (Metal), fully virtualized lists — a folder with 100,000
+* **Fast.** GPU rendered (Metal), fully virtualized lists. A folder with 100,000
   items scrolls as smoothly as one with 10.
-- **Smooth.** Native drag-and-drop, no jank, no Electron.
-- **Powerful & customizable.** The features below, and a theme system to make it
-  yours.
+* **Smooth.** Native drag and drop, no jank, no Electron.
+* **Powerful and customizable.** The features below, plus a theme system to make
+  it yours.
 
 ## Highlights
 
-- 🪟 **Dual panes / split canvas** — drag a tab to the edge to split the window
-  into two side-by-side panes, each with its own tabs, history, and filter; a
+* 🪟 **Dual panes / split canvas.** Drag a tab to the edge to split the window
+  into two side by side panes, each with its own tabs, history, and filter, and a
   draggable divider resizes them.
-- 🗂️ **Tabs** — `Cmd+T` or `+`, with smooth drag-to-reorder and drag-between-panes.
-- ⚡ **Command palette (`Cmd+P`)** — millisecond fuzzy search over your home
+* 🗂️ **Tabs.** `Cmd+T` or `+`, with smooth drag to reorder and drag between panes.
+* ⚡ **Command palette (`Cmd+P`).** Millisecond fuzzy search over your home
   directory with typo tolerance, live path browsing, and quick commands.
-- ⌨️ **Terminal mode** — an optional command bar at the bottom; move through the
-  explorer like a shell (`cd` navigates, Tab autocompletes paths/commands).
-- 👁️ **Preview & Information** — single-click a file to preview it (QuickLook:
-  images, PDFs, docs, …) and inspect its details, in a side inspector.
-- 🔎 **In-place filter (`/`)** — instantly narrow the current folder, typo-tolerant.
-- 🎨 **Deep theming** — dozens of preset palettes (Catppuccin, Dracula, Nord,
-  Gruvbox, Solarized, Tokyo Night, and bold single-hue themes) plus per-color
+* ⌨️ **Terminal mode.** An optional command bar at the bottom to move through the
+  explorer like a shell (`cd` navigates, Tab autocompletes paths and commands).
+* 👁️ **Preview and Information.** Single click a file to preview it (QuickLook:
+  images, PDFs, docs) and inspect its details in a side inspector.
+* 🔎 **In-place filter (`/`).** Instantly narrow the current folder, typo tolerant.
+* ☁️ **Cloud and servers.** Dropbox, Google Drive, OneDrive, and iCloud show up
+  automatically, alongside mounted volumes and a Connect to Server dialog.
+* 🎨 **Deep theming.** Dozens of preset palettes (Catppuccin, Dracula, Nord,
+  Gruvbox, Solarized, Tokyo Night, and bold single hue themes) plus per color
   customization, applied live.
 
-Optional features (Terminal, Preview, Information) live in **Settings → General**
+Optional features (Terminal, Preview, Information) live in **Settings › General**
 and are off by default.
 
 ## Platform support
 
-Built for **macOS**, tuned for **Apple Silicon (M-series)**. It's a standard
-Metal app and runs on any modern Mac (macOS 12+); Intel builds from source.
+Built for **macOS**, tuned for **Apple Silicon (M series)**. It is a standard
+Metal app and runs on any modern Mac (macOS 12+). Intel builds from source.
 
 ## Building from source
 
@@ -67,13 +67,13 @@ cargo build --release     # optimized
 
 ## Keyboard shortcuts
 
-| Shortcut | Action                         |
-| -------- | ------------------------------ |
-| `Cmd+P`  | Command palette / fuzzy find   |
-| `/`      | Filter the current directory   |
-| `Cmd+T`  | New tab                        |
-| `Cmd+W`  | Close tab                      |
-| `Cmd+,`  | Settings                       |
+| Shortcut | Action                       |
+| :------- | :--------------------------- |
+| `Cmd+P`  | Command palette / fuzzy find |
+| `/`      | Filter the current directory |
+| `Cmd+T`  | New tab                      |
+| `Cmd+W`  | Close tab                    |
+| `Cmd+,`  | Settings                     |
 
 ## Status
 
