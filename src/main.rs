@@ -323,6 +323,8 @@ struct Prefs {
     sidebar_collapsed: bool,
     /// How many Recents to show in the sidebar (0 hides the section).
     recent_limit: usize,
+    /// Give the command palette (Cmd+P) its own Up/Down query history.
+    palette_history: bool,
 }
 
 impl Default for Prefs {
@@ -335,6 +337,7 @@ impl Default for Prefs {
             show_parent: true,
             sidebar_collapsed: false,
             recent_limit: 3,
+            palette_history: false,
         }
     }
 }
@@ -352,6 +355,7 @@ thread_local! {
         show_parent: true,
         sidebar_collapsed: false,
         recent_limit: 3,
+        palette_history: false,
     }) };
 }
 
@@ -398,6 +402,60 @@ fn apply_icon_pack(p: Option<PathBuf>, cx: &mut App) {
     set_active_icon_pack(p.clone());
     save_icon_pack(&p);
     cx.set_global(IconPackGlobal(p));
+    cx.refresh_windows();
+}
+
+// ----- menu style (right-click / dropdown menu appearance) -------------------
+
+/// Customizable look of pop-up menus (right-click menu, dropdowns).
+#[derive(Clone, Copy, PartialEq)]
+struct MenuStyle {
+    /// Menu background color.
+    bg: u32,
+    /// Menu text ("letter") color.
+    text: u32,
+    /// Background opacity, 0..=100 percent.
+    opacity: u8,
+    /// Menu font size in pixels.
+    font_px: f32,
+}
+
+impl Default for MenuStyle {
+    fn default() -> Self {
+        let d = Theme::default();
+        MenuStyle { bg: d.surface, text: d.text, opacity: 100, font_px: 14.0 }
+    }
+}
+
+impl MenuStyle {
+    /// The background as an rgba value with the configured opacity applied.
+    fn bg_rgba(&self) -> Rgba {
+        let a = (self.opacity.min(100) as u32 * 255) / 100;
+        Theme::alpha(self.bg, a)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct MenuStyleGlobal(MenuStyle);
+impl gpui::Global for MenuStyleGlobal {}
+
+thread_local! {
+    static ACTIVE_MENU: RefCell<MenuStyle> = RefCell::new(MenuStyle::default());
+}
+
+fn menu_style() -> MenuStyle {
+    ACTIVE_MENU.with(|m| *m.borrow())
+}
+
+fn set_active_menu(m: MenuStyle) {
+    ACTIVE_MENU.with(|c| *c.borrow_mut() = m);
+}
+
+/// Apply a menu style everywhere: render copy, persist, global, repaint.
+fn apply_menu_style(m: MenuStyle, cx: &mut App) {
+    set_active_menu(m);
+    save_menu_style(&m);
+    cx.set_global(MenuStyleGlobal(m));
     cx.refresh_windows();
 }
 
@@ -611,6 +669,8 @@ enum ColorTarget {
     Bg,
     Text,
     Hover,
+    MenuBg,
+    MenuText,
 }
 
 /// The Settings window: a tabbed customization surface.
@@ -661,13 +721,33 @@ impl Settings {
             "enter" => {
                 if let Some((_, s)) = &self.color_edit {
                     if let Ok(c) = u32::from_str_radix(s, 16) {
-                        let mut nt = theme();
                         match target {
-                            ColorTarget::Bg => nt.bg = c,
-                            ColorTarget::Text => nt.text = c,
-                            ColorTarget::Hover => nt.hover = c,
+                            ColorTarget::Bg => {
+                                let mut nt = theme();
+                                nt.bg = c;
+                                apply_theme(nt, cx);
+                            }
+                            ColorTarget::Text => {
+                                let mut nt = theme();
+                                nt.text = c;
+                                apply_theme(nt, cx);
+                            }
+                            ColorTarget::Hover => {
+                                let mut nt = theme();
+                                nt.hover = c;
+                                apply_theme(nt, cx);
+                            }
+                            ColorTarget::MenuBg => {
+                                let mut nm = menu_style();
+                                nm.bg = c;
+                                apply_menu_style(nm, cx);
+                            }
+                            ColorTarget::MenuText => {
+                                let mut nm = menu_style();
+                                nm.text = c;
+                                apply_menu_style(nm, cx);
+                            }
                         }
-                        apply_theme(nt, cx);
                     }
                 }
                 self.color_edit = None;
@@ -862,6 +942,19 @@ impl Settings {
                     cx.notify();
                 }),
             ))
+            .child(toggle_row(
+                "tg-palette-history",
+                "Command palette history",
+                "Give Cmd+P its own query history: press Up/Down in the palette to \
+                 cycle through your previous searches.",
+                p.palette_history,
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut np = prefs();
+                    np.palette_history = !np.palette_history;
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }),
+            ))
             .child(settings_title("Sidebar"))
             .child(stepper_row(
                 "st-recents",
@@ -1026,6 +1119,75 @@ impl Settings {
                     .child(self.hex_field(ColorTarget::Hover, t.hover, cx)),
             )
             .child(self.color_row("hover", t.hover, |t, c| t.hover = c, cx))
+            // ----- Menu (right-click / dropdown) appearance -----
+            .child(settings_title("Menu"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .child(self.menu_preview())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(t.text_muted))
+                            .child("Live preview of the right-click menu."),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(menu_label("Menu color"))
+                    .child(self.hex_field(ColorTarget::MenuBg, menu_style().bg, cx)),
+            )
+            .child(self.menu_color_row("menubg", menu_style().bg, |m, c| m.bg = c, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(menu_label("Letter color"))
+                    .child(self.hex_field(ColorTarget::MenuText, menu_style().text, cx)),
+            )
+            .child(self.menu_color_row("menutext", menu_style().text, |m, c| m.text = c, cx))
+            .child(stepper_row(
+                "st-menu-opacity",
+                "Opacity",
+                "Menu background opacity (lower is more see-through).",
+                format!("{}%", menu_style().opacity),
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut m = menu_style();
+                    m.opacity = m.opacity.saturating_sub(10);
+                    apply_menu_style(m, cx);
+                    cx.notify();
+                }),
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut m = menu_style();
+                    m.opacity = (m.opacity + 10).min(100);
+                    apply_menu_style(m, cx);
+                    cx.notify();
+                }),
+            ))
+            .child(stepper_row(
+                "st-menu-size",
+                "Text size",
+                "Menu font size in pixels.",
+                format!("{}px", menu_style().font_px as i32),
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut m = menu_style();
+                    m.font_px = (m.font_px - 1.0).max(9.0);
+                    apply_menu_style(m, cx);
+                    cx.notify();
+                }),
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut m = menu_style();
+                    m.font_px = (m.font_px + 1.0).min(24.0);
+                    apply_menu_style(m, cx);
+                    cx.notify();
+                }),
+            ))
             .child(settings_title("Icon Pack"))
             .child(
                 div()
@@ -1133,6 +1295,70 @@ impl Settings {
         div().flex().flex_wrap().gap_1().children(swatches)
     }
 
+    /// Like [`color_row`] but sets a field on the menu style.
+    fn menu_color_row(
+        &self,
+        tag: &'static str,
+        current: u32,
+        set: fn(&mut MenuStyle, u32),
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = theme();
+        let mut swatches: Vec<AnyElement> = Vec::new();
+        for c in palette_colors() {
+            let selected = c == current;
+            swatches.push(
+                div()
+                    .id((tag, c as usize))
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(c))
+                    .border_2()
+                    .border_color(if selected { rgb(t.accent) } else { rgb(t.border) })
+                    .hover(|s| s.border_color(rgb(t.accent)))
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        let mut nm = menu_style();
+                        set(&mut nm, c);
+                        apply_menu_style(nm, cx);
+                        cx.notify();
+                    }))
+                    .into_any_element(),
+            );
+        }
+        div().flex().flex_wrap().gap_1().children(swatches)
+    }
+
+    /// A live sample pop-up menu showing the current menu style.
+    fn menu_preview(&self) -> impl IntoElement {
+        let m = menu_style();
+        let t = theme();
+        let row = |label: &str| {
+            div()
+                .mx_1()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .child(label.to_string())
+        };
+        div()
+            .min_w(px(200.0))
+            .py_1()
+            .bg(m.bg_rgba())
+            .text_color(rgb(m.text))
+            .text_size(px(m.font_px))
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(t.border_strong))
+            .shadow_lg()
+            .child(row("Open"))
+            .child(row("Rename"))
+            .child(row("Add to Bookmarks"))
+            .child(div().my_1().mx_2().h(px(1.0)).bg(rgb(t.border_strong)))
+            .child(row("Move to Trash"))
+    }
+
     /// A small "current value + editable hex" control for a theme color.
     fn hex_field(
         &self,
@@ -1237,6 +1463,11 @@ fn settings_title(text: &str) -> impl IntoElement {
         .text_color(rgb(theme().text_muted))
         .text_xs()
         .child(text.to_uppercase())
+}
+
+/// A small settings sub-label (normal case, not uppercased).
+fn menu_label(text: &str) -> impl IntoElement {
+    div().text_color(rgb(theme().text)).child(text.to_string())
 }
 
 /// A labelled on/off toggle row used in the General settings tab. `id` must be
@@ -1716,6 +1947,14 @@ struct Shuffle {
     focus: FocusHandle,
     palette_open: bool,
     query: String,
+    /// Text-cursor position in `query`, as a char index (0..=char count).
+    query_cursor: usize,
+    /// Whole query is selected (Cmd+A): the next character replaces it.
+    query_selected: bool,
+    /// Past palette queries (newest last), when the history setting is on.
+    palette_hist: Vec<String>,
+    /// Which history entry is being browsed with Up/Down (None = live query).
+    palette_hist_pos: Option<usize>,
     palette_items: Vec<PaletteItem>,
     selected: usize,
     search_gen: u64,
@@ -1764,6 +2003,12 @@ impl Shuffle {
             cx.notify();
         })
         .detach();
+        // Sync + repaint whenever the menu style changes (e.g. from Settings).
+        cx.observe_global::<MenuStyleGlobal>(|_, cx| {
+            set_active_menu(cx.global::<MenuStyleGlobal>().0);
+            cx.notify();
+        })
+        .detach();
         // Sync the keymap when it changes (e.g. from the Settings window).
         cx.observe_global::<KeymapGlobal>(|_, cx| {
             set_active_keymap(cx.global::<KeymapGlobal>().0.clone());
@@ -1795,6 +2040,10 @@ impl Shuffle {
             focus: cx.focus_handle(),
             palette_open: false,
             query: String::new(),
+            query_cursor: 0,
+            query_selected: false,
+            palette_hist: read_string_list("palette_history.txt"),
+            palette_hist_pos: None,
             palette_items: Vec::new(),
             selected: 0,
             search_gen: 0,
@@ -2620,7 +2869,9 @@ impl Shuffle {
                         div()
                             .min_w(px(200.0))
                             .py_1()
-                            .bg(rgb(theme().surface))
+                            .bg(menu_style().bg_rgba())
+                            .text_color(rgb(menu_style().text))
+                            .text_size(px(menu_style().font_px))
                             .rounded_md()
                             .border_1()
                             .border_color(rgb(theme().border_strong))
@@ -3057,6 +3308,9 @@ impl Shuffle {
         self.palette_open = !self.palette_open;
         if self.palette_open {
             self.query.clear();
+            self.query_cursor = 0;
+            self.query_selected = false;
+            self.palette_hist_pos = None;
             self.selected = 0;
             self.refresh_palette(cx);
             window.focus(&self.focus);
@@ -3243,7 +3497,9 @@ impl Shuffle {
         let Some(item) = self.palette_items.get(self.selected) else {
             return;
         };
-        match item.action.clone() {
+        let action = item.action.clone();
+        self.record_palette_history();
+        match action {
             Action::Open(path, is_dir) => {
                 let target = if is_dir {
                     path
@@ -3418,18 +3674,64 @@ impl Shuffle {
             return;
         }
 
+        let ctrl = ks.modifiers.control;
+        // Up/Down browse the palette's own history when that setting is on;
+        // otherwise they move the result selection.
+        let history_nav = prefs().palette_history;
         match key {
             "escape" => self.close_palette(cx),
             "enter" => self.activate_selection(cx),
+            "down" if history_nav => self.palette_history_next(cx),
+            "up" if history_nav => self.palette_history_prev(cx),
             "down" => self.move_selection(1, cx),
             "up" => self.move_selection(-1, cx),
+            // Cmd+Left / Cmd+Right jump to the start / end of the query.
+            "left" if cmd => {
+                self.query_cursor = 0;
+                self.query_selected = false;
+                cx.notify();
+            }
+            "right" if cmd => {
+                self.query_cursor = self.query.chars().count();
+                self.query_selected = false;
+                cx.notify();
+            }
+            // Left/Right move the text cursor (collapsing any selection).
+            "left" => {
+                self.query_cursor = if self.query_selected {
+                    0
+                } else {
+                    self.query_cursor.saturating_sub(1)
+                };
+                self.query_selected = false;
+                cx.notify();
+            }
+            "right" => {
+                self.query_cursor = if self.query_selected {
+                    self.query.chars().count()
+                } else {
+                    (self.query_cursor + 1).min(self.query.chars().count())
+                };
+                self.query_selected = false;
+                cx.notify();
+            }
+            // Cmd+A selects the whole query (next keystroke replaces it).
+            "a" if cmd => {
+                self.query_selected = !self.query.is_empty();
+                cx.notify();
+            }
+            // Ctrl+U deletes everything behind (before) the cursor.
+            "u" if ctrl => {
+                self.palette_kill_before();
+                self.refresh_palette(cx);
+            }
             "backspace" => {
-                self.query.pop();
+                self.palette_backspace();
                 self.refresh_palette(cx);
             }
             "v" if cmd => {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    self.query.push_str(text.trim());
+                    self.palette_insert(text.trim());
                     self.refresh_palette(cx);
                 }
             }
@@ -3439,12 +3741,119 @@ impl Shuffle {
                 }
                 if let Some(ch) = ks.key_char.as_ref() {
                     if !ch.is_empty() && !ch.chars().any(|c| c.is_control()) {
-                        self.query.push_str(ch);
+                        self.palette_insert(ch);
                         self.refresh_palette(cx);
                     }
                 }
             }
         }
+    }
+
+    // ----- palette text editing (cursor-aware) -----
+
+    /// Byte offset of char index `i` in the query (or its end).
+    fn query_byte(&self, i: usize) -> usize {
+        self.query
+            .char_indices()
+            .nth(i)
+            .map(|(b, _)| b)
+            .unwrap_or(self.query.len())
+    }
+
+    /// Insert `s` at the cursor (replacing the selection first, if any).
+    fn palette_insert(&mut self, s: &str) {
+        if self.query_selected {
+            self.query.clear();
+            self.query_cursor = 0;
+            self.query_selected = false;
+        }
+        let b = self.query_byte(self.query_cursor);
+        self.query.insert_str(b, s);
+        self.query_cursor += s.chars().count();
+        self.palette_hist_pos = None;
+    }
+
+    /// Delete the char before the cursor (or the whole selection).
+    fn palette_backspace(&mut self) {
+        if self.query_selected {
+            self.query.clear();
+            self.query_cursor = 0;
+            self.query_selected = false;
+            return;
+        }
+        if self.query_cursor == 0 {
+            return;
+        }
+        let start = self.query_byte(self.query_cursor - 1);
+        let end = self.query_byte(self.query_cursor);
+        self.query.replace_range(start..end, "");
+        self.query_cursor -= 1;
+    }
+
+    /// Ctrl+U: delete everything before the cursor, keeping what's after.
+    fn palette_kill_before(&mut self) {
+        let b = self.query_byte(self.query_cursor);
+        self.query.replace_range(0..b, "");
+        self.query_cursor = 0;
+        self.query_selected = false;
+    }
+
+    /// Up in history mode: step to the previous (older) query.
+    fn palette_history_prev(&mut self, cx: &mut Context<Self>) {
+        if self.palette_hist.is_empty() {
+            return;
+        }
+        let pos = match self.palette_hist_pos {
+            None => self.palette_hist.len() - 1,
+            Some(0) => 0,
+            Some(p) => p - 1,
+        };
+        self.palette_hist_pos = Some(pos);
+        self.query = self.palette_hist[pos].clone();
+        self.query_cursor = self.query.chars().count();
+        self.query_selected = false;
+        self.refresh_palette(cx);
+    }
+
+    /// Down in history mode: step to the next (newer) query, past the newest
+    /// returns to an empty live query.
+    fn palette_history_next(&mut self, cx: &mut Context<Self>) {
+        match self.palette_hist_pos {
+            None => {}
+            Some(p) if p + 1 >= self.palette_hist.len() => {
+                self.palette_hist_pos = None;
+                self.query.clear();
+                self.query_cursor = 0;
+                self.query_selected = false;
+                self.refresh_palette(cx);
+            }
+            Some(p) => {
+                let np = p + 1;
+                self.palette_hist_pos = Some(np);
+                self.query = self.palette_hist[np].clone();
+                self.query_cursor = self.query.chars().count();
+                self.query_selected = false;
+                self.refresh_palette(cx);
+            }
+        }
+    }
+
+    /// Record a submitted query into the palette history (when enabled).
+    fn record_palette_history(&mut self) {
+        if !prefs().palette_history {
+            return;
+        }
+        let q = self.query.trim().to_string();
+        if q.is_empty() {
+            return;
+        }
+        self.palette_hist.retain(|h| h != &q);
+        self.palette_hist.push(q);
+        let overflow = self.palette_hist.len().saturating_sub(50);
+        if overflow > 0 {
+            self.palette_hist.drain(0..overflow);
+        }
+        write_string_list("palette_history.txt", &self.palette_hist);
     }
 
     fn render_palette(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -3508,15 +3917,27 @@ impl Shuffle {
             })
             .collect();
 
-        // Input line: query with a caret, or a dim placeholder.
+        // Input line: query with a caret, or a dim placeholder. When the whole
+        // query is selected (Cmd+A) it's shown highlighted.
         let input = if self.query.is_empty() {
             div()
                 .text_color(rgb(t.text_dim))
                 .child("Type a path, or a file/folder name…")
+        } else if self.query_selected {
+            div().text_color(rgb(t.text)).child(
+                div()
+                    .bg(Theme::alpha(t.accent, 0x66))
+                    .rounded_sm()
+                    .child(self.query.clone()),
+            )
         } else {
+            // Insert a caret bar at the cursor position.
+            let cursor = self.query_cursor.min(self.query.chars().count());
+            let b = self.query_byte(cursor);
+            let (before, after) = self.query.split_at(b);
             div()
                 .text_color(rgb(t.text))
-                .child(format!("{}\u{2502}", self.query))
+                .child(format!("{before}\u{2502}{after}"))
         };
 
         // Backdrop covering the window, with the panel near the top.
@@ -6533,7 +6954,7 @@ fn ctx_item(
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .text_color(rgb(theme().text))
+        .text_color(rgb(menu_style().text))
         .hover(|s| s.bg(rgb(theme().selected)))
         .child(label)
         .on_click(on_click)
@@ -6560,7 +6981,7 @@ fn ctx_parent(
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .text_color(rgb(t.text))
+        .text_color(rgb(menu_style().text))
         .hover(|s| s.bg(rgb(t.selected)))
         .child(label)
         .child(div().flex_none().text_color(rgb(t.text_dim)).child("›"))
@@ -6582,7 +7003,7 @@ fn ctx_app(
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .text_color(rgb(theme().text))
+        .text_color(rgb(menu_style().text))
         .hover(|s| s.bg(rgb(theme().selected)))
         .child(name)
         .on_click(on_click)
@@ -8416,6 +8837,59 @@ fn load_theme() -> Theme {
     Theme::default()
 }
 
+/// Persist the menu style.
+fn save_menu_style(m: &MenuStyle) {
+    if let Some(file) = config_file("menu.txt") {
+        if let Some(parent) = file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let body = format!(
+            "bg={:06x}\ntext={:06x}\nopacity={}\nfont_px={}\n",
+            m.bg, m.text, m.opacity, m.font_px
+        );
+        let _ = fs::write(&file, body);
+    }
+}
+
+/// Load the saved menu style, falling back to defaults for missing fields.
+fn load_menu_style() -> MenuStyle {
+    let mut m = MenuStyle::default();
+    if let Some(file) = config_file("menu.txt") {
+        if let Ok(s) = fs::read_to_string(&file) {
+            for line in s.lines() {
+                let Some((k, v)) = line.split_once('=') else {
+                    continue;
+                };
+                let (k, v) = (k.trim(), v.trim());
+                match k {
+                    "bg" => {
+                        if let Ok(c) = u32::from_str_radix(v, 16) {
+                            m.bg = c;
+                        }
+                    }
+                    "text" => {
+                        if let Ok(c) = u32::from_str_radix(v, 16) {
+                            m.text = c;
+                        }
+                    }
+                    "opacity" => {
+                        if let Ok(n) = v.parse::<u8>() {
+                            m.opacity = n.min(100);
+                        }
+                    }
+                    "font_px" => {
+                        if let Ok(n) = v.parse::<f32>() {
+                            m.font_px = n.clamp(9.0, 24.0);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    m
+}
+
 /// Persist feature prefs as `key=bool` lines.
 fn save_prefs(p: &Prefs) {
     if let Some(file) = config_file("prefs.txt") {
@@ -8423,8 +8897,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\n",
-            p.terminal, p.term_history, p.preview, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit
+            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\n",
+            p.terminal, p.term_history, p.preview, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history
         );
         let _ = fs::write(&file, body);
     }
@@ -8508,6 +8982,7 @@ fn load_prefs() -> Prefs {
                             p.recent_limit = n.min(RECENTS_CAP);
                         }
                     }
+                    "palette_history" => p.palette_history = on,
                     _ => {}
                 }
             }
@@ -8670,6 +9145,11 @@ fn main() {
         let saved_pack = load_icon_pack();
         set_active_icon_pack(saved_pack.clone());
         cx.set_global(IconPackGlobal(saved_pack));
+
+        // Load the menu style.
+        let saved_menu = load_menu_style();
+        set_active_menu(saved_menu);
+        cx.set_global(MenuStyleGlobal(saved_menu));
 
         // Menu bar: app menu with Settings + Quit, plus their shortcuts.
         cx.bind_keys([
