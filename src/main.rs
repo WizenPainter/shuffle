@@ -21,7 +21,8 @@ use chrono::{DateTime, Local};
 use gpui::{
     actions, anchored, div, img, point, prelude::*, px, relative, rgb, rgba, size, uniform_list, AnyElement, App,
     Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, FocusHandle, ImageSource,
-    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit, Rgba,
+    KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
+    PathPromptOptions, Rgba,
     RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, TitlebarOptions,
     UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
@@ -236,9 +237,42 @@ const PRESETS: &[(&str, Theme)] = &[
 ];
 
 /// Curated per-property options shown in Settings alongside the presets.
-const BG_OPTIONS: &[u32] = &[0x1e1e22, 0x101014, 0x1e1e2e, 0x24273a, 0x303446, 0x232334, 0xeff1f5];
-const TEXT_OPTIONS: &[u32] = &[0xf0f0f4, 0xcdd6f4, 0xcad3f5, 0xc6d0f5, 0xb0b0b8, 0x4c4f69];
-const HOVER_OPTIONS: &[u32] = &[0x2a2a30, 0x313244, 0x363a4f, 0x414559, 0x3a3a44, 0xdce0e8];
+/// Convert HSL (h in 0..360, s/l in 0..1) to a 0xRRGGBB color.
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> u32 {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r1, g1, b1) = match hp as i32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    let to = |v: f32| (((v + m).clamp(0.0, 1.0)) * 255.0).round() as u32;
+    (to(r1) << 16) | (to(g1) << 8) | to(b1)
+}
+
+/// A broad, ordered swatch palette: a grayscale ramp plus a hue × lightness grid
+/// — enough variety to set any reasonable background/text/accent color.
+fn palette_colors() -> Vec<u32> {
+    let mut out = Vec::new();
+    // Grayscale ramp (black → white).
+    for i in 0..13 {
+        let v = (i as f32 / 12.0 * 255.0).round() as u32;
+        out.push((v << 16) | (v << 8) | v);
+    }
+    // Hues across the wheel, each from dark to light.
+    let lights = [0.18f32, 0.30, 0.42, 0.55, 0.68, 0.82];
+    for hue in (0..360).step_by(30) {
+        for &l in &lights {
+            out.push(hsl_to_rgb(hue as f32, 0.65, l));
+        }
+    }
+    out
+}
 
 /// Wrapper so the theme lives in the GPUI global store and notifies observers.
 #[derive(Clone, Copy)]
@@ -284,6 +318,8 @@ struct Prefs {
     info: bool,
     /// Show the leading ".." row that goes up one level.
     show_parent: bool,
+    /// Collapse the left sidebar to an icon-only rail.
+    sidebar_collapsed: bool,
 }
 
 impl Default for Prefs {
@@ -294,6 +330,7 @@ impl Default for Prefs {
             preview: false,
             info: false,
             show_parent: true,
+            sidebar_collapsed: false,
         }
     }
 }
@@ -309,6 +346,7 @@ thread_local! {
         preview: false,
         info: false,
         show_parent: true,
+        sidebar_collapsed: false,
     }) };
 }
 
@@ -327,6 +365,69 @@ fn apply_prefs(p: Prefs, cx: &mut App) {
     save_prefs(&p);
     cx.set_global(PrefsGlobal(p));
     cx.refresh_windows();
+}
+
+// ----- icon packs ------------------------------------------------------------
+
+/// The active icon pack: a folder of images named `folder.png`, `file.png`, and
+/// per-extension (e.g. `pdf.png`, `png.png`) that override macOS icons.
+#[derive(Clone)]
+struct IconPackGlobal(Option<PathBuf>);
+impl gpui::Global for IconPackGlobal {}
+
+thread_local! {
+    static ACTIVE_ICON_PACK: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+fn icon_pack() -> Option<PathBuf> {
+    ACTIVE_ICON_PACK.with(|p| p.borrow().clone())
+}
+
+fn set_active_icon_pack(p: Option<PathBuf>) {
+    ACTIVE_ICON_PACK.with(|c| *c.borrow_mut() = p);
+}
+
+/// Apply an icon pack (or `None` to revert to macOS icons): persist, rebuild
+/// icons, and notify the explorer window.
+fn apply_icon_pack(p: Option<PathBuf>, cx: &mut App) {
+    set_active_icon_pack(p.clone());
+    save_icon_pack(&p);
+    cx.set_global(IconPackGlobal(p));
+    cx.refresh_windows();
+}
+
+/// The pack image overriding the icon for `key` (a file extension, FOLDER_KEY,
+/// or FILE_KEY), if the active pack provides one.
+fn pack_icon_path(key: &str) -> Option<PathBuf> {
+    let pack = icon_pack()?;
+    let name = if key == FOLDER_KEY {
+        "folder"
+    } else if key == FILE_KEY {
+        "file"
+    } else if let Some(rest) = key.strip_prefix("fav:") {
+        // Favorite/location icons (e.g. "fav:documents") map to <name>.png so a
+        // pack can override sidebar icons just like file/folder icons.
+        rest
+    } else {
+        key
+    };
+    for ext in ["png", "jpg", "jpeg", "gif", "tiff", "bmp", "webp"] {
+        let p = pack.join(format!("{name}.{ext}"));
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Decode an image file from disk into a 128px GPUI icon (for pack icons).
+fn decode_image_file(path: &Path) -> Option<Arc<RenderImage>> {
+    let bytes = fs::read(path).ok()?;
+    decode_icon(&bytes)
+}
+
+fn clear_icon_cache() {
+    ICON_CACHE.with(|c| c.borrow_mut().clear());
 }
 
 // ----- keybindings -----------------------------------------------------------
@@ -499,12 +600,22 @@ fn canon_keystroke(ks: &gpui::Keystroke) -> String {
     s
 }
 
+/// Which theme color a hex field edits.
+#[derive(Clone, Copy, PartialEq)]
+enum ColorTarget {
+    Bg,
+    Text,
+    Hover,
+}
+
 /// The Settings window: a tabbed customization surface.
 struct Settings {
     tab: usize,
     focus: FocusHandle,
     /// The action whose keystroke is currently being recorded, if any.
     recording: Option<KeyAction>,
+    /// In-progress hex color entry: (which color, typed hex digits).
+    color_edit: Option<(ColorTarget, String)>,
 }
 
 impl Settings {
@@ -513,6 +624,63 @@ impl Settings {
             tab: 0,
             focus: cx.focus_handle(),
             recording: None,
+            color_edit: None,
+        }
+    }
+
+    /// Route key events: hex entry first, then keybind recording.
+    fn handle_settings_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        if self.color_edit.is_some() {
+            self.handle_hex_key(ev, cx);
+        } else if self.recording.is_some() {
+            self.handle_keybind_key(ev, cx);
+        }
+    }
+
+    /// Capture typed hex digits for a color field; Enter applies, Esc cancels.
+    fn handle_hex_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let Some((target, _)) = self.color_edit.clone() else {
+            return;
+        };
+        match ev.keystroke.key.as_str() {
+            "escape" => {
+                self.color_edit = None;
+                cx.notify();
+            }
+            "backspace" => {
+                if let Some((_, s)) = self.color_edit.as_mut() {
+                    s.pop();
+                }
+                cx.notify();
+            }
+            "enter" => {
+                if let Some((_, s)) = &self.color_edit {
+                    if let Ok(c) = u32::from_str_radix(s, 16) {
+                        let mut nt = theme();
+                        match target {
+                            ColorTarget::Bg => nt.bg = c,
+                            ColorTarget::Text => nt.text = c,
+                            ColorTarget::Hover => nt.hover = c,
+                        }
+                        apply_theme(nt, cx);
+                    }
+                }
+                self.color_edit = None;
+                cx.notify();
+            }
+            _ => {
+                if let Some(ch) = ev.keystroke.key_char.as_ref() {
+                    // Accept up to 6 hex digits.
+                    if let Some((_, s)) = self.color_edit.as_mut() {
+                        for c in ch.chars() {
+                            if c.is_ascii_hexdigit() && s.len() < 6 {
+                                s.push(c.to_ascii_lowercase());
+                            }
+                        }
+                    }
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -599,7 +767,7 @@ impl Render for Settings {
             .text_color(rgb(t.text))
             .track_focus(&self.focus)
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
-                this.handle_keybind_key(ev, cx);
+                this.handle_settings_key(ev, cx);
             }))
             .child(rail)
             .child(
@@ -802,31 +970,122 @@ impl Settings {
             .gap_5()
             .child(settings_title("Preset Palettes"))
             .child(div().flex().flex_wrap().gap_3().children(presets))
-            .child(settings_title("Background"))
-            .child(self.color_row(BG_OPTIONS, t.bg, |t, c| t.bg = c, cx))
-            .child(settings_title("Text"))
-            .child(self.color_row(TEXT_OPTIONS, t.text, |t, c| t.text = c, cx))
-            .child(settings_title("Mouseover"))
-            .child(self.color_row(HOVER_OPTIONS, t.hover, |t, c| t.hover = c, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(settings_title("Background"))
+                    .child(self.hex_field(ColorTarget::Bg, t.bg, cx)),
+            )
+            .child(self.color_row("bg", t.bg, |t, c| t.bg = c, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(settings_title("Text"))
+                    .child(self.hex_field(ColorTarget::Text, t.text, cx)),
+            )
+            .child(self.color_row("text", t.text, |t, c| t.text = c, cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(settings_title("Mouseover"))
+                    .child(self.hex_field(ColorTarget::Hover, t.hover, cx)),
+            )
+            .child(self.color_row("hover", t.hover, |t, c| t.hover = c, cx))
+            .child(settings_title("Icon Pack"))
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(t.text_muted))
+                    .child(match icon_pack() {
+                        Some(p) => format!("Current: {}", path_label(&p)),
+                        None => "Using macOS icons".to_string(),
+                    }),
+            )
+            .child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("pack-choose")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgb(t.surface))
+                            .border_1()
+                            .border_color(rgb(t.border))
+                            .hover(|s| s.border_color(rgb(t.accent)))
+                            .child("Choose Folder…")
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                let rx = cx.prompt_for_paths(PathPromptOptions {
+                                    files: false,
+                                    directories: true,
+                                    multiple: false,
+                                    prompt: Some("Choose Icon Pack".into()),
+                                });
+                                cx.spawn(async move |this, cx| {
+                                    if let Ok(Ok(Some(paths))) = rx.await {
+                                        if let Some(p) = paths.into_iter().next() {
+                                            let _ = this.update(cx, |_, cx| {
+                                                apply_icon_pack(Some(p), cx)
+                                            });
+                                        }
+                                    }
+                                })
+                                .detach();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("pack-reset")
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(rgb(t.hover))
+                            .hover(|s| s.bg(rgb(t.selected)))
+                            .child("Use macOS icons")
+                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                apply_icon_pack(None, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(t.text_dim))
+                    .child(
+                        "A folder of images named folder.png, file.png, and per-extension \
+                         (e.g. pdf.png, png.png). PNG with transparency works best.",
+                    ),
+            )
     }
 
-    /// A row of color swatches; clicking one sets a single theme field via `set`.
+    /// A grid of color swatches; clicking one sets a single theme field via
+    /// `set`. `tag` keeps element ids unique across rows that share colors.
     fn color_row(
         &self,
-        options: &'static [u32],
+        tag: &'static str,
         current: u32,
         set: fn(&mut Theme, u32),
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let t = theme();
         let mut swatches: Vec<AnyElement> = Vec::new();
-        for &c in options {
+        for c in palette_colors() {
             let selected = c == current;
             swatches.push(
                 div()
-                    .id(("swatch", c))
-                    .w(px(34.0))
-                    .h(px(34.0))
+                    .id((tag, c as usize))
+                    .w(px(22.0))
+                    .h(px(22.0))
                     .rounded_md()
                     .cursor_pointer()
                     .bg(rgb(c))
@@ -842,7 +1101,40 @@ impl Settings {
                     .into_any_element(),
             );
         }
-        div().flex().flex_wrap().gap_2().children(swatches)
+        div().flex().flex_wrap().gap_1().children(swatches)
+    }
+
+    /// A small "current value + editable hex" control for a theme color.
+    fn hex_field(
+        &self,
+        target: ColorTarget,
+        current: u32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let t = theme();
+        let editing = self.color_edit.as_ref().filter(|(tt, _)| *tt == target);
+        let text = match editing {
+            Some((_, s)) => format!("#{s}\u{2502}"),
+            None => format!("#{current:06x}"),
+        };
+        div()
+            .id(("hex", target as usize))
+            .flex_none()
+            .px_2()
+            .py(px(2.0))
+            .rounded_md()
+            .cursor_text()
+            .bg(rgb(t.surface))
+            .border_1()
+            .border_color(if editing.is_some() { rgb(t.accent) } else { rgb(t.border) })
+            .text_xs()
+            .text_color(rgb(t.text))
+            .child(text)
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.color_edit = Some((target, String::new()));
+                window.focus(&this.focus);
+                cx.notify();
+            }))
     }
 }
 
@@ -982,6 +1274,8 @@ const PALETTE_ROW_H: f32 = 26.0;
 const PALETTE_MAX_ROWS: usize = 7;
 /// Sidebar width; also the left edge of the content/canvas area.
 const SIDEBAR_W: f32 = 220.0;
+/// Sidebar width when collapsed to an icon-only rail.
+const SIDEBAR_COLLAPSED_W: f32 = 52.0;
 /// Tab strip row height.
 const TAB_H: f32 = 30.0;
 /// Fixed list-row height (so marquee selection can map y-coordinates to rows).
@@ -1268,6 +1562,29 @@ struct FileDrag {
     path: PathBuf,
 }
 
+/// A small floating tooltip (used by the collapsed sidebar to show a row's
+/// name/path on hover).
+struct TooltipView {
+    text: String,
+}
+
+impl Render for TooltipView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(Theme::alpha(t.surface, 0xf2))
+            .border_1()
+            .border_color(rgb(t.border))
+            .text_color(rgb(t.text))
+            .text_xs()
+            .shadow_lg()
+            .child(self.text.clone())
+    }
+}
+
 /// The floating preview rendered under the cursor while dragging a tab.
 struct TabDragPreview {
     label: String,
@@ -1324,6 +1641,10 @@ struct Shuffle {
     next_load_gen: u64,
     /// In-progress marquee (box) selection: (pane, start, current) window coords.
     marquee: Option<(usize, (f32, f32), (f32, f32))>,
+    /// Open "Connect to Server" dialog: the URL being typed (None = closed).
+    server_dialog: Option<String>,
+    /// Recently-connected server URLs (most recent first).
+    server_history: Vec<String>,
     // Terminal mode (the bottom command bar).
     term_input: String,
     term_output: Vec<String>,
@@ -1334,6 +1655,8 @@ struct Shuffle {
 impl Shuffle {
     fn new(dir: PathBuf, cx: &mut Context<Self>) -> Self {
         ensure_base_icons(); // real folder/file icons ready before first render
+        ensure_sidebar_icons(); // Applications/Documents/… + Mac/home icons
+        ensure_dynamic_sidebar_icons(); // cloud providers + mounted volumes
         // Sync + repaint whenever the theme changes (e.g. from Settings).
         cx.observe_global::<ThemeGlobal>(|_, cx| {
             set_active_theme(cx.global::<ThemeGlobal>().0);
@@ -1350,6 +1673,17 @@ impl Shuffle {
         cx.observe_global::<KeymapGlobal>(|_, cx| {
             set_active_keymap(cx.global::<KeymapGlobal>().0.clone());
             cx.notify();
+        })
+        .detach();
+        // Rebuild icons when the icon pack changes.
+        cx.observe_global::<IconPackGlobal>(|this, cx| {
+            set_active_icon_pack(cx.global::<IconPackGlobal>().0.clone());
+            clear_icon_cache();
+            ensure_base_icons();
+            ensure_sidebar_icons();
+            ensure_dynamic_sidebar_icons();
+            cx.notify();
+            this.prewarm_icons(cx);
         })
         .detach();
         Self {
@@ -1376,6 +1710,8 @@ impl Shuffle {
             confirm_delete: None,
             next_load_gen: 0,
             marquee: None,
+            server_dialog: None,
+            server_history: read_string_list("servers.txt"),
             term_input: String::new(),
             term_output: Vec::new(),
             term_focused: false,
@@ -1444,6 +1780,7 @@ impl Shuffle {
     /// paint, then a background pass that fills in sizes/dates without blocking.
     fn reload_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
         let dir = self.tab(pane).current_dir.clone();
+        ensure_dynamic_sidebar_icons(); // pick up newly-mounted volumes/cloud
         self.tab_mut(pane).entries = read_entries_fast(&dir);
         self.next_load_gen += 1;
         let gen = self.next_load_gen;
@@ -2348,6 +2685,200 @@ impl Shuffle {
             )
     }
 
+    // ----- Connect to Server -----
+
+    fn open_server_dialog(&mut self, cx: &mut Context<Self>) {
+        self.server_dialog = Some(String::new());
+        cx.notify();
+    }
+
+    /// Hand a server URL off to macOS (`open smb://…`), which shows the native
+    /// auth prompt and mounts the share under /Volumes. Records it in history.
+    fn connect_to_server(&mut self, raw: &str, cx: &mut Context<Self>) {
+        let mut url = raw.trim().to_string();
+        if url.is_empty() {
+            return;
+        }
+        // Default to SMB when no scheme is given.
+        if !url.contains("://") {
+            url = format!("smb://{url}");
+        }
+        let _ = Command::new("open").arg(&url).spawn();
+
+        // Most-recent-first, de-duplicated, capped.
+        self.server_history.retain(|u| u != &url);
+        self.server_history.insert(0, url);
+        self.server_history.truncate(10);
+        write_string_list("servers.txt", &self.server_history);
+
+        self.server_dialog = None;
+        cx.notify();
+    }
+
+    fn handle_server_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let cmd = ks.modifiers.platform;
+        match ks.key.as_str() {
+            "escape" => {
+                self.server_dialog = None;
+                cx.notify();
+            }
+            "enter" => {
+                if let Some(url) = self.server_dialog.clone() {
+                    self.connect_to_server(&url, cx);
+                }
+            }
+            "backspace" => {
+                if let Some(s) = self.server_dialog.as_mut() {
+                    s.pop();
+                }
+                cx.notify();
+            }
+            "v" if cmd => {
+                if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                    if let Some(s) = self.server_dialog.as_mut() {
+                        s.push_str(t.trim());
+                    }
+                    cx.notify();
+                }
+            }
+            _ => {
+                if cmd {
+                    return;
+                }
+                if let Some(ch) = ks.key_char.as_ref() {
+                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
+                        if let Some(s) = self.server_dialog.as_mut() {
+                            s.push_str(ch);
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
+    fn render_server_dialog(&self, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let url = self.server_dialog.clone().unwrap_or_default();
+        let placeholder = url.is_empty();
+        let shown = if placeholder { "smb://server/share".to_string() } else { url.clone() };
+
+        let mut recent = div().flex().flex_col().gap_1();
+        if !self.server_history.is_empty() {
+            recent = recent.child(
+                div().text_xs().text_color(rgb(t.text_dim)).child("Recent Servers"),
+            );
+            for u in self.server_history.iter().take(6) {
+                let target = u.clone();
+                recent = recent.child(
+                    div()
+                        .id(SharedString::from(format!("srv-{u}")))
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_color(rgb(t.text_muted))
+                        .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+                        .child(u.clone())
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.connect_to_server(&target, cx);
+                        })),
+                );
+            }
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000066))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.server_dialog = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .w(px(420.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_5()
+                    .rounded_lg()
+                    .bg(rgb(t.surface))
+                    .border_1()
+                    .border_color(rgb(t.border_strong))
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
+                    .child(div().text_color(rgb(t.text)).child("Connect to Server"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(t.text_muted))
+                            .child("Enter an address, e.g. smb://host/share, afp://…, or ftp://…"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(t.bg))
+                            .border_1()
+                            .border_color(rgb(t.accent))
+                            .text_color(rgb(if placeholder { t.text_dim } else { t.text }))
+                            .child(shown),
+                    )
+                    .child(recent)
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("srv-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(rgb(t.text))
+                                    .bg(rgb(t.hover))
+                                    .hover(|s| s.bg(rgb(t.selected)))
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.server_dialog = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("srv-connect")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(rgb(0xffffff))
+                                    .bg(rgb(t.accent))
+                                    .hover(|s| s.bg(Theme::alpha(t.accent, 0xdd)))
+                                    .child("Connect")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Some(url) = this.server_dialog.clone() {
+                                            this.connect_to_server(&url, cx);
+                                        }
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
     /// Build the ~/ fuzzy index on a background thread, then store it.
     fn build_index(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
@@ -2687,6 +3218,12 @@ impl Shuffle {
         let cmd = ks.modifiers.platform;
         let key = ks.key.as_str();
 
+        // The Connect-to-Server dialog captures all typing while open.
+        if self.server_dialog.is_some() {
+            self.handle_server_key(ev, cx);
+            return;
+        }
+
         // The delete-confirmation dialog captures Enter (confirm) / Esc (cancel).
         if self.confirm_delete.is_some() {
             match key {
@@ -2742,24 +3279,16 @@ impl Shuffle {
             // Arrow keys move the selection within the active pane.
             if !cmd {
                 let pane = self.active_pane;
-                match key {
-                    "up" => {
-                        self.arrow_move(pane, 0, -1, cx);
-                        return;
-                    }
-                    "down" => {
-                        self.arrow_move(pane, 0, 1, cx);
-                        return;
-                    }
-                    "left" => {
-                        self.arrow_move(pane, -1, 0, cx);
-                        return;
-                    }
-                    "right" => {
-                        self.arrow_move(pane, 1, 0, cx);
-                        return;
-                    }
-                    _ => {}
+                let delta = match key {
+                    "up" => Some((0, -1)),
+                    "down" => Some((0, 1)),
+                    "left" => Some((-1, 0)),
+                    "right" => Some((1, 0)),
+                    _ => None,
+                };
+                if let Some((dx, dy)) = delta {
+                    self.arrow_move(pane, dx, dy, cx);
+                    return;
                 }
             }
             // Enter renames the focused file (Finder-style; not rebindable).
@@ -3731,7 +4260,8 @@ impl Shuffle {
 
     /// Gather file info for `path` in the background (once), then repaint.
     fn ensure_info(&self, path: PathBuf, cx: &mut Context<Self>) {
-        if lookup_info(&path).is_some() {
+        // Only gather info when the Information panel is actually shown.
+        if !prefs().info || lookup_info(&path).is_some() {
             return;
         }
         cx.spawn(async move |this, cx| {
@@ -4164,14 +4694,20 @@ impl Shuffle {
 
         cx.spawn(async move |this, cx| {
             for (key, path) in jobs {
-                // AppKit's icon fetch must stay on the main thread (calling it
-                // off-main can deadlock), but it's the cheap part. The heavy TIFF
-                // decode/resize runs on a background thread so it never blocks
-                // rendering.
-                let tiff = icon_tiff(&path);
-                let built = match tiff {
-                    Some(t) => cx.background_spawn(async move { decode_icon(&t) }).await,
-                    None => None,
+                // An active icon pack overrides the macOS icon. Pack images are
+                // read + decoded entirely off the main thread.
+                let built = if let Some(pack_file) = pack_icon_path(&key) {
+                    cx.background_spawn(async move { decode_image_file(&pack_file) })
+                        .await
+                } else {
+                    // AppKit's icon fetch must stay on the main thread (calling it
+                    // off-main can deadlock), but it's the cheap part. The heavy
+                    // decode/resize runs on a background thread.
+                    let tiff = icon_tiff(&path);
+                    match tiff {
+                        Some(t) => cx.background_spawn(async move { decode_icon(&t) }).await,
+                        None => None,
+                    }
                 };
                 ICON_CACHE.with(|cache| {
                     cache.borrow_mut().insert(key, built);
@@ -4200,79 +4736,212 @@ impl Shuffle {
         let current = self.active_tab().current_dir.clone();
         let current = current.as_path();
         let home = home_dir();
+        let collapsed = prefs().sidebar_collapsed;
         let mut items: Vec<AnyElement> = Vec::new();
         let mut key = 0usize;
 
-        // --- Recent ---
-        items.push(section_header("RECENT").into_any_element());
-        if self.recents.is_empty() {
-            items.push(empty_hint("No recent folders").into_any_element());
-        } else {
-            for p in &self.recents {
-                push_nav(&mut items, cx, &mut key, path_label(p), p.clone(), current);
+        // --- Collapse / expand toggle (always present) ---
+        let chevron = if collapsed { "»" } else { "«" };
+        items.push(
+            div()
+                .id("sidebar-toggle")
+                .flex()
+                .items_center()
+                .when(collapsed, |d| d.justify_center())
+                .when(!collapsed, |d| d.justify_end())
+                .px_2()
+                .pt_2()
+                .pb_1()
+                .cursor_pointer()
+                .text_color(rgb(theme().text_dim))
+                .hover(|s| s.text_color(rgb(theme().text)))
+                .child(chevron)
+                .tooltip(tip(if collapsed { "Expand sidebar" } else { "Collapse sidebar" }))
+                .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut np = prefs();
+                    np.sidebar_collapsed = !np.sidebar_collapsed;
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        );
+
+        // --- Favorites (Applications, Documents, …) ---
+        push_section(&mut items, "FAVORITES", collapsed);
+        for (label, slug) in SIDEBAR_FAVORITES {
+            let path = fav_path(slug);
+            if !path.is_dir() {
+                continue;
             }
+            push_nav(
+                &mut items,
+                cx,
+                &mut key,
+                label.to_string(),
+                fav_key(slug),
+                path,
+                current,
+                collapsed,
+            );
         }
 
         // --- Bookmarks (with a "+" to pin the current folder) ---
-        items.push(
-            div()
-                .flex()
-                .items_center()
-                .justify_between()
-                .px_3()
-                .pt_4()
-                .pb_1()
-                .child(div().text_xs().text_color(rgb(theme().text_dim)).child("BOOKMARKS"))
-                .child(
-                    div()
-                        .id("add-bookmark")
-                        .cursor_pointer()
-                        .px_1()
-                        .text_color(rgb(theme().text_dim))
-                        .hover(|s| s.text_color(rgb(theme().text)))
-                        .child("+")
-                        .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                            this.add_bookmark(cx);
-                        })),
-                )
-                .into_any_element(),
-        );
+        if collapsed {
+            push_divider(&mut items);
+            items.push(
+                div()
+                    .id("add-bookmark")
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .mx_1()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(rgb(theme().text_dim))
+                    .hover(|s| s.bg(rgb(theme().hover)).text_color(rgb(theme().text)))
+                    .child("+")
+                    .tooltip(tip("Pin current folder"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.add_bookmark(cx);
+                    }))
+                    .into_any_element(),
+            );
+        } else {
+            items.push(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_3()
+                    .pt_4()
+                    .pb_1()
+                    .child(div().text_xs().text_color(rgb(theme().text_dim)).child("BOOKMARKS"))
+                    .child(
+                        div()
+                            .id("add-bookmark")
+                            .cursor_pointer()
+                            .px_1()
+                            .text_color(rgb(theme().text_dim))
+                            .hover(|s| s.text_color(rgb(theme().text)))
+                            .child("+")
+                            .tooltip(tip("Pin current folder"))
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.add_bookmark(cx);
+                            })),
+                    )
+                    .into_any_element(),
+            );
+        }
         if self.bookmarks.is_empty() {
-            items.push(empty_hint("Click + to pin a folder").into_any_element());
+            if !collapsed {
+                items.push(empty_hint("Click + to pin a folder").into_any_element());
+            }
         } else {
             for p in &self.bookmarks {
-                push_nav(&mut items, cx, &mut key, path_label(p), p.clone(), current);
+                push_nav(
+                    &mut items,
+                    cx,
+                    &mut key,
+                    path_label(p),
+                    FOLDER_KEY.to_string(),
+                    p.clone(),
+                    current,
+                    collapsed,
+                );
             }
         }
 
-        // --- Favorites ---
-        items.push(section_header("FAVORITES").into_any_element());
-        let favorites: [(&str, PathBuf); 4] = [
-            ("Applications", PathBuf::from("/Applications")),
-            ("Pictures", home.join("Pictures")),
-            ("Documents", home.join("Documents")),
-            ("Downloads", home.join("Downloads")),
-        ];
-        for (label, path) in favorites {
-            push_nav(&mut items, cx, &mut key, label.to_string(), path, current);
+        // --- Recents ---
+        push_section(&mut items, "RECENTS", collapsed);
+        if self.recents.is_empty() {
+            if !collapsed {
+                items.push(empty_hint("No recent folders").into_any_element());
+            }
+        } else {
+            for p in &self.recents {
+                push_nav(
+                    &mut items,
+                    cx,
+                    &mut key,
+                    path_label(p),
+                    FOLDER_KEY.to_string(),
+                    p.clone(),
+                    current,
+                    collapsed,
+                );
+            }
         }
 
-        // --- Locations ---
-        items.push(section_header("LOCATIONS").into_any_element());
+        // --- Cloud (Dropbox, Google Drive, iCloud, …) ---
+        let cloud = cloud_locations();
+        if !cloud.is_empty() {
+            push_section(&mut items, "CLOUD", collapsed);
+            for (label, path) in cloud {
+                let icon_key = path.to_string_lossy().into_owned();
+                push_nav(&mut items, cx, &mut key, label, icon_key, path, current, collapsed);
+            }
+        }
+
+        // --- Servers (the Mac, mounted volumes/shares, Connect to Server) ---
+        push_section(&mut items, "SERVERS", collapsed);
         push_nav(
             &mut items,
             cx,
             &mut key,
             "Macintosh HD".to_string(),
+            fav_key("computer"),
             PathBuf::from("/"),
             current,
+            collapsed,
         );
-        push_nav(&mut items, cx, &mut key, username(), home, current);
+        push_nav(
+            &mut items,
+            cx,
+            &mut key,
+            username(),
+            fav_key("home"),
+            home,
+            current,
+            collapsed,
+        );
+        for (label, path) in mounted_volumes() {
+            let icon_key = path.to_string_lossy().into_owned();
+            push_nav(&mut items, cx, &mut key, label, icon_key, path, current, collapsed);
+        }
+        // "Connect to Server…" action row.
+        {
+            let base = div()
+                .id("connect-server")
+                .flex()
+                .items_center()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(rgb(theme().text_muted))
+                .hover(|s| s.bg(rgb(theme().hover)).text_color(rgb(theme().text)));
+            let base = if collapsed {
+                base.mx_1().py_1().justify_center().child("🌐")
+            } else {
+                base.mx_2()
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .child(div().w(px(16.0)).flex().justify_center().child("🌐"))
+                    .child("Connect to Server…")
+            };
+            items.push(
+                base.tooltip(tip("Connect to Server…"))
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.open_server_dialog(cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
 
         div()
             .id("sidebar")
             .flex_none()
-            .w(px(SIDEBAR_W))
+            .w(px(if collapsed { SIDEBAR_COLLAPSED_W } else { SIDEBAR_W }))
             .h_full()
             .overflow_y_scroll()
             .flex()
@@ -5344,31 +6013,81 @@ impl Render for Shuffle {
         if self.confirm_delete.is_some() {
             root = root.child(self.render_confirm_delete(cx));
         }
+        if self.server_dialog.is_some() {
+            root = root.child(self.render_server_dialog(cx));
+        }
         root
     }
 }
 
 /// Build a sidebar nav item that navigates to `target`, and push it onto `items`.
+#[allow(clippy::too_many_arguments)]
 fn push_nav(
     items: &mut Vec<AnyElement>,
     cx: &Context<Shuffle>,
     key: &mut usize,
     label: String,
+    icon_key: String,
     target: PathBuf,
     current: &Path,
+    collapsed: bool,
 ) {
     *key += 1;
     let active = target.as_path() == current;
     let nav_target = target.clone();
+    // Tooltip: the friendly path (`~/Documents/Projects`). When expanded the
+    // label is already visible, so lead with it for clarity.
+    let path_str = display_path(&target);
+    let tooltip = if collapsed || path_str == label {
+        format!("{label}\n{path_str}")
+    } else {
+        path_str
+    };
     let item = nav_item(
         label,
+        tooltip,
+        sidebar_icon(&icon_key, 16.0),
         *key,
         active,
+        collapsed,
         cx.listener(move |this, _: &ClickEvent, _, cx| {
             this.navigate_to(nav_target.clone(), cx);
         }),
     );
     items.push(item.into_any_element());
+}
+
+/// Push a section header (expanded) or a thin divider (collapsed).
+fn push_section(items: &mut Vec<AnyElement>, title: &str, collapsed: bool) {
+    if collapsed {
+        push_divider(items);
+    } else {
+        items.push(section_header(title).into_any_element());
+    }
+}
+
+/// A 1px separator used between sections in the collapsed rail.
+fn push_divider(items: &mut Vec<AnyElement>) {
+    items.push(
+        div()
+            .mx_2()
+            .my_1()
+            .h(px(1.0))
+            .bg(rgb(theme().border))
+            .into_any_element(),
+    );
+}
+
+/// A path shown with the home directory abbreviated to `~`.
+fn display_path(p: &Path) -> String {
+    let home = home_dir();
+    if let Ok(rest) = p.strip_prefix(&home) {
+        if rest.as_os_str().is_empty() {
+            return "~".to_string();
+        }
+        return format!("~/{}", rest.display());
+    }
+    p.display().to_string()
 }
 
 /// A back/forward navigation arrow. Dimmed and inert when `enabled` is false.
@@ -5713,29 +6432,41 @@ fn trash_path(path: &Path) -> bool {
     fm.trashItemAtURL_resultingItemURL_error(&url, None).is_ok()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn nav_item(
     label: String,
+    tooltip: String,
+    icon: AnyElement,
     key: usize,
     active: bool,
+    collapsed: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let t = theme();
-    let base = div()
+    let mut base = div()
         .id(("nav", key))
         .flex()
         .items_center()
-        .mx_2()
-        .px_2()
-        .py_1()
         .rounded_md()
         .cursor_pointer()
         .text_color(rgb(if active { t.text } else { t.text_muted }));
+    base = if collapsed {
+        base.mx_1().px_0().py_1().justify_center()
+    } else {
+        base.mx_2().px_2().py_1().gap_2()
+    };
     let base = if active {
         base.bg(rgb(t.surface))
     } else {
         base.hover(|s| s.bg(rgb(t.hover)))
     };
-    base.child(label).on_click(on_click)
+    let base = base.child(icon);
+    let base = if collapsed {
+        base
+    } else {
+        base.child(div().min_w_0().overflow_hidden().child(label))
+    };
+    base.tooltip(tip(tooltip)).on_click(on_click)
 }
 
 fn section_header(title: &str) -> impl IntoElement {
@@ -6146,17 +6877,191 @@ fn file_probe_path() -> PathBuf {
 /// very first render shows real Finder icons — no emoji placeholder / swap.
 fn ensure_base_icons() {
     if ICON_CACHE.with(|c| !c.borrow().contains_key(FOLDER_KEY)) {
-        let icon = build_macos_icon(&folder_dir_path());
+        let icon = pack_icon_path(FOLDER_KEY)
+            .and_then(|p| decode_image_file(&p))
+            .or_else(|| build_macos_icon(&folder_dir_path()));
         ICON_CACHE.with(|c| {
             c.borrow_mut().insert(FOLDER_KEY.to_string(), icon);
         });
     }
     if ICON_CACHE.with(|c| !c.borrow().contains_key(FILE_KEY)) {
-        let icon = build_macos_icon(&file_probe_path());
+        let icon = pack_icon_path(FILE_KEY)
+            .and_then(|p| decode_image_file(&p))
+            .or_else(|| build_macos_icon(&file_probe_path()));
         ICON_CACHE.with(|c| {
             c.borrow_mut().insert(FILE_KEY.to_string(), icon);
         });
     }
+}
+
+/// The favorite/location shortcuts shown at the top of the sidebar. Each is
+/// `(label, slug)`; the slug both names the cache key (`fav:<slug>`) and the
+/// pack override file (`<slug>.png`). The real path is resolved by [`fav_path`].
+const SIDEBAR_FAVORITES: &[(&str, &str)] = &[
+    ("Applications", "applications"),
+    ("Desktop", "desktop"),
+    ("Documents", "documents"),
+    ("Downloads", "downloads"),
+    ("Pictures", "pictures"),
+    ("Music", "music"),
+    ("Movies", "movies"),
+];
+
+/// The path a favorite/location slug points at (used for navigation and to fetch
+/// the real macOS special-folder icon when no pack overrides it).
+fn fav_path(slug: &str) -> PathBuf {
+    let home = home_dir();
+    match slug {
+        "applications" => PathBuf::from("/Applications"),
+        "computer" => PathBuf::from("/"),
+        "home" => home,
+        "desktop" => home.join("Desktop"),
+        "documents" => home.join("Documents"),
+        "downloads" => home.join("Downloads"),
+        "pictures" => home.join("Pictures"),
+        "music" => home.join("Music"),
+        "movies" => home.join("Movies"),
+        other => home.join(other),
+    }
+}
+
+fn fav_key(slug: &str) -> String {
+    format!("fav:{slug}")
+}
+
+/// Build the special sidebar icons (Applications, Documents, the Mac, home, …)
+/// synchronously. There are only a handful and each is a few ms, so this is fine
+/// at startup and on icon-pack changes. A pack override (`<slug>.png`) wins;
+/// otherwise we use the real macOS special-folder icon for that path.
+fn ensure_sidebar_icons() {
+    let mut slugs: Vec<&str> = SIDEBAR_FAVORITES.iter().map(|(_, s)| *s).collect();
+    slugs.push("home");
+    slugs.push("computer");
+    for slug in slugs {
+        let key = fav_key(slug);
+        if ICON_CACHE.with(|c| c.borrow().contains_key(&key)) {
+            continue;
+        }
+        let icon = pack_icon_path(&key)
+            .and_then(|p| decode_image_file(&p))
+            .or_else(|| build_macos_icon(&fav_path(slug)));
+        ICON_CACHE.with(|c| {
+            c.borrow_mut().insert(key, icon);
+        });
+    }
+}
+
+/// Cloud-storage locations macOS syncs to disk: iCloud Drive plus every
+/// provider under `~/Library/CloudStorage` (Dropbox, Google Drive, OneDrive,
+/// Box, …), and a legacy `~/Dropbox` if present. Returns `(label, path)`.
+fn cloud_locations() -> Vec<(String, PathBuf)> {
+    let home = home_dir();
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+
+    let icloud = home.join("Library/Mobile Documents/com~apple~CloudDocs");
+    if icloud.is_dir() {
+        out.push(("iCloud Drive".to_string(), icloud));
+    }
+
+    let cs = home.join("Library/CloudStorage");
+    if let Ok(rd) = fs::read_dir(&cs) {
+        let mut providers: Vec<(String, PathBuf)> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .map(|p| {
+                let raw = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                (pretty_cloud_name(&raw), p)
+            })
+            .collect();
+        providers.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+        out.extend(providers);
+    }
+
+    // Legacy Dropbox install (pre-CloudStorage) at ~/Dropbox.
+    let legacy_dropbox = home.join("Dropbox");
+    if legacy_dropbox.is_dir() && !out.iter().any(|(l, _)| l == "Dropbox") {
+        out.push(("Dropbox".to_string(), legacy_dropbox));
+    }
+
+    out
+}
+
+/// Turn a raw CloudStorage folder name ("GoogleDrive-me@x.com", "OneDrive-Personal")
+/// into a friendly label ("Google Drive", "OneDrive").
+fn pretty_cloud_name(raw: &str) -> String {
+    let base = raw.split('-').next().unwrap_or(raw).trim();
+    match base {
+        "GoogleDrive" => "Google Drive".to_string(),
+        "" => raw.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Mounted volumes under `/Volumes` (external drives + network shares),
+/// excluding the boot volume. Returns `(label, path)`.
+fn mounted_volumes() -> Vec<(String, PathBuf)> {
+    let mut out: Vec<(String, PathBuf)> = Vec::new();
+    if let Ok(rd) = fs::read_dir("/Volumes") {
+        for e in rd.flatten() {
+            let p = e.path();
+            if !p.is_dir() {
+                continue;
+            }
+            // Skip the boot volume (a /Volumes entry that resolves to "/").
+            if fs::canonicalize(&p).map(|t| t == Path::new("/")).unwrap_or(false) {
+                continue;
+            }
+            let name = e.file_name().to_string_lossy().into_owned();
+            out.push((name, p));
+        }
+    }
+    out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    out
+}
+
+/// Paths whose real macOS icon should be cached for the sidebar (cloud
+/// providers + mounted volumes). These are dynamic, so their icons are keyed by
+/// the path string and (re)built by [`ensure_dynamic_sidebar_icons`].
+fn dynamic_sidebar_paths() -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = cloud_locations().into_iter().map(|(_, p)| p).collect();
+    v.extend(mounted_volumes().into_iter().map(|(_, p)| p));
+    v
+}
+
+/// Build the real macOS icons for the currently-mounted volumes and synced
+/// cloud folders, keyed by path. Cheap (icon_tiff is a few ms) and main-thread,
+/// so it's safe to call on navigation / startup — never from render.
+fn ensure_dynamic_sidebar_icons() {
+    for p in dynamic_sidebar_paths() {
+        let key = p.to_string_lossy().into_owned();
+        if ICON_CACHE.with(|c| c.borrow().contains_key(&key)) {
+            continue;
+        }
+        let icon = build_macos_icon(&p);
+        ICON_CACHE.with(|c| {
+            c.borrow_mut().insert(key, icon);
+        });
+    }
+}
+
+/// Build a `.tooltip(...)` callback showing `text` in a small floating label.
+fn tip(text: impl Into<String>) -> impl Fn(&mut Window, &mut App) -> gpui::AnyView + 'static {
+    let text = text.into();
+    move |_, cx| cx.new(|_| TooltipView { text: text.clone() }).into()
+}
+
+/// A sidebar icon element by cache key, falling back to the generic folder icon
+/// so a row is never blank.
+fn sidebar_icon(key: &str, size: f32) -> AnyElement {
+    let handle = lookup_cached(key).or_else(|| lookup_cached(FOLDER_KEY));
+    if let Some(handle) = handle {
+        return img(ImageSource::Render(handle))
+            .w(px(size))
+            .h(px(size))
+            .into_any_element();
+    }
+    div().child("📁").into_any_element()
 }
 
 /// Ask NSWorkspace for `path`'s icon, decode it, and convert to a GPUI image.
@@ -6306,14 +7211,14 @@ fn gather_info(path: &Path) -> FileInfo {
     let modified = format_date(md.as_ref().and_then(|m| m.modified().ok()));
     let accessed = format_date(md.as_ref().and_then(|m| m.accessed().ok()));
 
-    // Image dimensions (cheap header read) and, for reasonably-sized images, a
-    // color descriptor (needs a decode, so skip very large images).
+    // Image dimensions + color, both from the header only (no full decode).
     let (mut dimensions, mut color) = (None, None);
     if let Ok((w, h)) = image::image_dimensions(path) {
         dimensions = Some(format!("{w} × {h}"));
-        if (w as u64) * (h as u64) <= 8_000_000 {
-            if let Ok(decoded) = image::open(path) {
-                color = Some(color_label(decoded.color()));
+        use image::ImageDecoder;
+        if let Ok(reader) = image::ImageReader::open(path).and_then(|r| r.with_guessed_format()) {
+            if let Ok(decoder) = reader.into_decoder() {
+                color = Some(color_label(decoder.color_type()));
             }
         }
     }
@@ -7043,6 +7948,31 @@ fn read_path_list(name: &str) -> Vec<PathBuf> {
     paths
 }
 
+/// Read a newline-separated list of arbitrary strings (e.g. server URLs).
+fn read_string_list(name: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(file) = config_file(name) {
+        if let Ok(contents) = fs::read_to_string(&file) {
+            for line in contents.lines() {
+                let line = line.trim();
+                if !line.is_empty() {
+                    out.push(line.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn write_string_list(name: &str, items: &[String]) {
+    if let Some(file) = config_file(name) {
+        if let Some(parent) = file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&file, items.join("\n"));
+    }
+}
+
 fn write_path_list(name: &str, paths: &[PathBuf]) {
     if let Some(file) = config_file(name) {
         if let Some(parent) = file.parent() {
@@ -7103,8 +8033,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\n",
-            p.terminal, p.term_history, p.preview, p.info, p.show_parent
+            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\n",
+            p.terminal, p.term_history, p.preview, p.info, p.show_parent, p.sidebar_collapsed
         );
         let _ = fs::write(&file, body);
     }
@@ -7122,6 +8052,29 @@ fn save_keymap(k: &Keymap) {
             .collect();
         let _ = fs::write(&file, body);
     }
+}
+
+/// Persist the active icon-pack folder (empty = none).
+fn save_icon_pack(p: &Option<PathBuf>) {
+    if let Some(file) = config_file("icon_pack.txt") {
+        if let Some(parent) = file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let body = p.as_ref().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+        let _ = fs::write(&file, body);
+    }
+}
+
+/// Load the saved icon-pack folder, if it still exists.
+fn load_icon_pack() -> Option<PathBuf> {
+    let file = config_file("icon_pack.txt")?;
+    let s = fs::read_to_string(&file).ok()?;
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let p = PathBuf::from(s);
+    p.is_dir().then_some(p)
 }
 
 /// Load the keymap, starting from defaults and applying saved overrides.
@@ -7159,6 +8112,7 @@ fn load_prefs() -> Prefs {
                     "preview" => p.preview = on,
                     "info" => p.info = on,
                     "show_parent" => p.show_parent = on,
+                    "sidebar_collapsed" => p.sidebar_collapsed = on,
                     _ => {}
                 }
             }
@@ -7316,6 +8270,11 @@ fn main() {
         let saved_keymap = load_keymap();
         set_active_keymap(saved_keymap.clone());
         cx.set_global(KeymapGlobal(saved_keymap));
+
+        // Load the icon pack (if any).
+        let saved_pack = load_icon_pack();
+        set_active_icon_pack(saved_pack.clone());
+        cx.set_global(IconPackGlobal(saved_pack));
 
         // Menu bar: app menu with Settings + Quit, plus their shortcuts.
         cx.bind_keys([
