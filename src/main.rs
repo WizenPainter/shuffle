@@ -4880,6 +4880,15 @@ impl Shuffle {
         }
     }
 
+    /// Whether `path` is the target of the currently-open right-click menu
+    /// (so its row can keep the hovered look while the menu is up).
+    fn is_ctx_target(&self, path: &Path) -> bool {
+        self.context_menu
+            .as_ref()
+            .and_then(|m| m.target.as_ref())
+            .is_some_and(|(p, _)| p.as_path() == path)
+    }
+
     /// Remove a bookmark (from the right-click "Remove Bookmark" action).
     fn remove_bookmark(&mut self, path: &Path, cx: &mut Context<Self>) {
         let before = self.bookmarks.len();
@@ -5690,6 +5699,7 @@ impl Shuffle {
                                         true,        // ".." has no metadata to load
                                         row_key,
                                         false,
+                                        false,       // ".." is never the menu target
                                         widths,
                                         icon,
                                         true,        // accepts drops (move into parent)
@@ -5740,6 +5750,7 @@ impl Shuffle {
                             let ctx_target = target.clone();
                             let drop_target = target.clone();
                             let is_selected = tab.selection.contains(&target);
+                            let ctx_active = this.is_ctx_target(&target);
                             let rename_text = this
                                 .rename
                                 .as_ref()
@@ -5762,6 +5773,7 @@ impl Shuffle {
                                     entry_loaded,
                                     row_key,
                                     is_selected,
+                                    ctx_active,
                                     widths,
                                     icon,
                                     is_dir,            // folders accept drops
@@ -5885,7 +5897,8 @@ impl Shuffle {
                                 let is_dir = entry.is_dir;
                                 let target = base_dir.join(&name);
                                 let selected = tab.selection.contains(&target);
-                                cells.push(icon_cell(pane, name, target, is_dir, selected, cell_w, cx));
+                                let ctx_active = this.is_ctx_target(&target);
+                                cells.push(icon_cell(pane, name, target, is_dir, selected, ctx_active, cell_w, cx));
                             }
                             out.push(div().flex().w_full().px_2().children(cells).into_any_element());
                         }
@@ -5926,7 +5939,8 @@ impl Shuffle {
                 let target = dir.join(&e.name);
                 let selected = next_dir.as_deref() == Some(target.as_path())
                     || anchor.as_deref() == Some(target.as_path());
-                rows.push(column_row(pane, i, &e.name, target, e.is_dir, selected, cx));
+                let ctx_active = self.is_ctx_target(&target);
+                rows.push(column_row(pane, i, &e.name, target, e.is_dir, selected, ctx_active, cx));
             }
             cols.push(
                 div()
@@ -6751,6 +6765,9 @@ fn file_row(
     loaded: bool,
     key: usize,
     selected: bool,
+    // True while this row is the open right-click menu's target — keep it looking
+    // hovered even though the cursor is over the menu backdrop.
+    ctx_active: bool,
     widths: ColumnWidths,
     icon: AnyElement,
     // Drag-and-drop: `accept_drop` true => it's a drop target (a folder or the
@@ -6811,6 +6828,7 @@ fn file_row(
         .h(px(ROW_H))
         .cursor_pointer()
         .when(selected, |s| s.bg(rgb(t.selected)))
+        .when(ctx_active && !selected, |s| s.bg(rgb(t.hover)))
         .hover(|s| s.bg(rgb(t.hover)))
         // Press records a drag candidate (promoted to a native OS drag on move)
         // and stops a marquee from starting on the list behind it.
@@ -6883,6 +6901,7 @@ fn icon_cell(
     target: PathBuf,
     is_dir: bool,
     selected: bool,
+    ctx_active: bool,
     cell_w: f32,
     cx: &Context<Shuffle>,
 ) -> AnyElement {
@@ -6903,6 +6922,7 @@ fn icon_cell(
         .rounded_md()
         .cursor_pointer()
         .when(selected, |s| s.bg(rgb(t.selected)))
+        .when(ctx_active && !selected, |s| s.bg(rgb(t.hover)))
         .hover(|s| s.bg(rgb(t.hover)))
         // Press records a drag candidate; moving past the threshold starts a
         // native OS drag (drop into Finder / other apps or back into Shuffle).
@@ -6966,6 +6986,7 @@ fn column_row(
     target: PathBuf,
     is_dir: bool,
     selected: bool,
+    ctx_active: bool,
     cx: &Context<Shuffle>,
 ) -> AnyElement {
     let t = theme();
@@ -6981,6 +7002,7 @@ fn column_row(
         .h(px(ROW_H))
         .cursor_pointer()
         .when(selected, |s| s.bg(rgb(t.selected)))
+        .when(ctx_active && !selected, |s| s.bg(rgb(t.hover)))
         .hover(|s| s.bg(rgb(t.hover)))
         .child(div().flex_none().w(px(ICON_W)).flex().justify_center().child(icon))
         .child(
