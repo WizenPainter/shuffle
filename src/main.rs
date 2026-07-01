@@ -20,18 +20,19 @@ use std::time::{Duration, SystemTime};
 use chrono::{DateTime, Local};
 use gpui::{
     actions, anchored, div, img, point, prelude::*, px, relative, rgb, rgba, size, uniform_list, AnyElement, App,
-    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, FocusHandle, ImageSource,
+    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ExternalPaths, FocusHandle, ImageSource,
     KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
     PathPromptOptions, Rgba,
     RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, TitlebarOptions,
     UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
-use objc2::AllocAnyThread;
+use objc2::runtime::NSObjectProtocol;
+use objc2::{define_class, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
-    NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace, NSGraphicsContext, NSImage,
-    NSWorkspace,
+    NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace, NSDraggingContext,
+    NSDraggingSession, NSDraggingSource, NSDragOperation, NSGraphicsContext, NSImage, NSWorkspace,
 };
-use objc2_foundation::{NSData, NSFileManager, NSString, NSURL};
+use objc2_foundation::{NSData, NSFileManager, NSObject, NSString, NSURL};
 use rayon::prelude::*;
 
 const RECENTS_CAP: usize = 12;
@@ -320,6 +321,8 @@ struct Prefs {
     show_parent: bool,
     /// Collapse the left sidebar to an icon-only rail.
     sidebar_collapsed: bool,
+    /// How many Recents to show in the sidebar (0 hides the section).
+    recent_limit: usize,
 }
 
 impl Default for Prefs {
@@ -331,6 +334,7 @@ impl Default for Prefs {
             info: false,
             show_parent: true,
             sidebar_collapsed: false,
+            recent_limit: 3,
         }
     }
 }
@@ -347,6 +351,7 @@ thread_local! {
         info: false,
         show_parent: true,
         sidebar_collapsed: false,
+        recent_limit: 3,
     }) };
 }
 
@@ -857,6 +862,30 @@ impl Settings {
                     cx.notify();
                 }),
             ))
+            .child(settings_title("Sidebar"))
+            .child(stepper_row(
+                "st-recents",
+                "Recent folders",
+                "How many recently-visited folders to show in the sidebar (0 hides \
+                 the Recents section).",
+                if p.recent_limit == 0 {
+                    "Off".to_string()
+                } else {
+                    p.recent_limit.to_string()
+                },
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut np = prefs();
+                    np.recent_limit = np.recent_limit.saturating_sub(1);
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }),
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut np = prefs();
+                    np.recent_limit = (np.recent_limit + 1).min(RECENTS_CAP);
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }),
+            ))
     }
 
     fn render_keybinds(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1265,6 +1294,73 @@ fn toggle_row(
         .child(switch)
 }
 
+/// A settings row with a −/+ stepper and a value label (used for numeric prefs).
+fn stepper_row(
+    id: &'static str,
+    title: &str,
+    desc: &str,
+    value_label: String,
+    on_dec: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_inc: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let t = theme();
+    let button = |bid: SharedString, glyph: &str| {
+        div()
+            .id(bid)
+            .flex_none()
+            .w(px(24.0))
+            .h(px(24.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .bg(rgb(t.surface))
+            .text_color(rgb(t.text))
+            .hover(|s| s.bg(rgb(t.hover)))
+            .child(glyph.to_string())
+    };
+
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_4()
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_color(rgb(t.text)).child(title.to_string()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(t.text_muted))
+                        .child(desc.to_string()),
+                ),
+        )
+        .child(
+            div()
+                .flex_none()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(button(SharedString::from(format!("{id}-dec")), "−").on_click(on_dec))
+                .child(
+                    div()
+                        .w(px(40.0))
+                        .flex()
+                        .justify_center()
+                        .text_color(rgb(t.text))
+                        .child(value_label),
+                )
+                .child(button(SharedString::from(format!("{id}-inc")), "+").on_click(on_inc)),
+        )
+}
+
 // Default column widths for the main listing; all are user-resizable.
 const ICON_W: f32 = 18.0;
 const MIN_COL_W: f32 = 50.0;
@@ -1556,12 +1652,6 @@ struct TabDrag {
     tab: usize,
 }
 
-/// Payload for dragging a file/folder between panes.
-#[derive(Clone)]
-struct FileDrag {
-    path: PathBuf,
-}
-
 /// A small floating tooltip (used by the collapsed sidebar to show a row's
 /// name/path on hover).
 struct TooltipView {
@@ -1641,6 +1731,9 @@ struct Shuffle {
     next_load_gen: u64,
     /// In-progress marquee (box) selection: (pane, start, current) window coords.
     marquee: Option<(usize, (f32, f32), (f32, f32))>,
+    /// A left-press on a draggable row: (pane, path, press position). Promoted to
+    /// a native OS drag once the cursor moves past a small threshold.
+    drag_candidate: Option<(usize, PathBuf, (f32, f32))>,
     /// Open "Connect to Server" dialog: the URL being typed (None = closed).
     server_dialog: Option<String>,
     /// Recently-connected server URLs (most recent first).
@@ -1710,6 +1803,7 @@ impl Shuffle {
             confirm_delete: None,
             next_load_gen: 0,
             marquee: None,
+            drag_candidate: None,
             server_dialog: None,
             server_history: read_string_list("servers.txt"),
             term_input: String::new(),
@@ -4057,6 +4151,36 @@ impl Shuffle {
         }
     }
 
+    /// If a left-press on a row has moved past the drag threshold, hand the
+    /// current selection to a native macOS drag session so the files can be
+    /// dropped into Finder, Claude, Mail, or any other app (and back into
+    /// Shuffle's own folders/panes, which arrive as an external-file drop).
+    fn maybe_start_os_drag(&mut self, x: f32, y: f32, window: &Window, cx: &mut Context<Self>) {
+        let Some((pane, path, (sx, sy))) = self.drag_candidate.clone() else {
+            return;
+        };
+        if (x - sx).abs() < 6.0 && (y - sy).abs() < 6.0 {
+            return; // still within the click slop; not a drag yet
+        }
+        self.drag_candidate = None;
+        self.marquee = None;
+
+        // Drag the whole selection if the pressed item is part of it; otherwise
+        // just the pressed item.
+        let sel = &self.tab(pane).selection;
+        let mut paths: Vec<PathBuf> = if sel.contains(&path) {
+            sel.iter().cloned().collect()
+        } else {
+            vec![path.clone()]
+        };
+        paths.sort();
+
+        if let Some(view) = ns_view_ptr(window) {
+            start_os_file_drag(view, &paths);
+        }
+        cx.notify();
+    }
+
     /// The visible marquee rectangle for `pane` (in the listing-local frame).
     fn marquee_rect(&self, pane: usize) -> Option<AnyElement> {
         let (mp, start, cur) = self.marquee?;
@@ -4852,24 +4976,27 @@ impl Shuffle {
             }
         }
 
-        // --- Recents ---
-        push_section(&mut items, "RECENTS", collapsed);
-        if self.recents.is_empty() {
-            if !collapsed {
-                items.push(empty_hint("No recent folders").into_any_element());
-            }
-        } else {
-            for p in &self.recents {
-                push_nav(
-                    &mut items,
-                    cx,
-                    &mut key,
-                    path_label(p),
-                    FOLDER_KEY.to_string(),
-                    p.clone(),
-                    current,
-                    collapsed,
-                );
+        // --- Recents (count is user-configurable; 0 hides the section) ---
+        let recent_limit = prefs().recent_limit;
+        if recent_limit > 0 {
+            push_section(&mut items, "RECENTS", collapsed);
+            if self.recents.is_empty() {
+                if !collapsed {
+                    items.push(empty_hint("No recent folders").into_any_element());
+                }
+            } else {
+                for p in self.recents.iter().take(recent_limit) {
+                    push_nav(
+                        &mut items,
+                        cx,
+                        &mut key,
+                        path_label(p),
+                        FOLDER_KEY.to_string(),
+                        p.clone(),
+                        current,
+                        collapsed,
+                    );
+                }
             }
         }
 
@@ -5399,10 +5526,12 @@ impl Shuffle {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    // Dropping a dragged file on empty pane space moves it here.
-                    .drag_over::<FileDrag>(|s, _, _, _| s.bg(Theme::alpha(theme().accent, 0x22)))
-                    .on_drop(cx.listener(move |this, drag: &FileDrag, _, cx| {
-                        this.move_into(pane_dir.clone(), drag.path.clone(), cx);
+                    // Dropping file(s) on empty pane space moves them here.
+                    .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(Theme::alpha(theme().accent, 0x22)))
+                    .on_drop(cx.listener(move |this, drag: &ExternalPaths, _, cx| {
+                        for p in drag.paths() {
+                            this.move_into(pane_dir.clone(), p.clone(), cx);
+                        }
                     }))
                     .child(
                         // Horizontal scroller holding the column header + rows, so
@@ -5479,7 +5608,6 @@ impl Shuffle {
                                         false,
                                         widths,
                                         icon,
-                                        None,        // not draggable
                                         true,        // accepts drops (move into parent)
                                         None,        // never renamed
                                         cx.listener({
@@ -5497,9 +5625,13 @@ impl Shuffle {
                                             this.open_context_menu(pane, x, y, None, cx);
                                             cx.stop_propagation();
                                         }),
-                                        cx.listener(move |this, drag: &FileDrag, _, cx| {
-                                            this.move_into(parent.clone(), drag.path.clone(), cx);
+                                        cx.listener(move |this, drag: &ExternalPaths, _, cx| {
+                                            for p in drag.paths() {
+                                                this.move_into(parent.clone(), p.clone(), cx);
+                                            }
                                         }),
+                                        // ".." isn't draggable; just swallow the press.
+                                        |_, _, cx: &mut App| cx.stop_propagation(),
                                     )
                                     .into_any_element(),
                                 );
@@ -5548,7 +5680,6 @@ impl Shuffle {
                                     is_selected,
                                     widths,
                                     icon,
-                                    drag_target,       // draggable unless renaming
                                     is_dir,            // folders accept drops
                                     rename_text,       // editable name when renaming
                                     cx.listener(move |this, ev: &ClickEvent, _, cx| {
@@ -5570,9 +5701,21 @@ impl Shuffle {
                                         );
                                         cx.stop_propagation();
                                     }),
-                                    cx.listener(move |this, drag: &FileDrag, _, cx| {
-                                        // Drop onto a folder → move the file into it.
-                                        this.move_into(drop_target.clone(), drag.path.clone(), cx);
+                                    cx.listener(move |this, drag: &ExternalPaths, _, cx| {
+                                        // Drop onto a folder → move the file(s) into it.
+                                        for p in drag.paths() {
+                                            this.move_into(drop_target.clone(), p.clone(), cx);
+                                        }
+                                    }),
+                                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                        if let Some(dp) = &drag_target {
+                                            let (x, y) = (
+                                                f64::from(ev.position.x) as f32,
+                                                f64::from(ev.position.y) as f32,
+                                            );
+                                            this.drag_candidate = Some((pane, dp.clone(), (x, y)));
+                                        }
+                                        cx.stop_propagation();
                                     }),
                                 )
                                 .into_any_element(),
@@ -5624,9 +5767,11 @@ impl Shuffle {
             .relative()
             .flex_1()
             .min_h_0()
-            .drag_over::<FileDrag>(|s, _, _, _| s.bg(Theme::alpha(theme().accent, 0x22)))
-            .on_drop(cx.listener(move |this, drag: &FileDrag, _, cx| {
-                this.move_into(pane_dir.clone(), drag.path.clone(), cx);
+            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(Theme::alpha(theme().accent, 0x22)))
+            .on_drop(cx.listener(move |this, drag: &ExternalPaths, _, cx| {
+                for p in drag.paths() {
+                    this.move_into(pane_dir.clone(), p.clone(), cx);
+                }
             }))
             .child(
                 uniform_list(
@@ -5977,9 +6122,12 @@ impl Render for Shuffle {
             .on_key_down(cx.listener(Self::on_key))
             // Track column drags anywhere in the window so the cursor can leave
             // the thin handle without dropping the resize.
-            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 let x = f64::from(ev.position.x) as f32;
                 let y = f64::from(ev.position.y) as f32;
+                // A press-then-move on a file row becomes a native OS drag (so
+                // files can be dropped into Finder or any other app).
+                this.maybe_start_os_drag(x, y, window, cx);
                 this.update_resize(x, cx);
                 this.update_scroll_drag(y, cx);
                 this.update_divider(x, cx);
@@ -5988,6 +6136,7 @@ impl Render for Shuffle {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
+                    this.drag_candidate = None;
                     this.end_resize();
                     this.end_scroll_drag();
                     this.divider_drag = None;
@@ -6499,22 +6648,22 @@ fn file_row(
     selected: bool,
     widths: ColumnWidths,
     icon: AnyElement,
-    // Drag-and-drop: `drag_path` Some => the row can be dragged; `accept_drop`
-    // true => it's a drop target (a folder or the ".." row) that runs `on_drop_file`.
-    drag_path: Option<PathBuf>,
+    // Drag-and-drop: `accept_drop` true => it's a drop target (a folder or the
+    // ".." row) that runs `on_drop_file` when files are dropped on it.
     accept_drop: bool,
     // When Some, this row is being renamed: the name shows as an editable field.
     // The bool is whether the whole text is selected (Cmd+A / on start).
     rename_text: Option<(String, bool)>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    on_drop_file: impl Fn(&FileDrag, &mut Window, &mut App) + 'static,
+    on_drop_file: impl Fn(&ExternalPaths, &mut Window, &mut App) + 'static,
+    // Left-press handler: records a drag candidate + stops marquee propagation.
+    on_press: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let t = theme();
     let kind = kind_label(name, is_dir);
     let name_color = if is_dir { t.accent } else { t.text };
     let meta_color = rgb(t.text_muted);
-    let drag_label = name.to_string();
     // The name element: an editable field while renaming, else the label.
     let name_el: AnyElement = match &rename_text {
         Some((txt, selected)) => {
@@ -6558,17 +6707,12 @@ fn file_row(
         .cursor_pointer()
         .when(selected, |s| s.bg(rgb(t.selected)))
         .hover(|s| s.bg(rgb(t.hover)))
-        // Press on a row shouldn't start a marquee on the list behind it.
-        .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
-        // Draggable rows show a floating label under the cursor.
-        .when_some(drag_path, |row, p| {
-            row.on_drag(FileDrag { path: p }, move |_, _, _, cx| {
-                cx.new(|_| TabDragPreview { label: drag_label.clone() })
-            })
-        })
-        // Folders / ".." accept dropped files (move into them).
+        // Press records a drag candidate (promoted to a native OS drag on move)
+        // and stops a marquee from starting on the list behind it.
+        .on_mouse_down(MouseButton::Left, on_press)
+        // Folders / ".." accept dropped files (from within Shuffle or Finder).
         .when(accept_drop, |row| {
-            row.drag_over::<FileDrag>(|s, _, _, _| s.bg(rgb(theme().selected)))
+            row.drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme().selected)))
                 .on_drop(on_drop_file)
         })
         // Name (icon + label). Long names truncate with an ellipsis.
@@ -6638,8 +6782,7 @@ fn icon_cell(
     cx: &Context<Shuffle>,
 ) -> AnyElement {
     let t = theme();
-    let label = name.clone();
-    let drag = target.clone();
+    let press_t = target.clone();
     let drop_t = target.clone();
     let ctx_t = target.clone();
     let click_t = target.clone();
@@ -6656,9 +6799,19 @@ fn icon_cell(
         .cursor_pointer()
         .when(selected, |s| s.bg(rgb(t.selected)))
         .hover(|s| s.bg(rgb(t.hover)))
-        .on_drag(FileDrag { path: drag }, move |_, _, _, cx| {
-            cx.new(|_| TabDragPreview { label: label.clone() })
-        })
+        // Press records a drag candidate; moving past the threshold starts a
+        // native OS drag (drop into Finder / other apps or back into Shuffle).
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                let (x, y) = (
+                    f64::from(ev.position.x) as f32,
+                    f64::from(ev.position.y) as f32,
+                );
+                this.drag_candidate = Some((pane, press_t.clone(), (x, y)));
+                cx.stop_propagation();
+            }),
+        )
         .child(
             div()
                 .h(px(56.0))
@@ -6690,9 +6843,11 @@ fn icon_cell(
         );
     if is_dir {
         cell = cell
-            .drag_over::<FileDrag>(|s, _, _, _| s.bg(rgb(theme().selected)))
-            .on_drop(cx.listener(move |this, d: &FileDrag, _, cx| {
-                this.move_into(drop_t.clone(), d.path.clone(), cx);
+            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme().selected)))
+            .on_drop(cx.listener(move |this, d: &ExternalPaths, _, cx| {
+                for p in d.paths() {
+                    this.move_into(drop_t.clone(), p.clone(), cx);
+                }
             }));
     }
     cell.into_any_element()
@@ -7043,6 +7198,113 @@ fn ensure_dynamic_sidebar_icons() {
             c.borrow_mut().insert(key, icon);
         });
     }
+}
+
+// ----- native OS file drag-out (drag files into Finder / other apps) ---------
+
+define_class!(
+    // A minimal NSDraggingSource: it only needs to say the drag is a "copy".
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "ShuffleDragSource"]
+    struct DragSource;
+
+    unsafe impl NSObjectProtocol for DragSource {}
+
+    unsafe impl NSDraggingSource for DragSource {
+        #[unsafe(method(draggingSession:sourceOperationMaskForDraggingContext:))]
+        fn source_operation_mask(
+            &self,
+            _session: &NSDraggingSession,
+            _context: NSDraggingContext,
+        ) -> NSDragOperation {
+            // Copy only: dragging out to another app never moves/deletes the
+            // original file.
+            NSDragOperation::Copy
+        }
+    }
+);
+
+thread_local! {
+    /// One shared dragging-source instance, reused for every drag.
+    static DRAG_SOURCE: RefCell<Option<objc2::rc::Retained<DragSource>>> = RefCell::new(None);
+}
+
+fn drag_source(mtm: objc2::MainThreadMarker) -> objc2::rc::Retained<DragSource> {
+    DRAG_SOURCE.with(|c| {
+        c.borrow_mut()
+            .get_or_insert_with(|| unsafe { objc2::msg_send![DragSource::alloc(mtm), init] })
+            .clone()
+    })
+}
+
+/// The GPUI content `NSView` pointer for this window (for native drag sessions).
+fn ns_view_ptr(window: &Window) -> Option<*mut std::ffi::c_void> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = HasWindowHandle::window_handle(window).ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
+        _ => None,
+    }
+}
+
+/// Start a native macOS drag session carrying `paths` as file URLs. macOS then
+/// drives the drag through the normal run loop; dropping on another app copies
+/// the files there, and dropping back on Shuffle arrives as an external-file
+/// drop (handled by our `ExternalPaths` drop targets).
+fn start_os_file_drag(view_ptr: *mut std::ffi::c_void, paths: &[PathBuf]) {
+    use objc2::rc::Retained;
+    use objc2::runtime::{AnyObject, ProtocolObject};
+    use objc2::AllocAnyThread;
+    use objc2_app_kit::{
+        NSApplication, NSDraggingItem, NSDraggingSource, NSPasteboardWriting, NSView, NSWorkspace,
+    };
+    use objc2_foundation::{NSArray, NSPoint, NSRect, NSSize, NSString, NSURL};
+
+    if paths.is_empty() || view_ptr.is_null() {
+        return;
+    }
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return;
+    };
+    // SAFETY: the GPUI content view is a live NSView on the main thread.
+    let view: &NSView = unsafe { &*(view_ptr as *const NSView) };
+    let app = NSApplication::sharedApplication(mtm);
+    let Some(event) = app.currentEvent() else {
+        return;
+    };
+    let base = event.locationInWindow();
+    let workspace = NSWorkspace::sharedWorkspace();
+
+    let mut items: Vec<Retained<NSDraggingItem>> = Vec::new();
+    for (i, p) in paths.iter().enumerate() {
+        let Some(s) = p.to_str() else { continue };
+        let ns = NSString::from_str(s);
+        let url = NSURL::fileURLWithPath(&ns);
+        let writer: &ProtocolObject<dyn NSPasteboardWriting> = ProtocolObject::from_ref(&*url);
+        let item = NSDraggingItem::initWithPasteboardWriter(NSDraggingItem::alloc(), writer);
+
+        let icon = workspace.iconForFile(&ns);
+        let size = NSSize { width: 48.0, height: 48.0 };
+        icon.setSize(size);
+        // Fan the icons out slightly so a multi-file drag reads as a stack.
+        let off = i as f64 * 6.0;
+        let frame = NSRect {
+            origin: NSPoint { x: base.x - 24.0 + off, y: base.y - 24.0 - off },
+            size,
+        };
+        let contents: &AnyObject = &icon;
+        unsafe { item.setDraggingFrame_contents(frame, Some(contents)) };
+        items.push(item);
+    }
+    if items.is_empty() {
+        return;
+    }
+    let array = NSArray::from_retained_slice(&items);
+
+    let source = drag_source(mtm);
+    let source_proto: &ProtocolObject<dyn NSDraggingSource> = ProtocolObject::from_ref(&*source);
+    let _ = view.beginDraggingSessionWithItems_event_source(&array, &event, source_proto);
 }
 
 /// Build a `.tooltip(...)` callback showing `text` in a small floating label.
@@ -8033,8 +8295,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\n",
-            p.terminal, p.term_history, p.preview, p.info, p.show_parent, p.sidebar_collapsed
+            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\n",
+            p.terminal, p.term_history, p.preview, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit
         );
         let _ = fs::write(&file, body);
     }
@@ -8113,6 +8375,11 @@ fn load_prefs() -> Prefs {
                     "info" => p.info = on,
                     "show_parent" => p.show_parent = on,
                     "sidebar_collapsed" => p.sidebar_collapsed = on,
+                    "recent_limit" => {
+                        if let Ok(n) = v.trim().parse::<usize>() {
+                            p.recent_limit = n.min(RECENTS_CAP);
+                        }
+                    }
                     _ => {}
                 }
             }
