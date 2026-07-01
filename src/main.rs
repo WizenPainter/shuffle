@@ -513,6 +513,14 @@ enum KeyAction {
     MoveToTrash,
     RevealInFinder,
     Open,
+    // Command-palette (Cmd+P) text editing. These act only while the palette is
+    // open, so they're excluded from the normal (global) key dispatch.
+    PaletteCursorStart,
+    PaletteCursorEnd,
+    PaletteSelectAll,
+    PaletteDeleteToStart,
+    PaletteHistoryPrev,
+    PaletteHistoryNext,
 }
 
 impl KeyAction {
@@ -532,7 +540,27 @@ impl KeyAction {
         KeyAction::MoveToTrash,
         KeyAction::RevealInFinder,
         KeyAction::Open,
+        KeyAction::PaletteCursorStart,
+        KeyAction::PaletteCursorEnd,
+        KeyAction::PaletteSelectAll,
+        KeyAction::PaletteDeleteToStart,
+        KeyAction::PaletteHistoryPrev,
+        KeyAction::PaletteHistoryNext,
     ];
+
+    /// Palette actions apply only inside the Cmd+P palette (skipped by the
+    /// normal global key dispatch).
+    fn is_palette(self) -> bool {
+        matches!(
+            self,
+            KeyAction::PaletteCursorStart
+                | KeyAction::PaletteCursorEnd
+                | KeyAction::PaletteSelectAll
+                | KeyAction::PaletteDeleteToStart
+                | KeyAction::PaletteHistoryPrev
+                | KeyAction::PaletteHistoryNext
+        )
+    }
 
     fn id(self) -> usize {
         Self::ALL.iter().position(|a| *a == self).unwrap()
@@ -556,6 +584,12 @@ impl KeyAction {
             KeyAction::MoveToTrash => "move_to_trash",
             KeyAction::RevealInFinder => "reveal_in_finder",
             KeyAction::Open => "open",
+            KeyAction::PaletteCursorStart => "palette_cursor_start",
+            KeyAction::PaletteCursorEnd => "palette_cursor_end",
+            KeyAction::PaletteSelectAll => "palette_select_all",
+            KeyAction::PaletteDeleteToStart => "palette_delete_to_start",
+            KeyAction::PaletteHistoryPrev => "palette_history_prev",
+            KeyAction::PaletteHistoryNext => "palette_history_next",
         }
     }
 
@@ -577,6 +611,12 @@ impl KeyAction {
             KeyAction::MoveToTrash => "Move to Trash",
             KeyAction::RevealInFinder => "Reveal in Finder",
             KeyAction::Open => "Open",
+            KeyAction::PaletteCursorStart => "Palette: cursor to start",
+            KeyAction::PaletteCursorEnd => "Palette: cursor to end",
+            KeyAction::PaletteSelectAll => "Palette: select all",
+            KeyAction::PaletteDeleteToStart => "Palette: delete to start",
+            KeyAction::PaletteHistoryPrev => "Palette: previous history",
+            KeyAction::PaletteHistoryNext => "Palette: next history",
         }
     }
 
@@ -588,6 +628,12 @@ impl KeyAction {
             KeyAction::CloseTab => Some("cmd-w"),
             KeyAction::Find => Some("/"),
             KeyAction::SelectAll => Some("cmd-a"),
+            KeyAction::PaletteCursorStart => Some("cmd-left"),
+            KeyAction::PaletteCursorEnd => Some("cmd-right"),
+            KeyAction::PaletteSelectAll => Some("cmd-a"),
+            KeyAction::PaletteDeleteToStart => Some("ctrl-u"),
+            KeyAction::PaletteHistoryPrev => Some("up"),
+            KeyAction::PaletteHistoryNext => Some("down"),
             _ => None,
         }
     }
@@ -3578,6 +3624,13 @@ impl Shuffle {
                     self.open_path(pane, p, is_dir, cx);
                 }
             }
+            // Palette editing actions run inside the palette handler, not here.
+            KeyAction::PaletteCursorStart
+            | KeyAction::PaletteCursorEnd
+            | KeyAction::PaletteSelectAll
+            | KeyAction::PaletteDeleteToStart
+            | KeyAction::PaletteHistoryPrev
+            | KeyAction::PaletteHistoryNext => {}
         }
     }
 
@@ -3635,7 +3688,8 @@ impl Shuffle {
         // own toggle acts, so typed characters still reach the query.
         let kc = canon_keystroke(ks);
         if let Some(action) = keymap().action_for(&kc) {
-            if !self.palette_open || action == KeyAction::CommandPalette {
+            // Palette editing actions are handled inside the palette block only.
+            if !action.is_palette() && (!self.palette_open || action == KeyAction::CommandPalette) {
                 self.run_key_action(action, window, cx);
                 return;
             }
@@ -3674,28 +3728,49 @@ impl Shuffle {
             return;
         }
 
-        let ctrl = ks.modifiers.control;
-        // Up/Down browse the palette's own history when that setting is on;
-        // otherwise they move the result selection.
-        let history_nav = prefs().palette_history;
+        // Rebindable palette editing actions (resolved against the keymap so
+        // they can be changed in Settings › Keybinds). History actions apply
+        // only when the palette-history setting is on.
+        let km = keymap();
+        let end = self.query.chars().count();
+        if km.get(KeyAction::PaletteCursorStart) == Some(kc.as_str()) {
+            self.query_cursor = 0;
+            self.query_selected = false;
+            cx.notify();
+            return;
+        }
+        if km.get(KeyAction::PaletteCursorEnd) == Some(kc.as_str()) {
+            self.query_cursor = end;
+            self.query_selected = false;
+            cx.notify();
+            return;
+        }
+        if km.get(KeyAction::PaletteSelectAll) == Some(kc.as_str()) {
+            self.query_selected = !self.query.is_empty();
+            cx.notify();
+            return;
+        }
+        if km.get(KeyAction::PaletteDeleteToStart) == Some(kc.as_str()) {
+            self.palette_kill_before();
+            self.refresh_palette(cx);
+            return;
+        }
+        if prefs().palette_history {
+            if km.get(KeyAction::PaletteHistoryPrev) == Some(kc.as_str()) {
+                self.palette_history_prev(cx);
+                return;
+            }
+            if km.get(KeyAction::PaletteHistoryNext) == Some(kc.as_str()) {
+                self.palette_history_next(cx);
+                return;
+            }
+        }
+
         match key {
             "escape" => self.close_palette(cx),
             "enter" => self.activate_selection(cx),
-            "down" if history_nav => self.palette_history_next(cx),
-            "up" if history_nav => self.palette_history_prev(cx),
             "down" => self.move_selection(1, cx),
             "up" => self.move_selection(-1, cx),
-            // Cmd+Left / Cmd+Right jump to the start / end of the query.
-            "left" if cmd => {
-                self.query_cursor = 0;
-                self.query_selected = false;
-                cx.notify();
-            }
-            "right" if cmd => {
-                self.query_cursor = self.query.chars().count();
-                self.query_selected = false;
-                cx.notify();
-            }
             // Left/Right move the text cursor (collapsing any selection).
             "left" => {
                 self.query_cursor = if self.query_selected {
@@ -3708,22 +3783,12 @@ impl Shuffle {
             }
             "right" => {
                 self.query_cursor = if self.query_selected {
-                    self.query.chars().count()
+                    end
                 } else {
-                    (self.query_cursor + 1).min(self.query.chars().count())
+                    (self.query_cursor + 1).min(end)
                 };
                 self.query_selected = false;
                 cx.notify();
-            }
-            // Cmd+A selects the whole query (next keystroke replaces it).
-            "a" if cmd => {
-                self.query_selected = !self.query.is_empty();
-                cx.notify();
-            }
-            // Ctrl+U deletes everything behind (before) the cursor.
-            "u" if ctrl => {
-                self.palette_kill_before();
-                self.refresh_palette(cx);
             }
             "backspace" => {
                 self.palette_backspace();
