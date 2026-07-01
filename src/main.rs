@@ -1649,6 +1649,9 @@ const PALETTE_MAX_ROWS: usize = 7;
 const SIDEBAR_W: f32 = 220.0;
 /// Sidebar width when collapsed to an icon-only rail.
 const SIDEBAR_COLLAPSED_W: f32 = 52.0;
+/// Height of the custom titlebar strip (the OS titlebar is transparent, so this
+/// colored bar sits behind the traffic lights).
+const TITLEBAR_H: f32 = 34.0;
 /// Tab strip row height.
 const TAB_H: f32 = 30.0;
 /// Fixed list-row height (so marquee selection can map y-coordinates to rows).
@@ -6727,6 +6730,10 @@ impl Render for Shuffle {
                     this.end_marquee(cx);
                 }),
             )
+            // A slim titlebar strip in the app's own background color. With the
+            // OS titlebar transparent, this is what shows behind the traffic
+            // lights, and it keeps the content clear of them.
+            .child(div().flex_none().w_full().h(px(TITLEBAR_H)).bg(rgb(t.bg)))
             .child(main_row);
 
         // Terminal-mode command bar at the bottom.
@@ -9238,7 +9245,9 @@ fn main() {
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Shuffle".into()),
+                    // No title text; transparent so our own colored bar shows.
+                    title: None,
+                    appears_transparent: true,
                     ..Default::default()
                 }),
                 ..Default::default()
