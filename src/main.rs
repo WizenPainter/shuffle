@@ -1707,6 +1707,8 @@ struct Shuffle {
     divider_drag: Option<(f32, f32)>,
     recents: Vec<PathBuf>,
     bookmarks: Vec<PathBuf>,
+    /// Sidebar section titles the user has collapsed (hidden their items).
+    collapsed_sections: HashSet<String>,
     widths: ColumnWidths,
     resize: Option<Resize>,
     scroll_drag: Option<ScrollDrag>,
@@ -1786,6 +1788,7 @@ impl Shuffle {
             divider_drag: None,
             recents: read_path_list("recents.txt"),
             bookmarks: read_path_list("bookmarks.txt"),
+            collapsed_sections: read_string_list("collapsed_sections.txt").into_iter().collect(),
             widths: ColumnWidths::default(),
             resize: None,
             scroll_drag: None,
@@ -2323,6 +2326,22 @@ impl Shuffle {
                     cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()));
                     this.close_context_menu(cx);
                 }))
+                .into_any_element(),
+            );
+            let p = path.clone();
+            let already = self.bookmarks.iter().any(|b| b == &p);
+            items.push(
+                ctx_item(
+                    if already { "Remove Bookmark" } else { "Add to Bookmarks" },
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_context_menu(cx);
+                        if already {
+                            this.remove_bookmark(&p, cx);
+                        } else {
+                            this.bookmark_path(p.clone(), cx);
+                        }
+                    }),
+                )
                 .into_any_element(),
             );
             let p = path.clone();
@@ -4849,11 +4868,94 @@ impl Shuffle {
     /// Pin the current directory to bookmarks (no-op if already pinned).
     fn add_bookmark(&mut self, cx: &mut Context<Self>) {
         let dir = self.active_tab().current_dir.clone();
-        if !self.bookmarks.iter().any(|b| b == &dir) {
-            self.bookmarks.push(dir);
+        self.bookmark_path(dir, cx);
+    }
+
+    /// Pin an arbitrary path (file or folder) to the Bookmarks section.
+    fn bookmark_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.bookmarks.iter().any(|b| b == &path) {
+            self.bookmarks.push(path);
             write_path_list("bookmarks.txt", &self.bookmarks);
             cx.notify();
         }
+    }
+
+    /// Remove a bookmark (from the right-click "Remove Bookmark" action).
+    fn remove_bookmark(&mut self, path: &Path, cx: &mut Context<Self>) {
+        let before = self.bookmarks.len();
+        self.bookmarks.retain(|b| b != path);
+        if self.bookmarks.len() != before {
+            write_path_list("bookmarks.txt", &self.bookmarks);
+            cx.notify();
+        }
+    }
+
+    /// Toggle whether a sidebar section (by title) is collapsed, and persist it.
+    fn toggle_section(&mut self, title: String, cx: &mut Context<Self>) {
+        if !self.collapsed_sections.remove(&title) {
+            self.collapsed_sections.insert(title);
+        }
+        let list: Vec<String> = self.collapsed_sections.iter().cloned().collect();
+        write_string_list("collapsed_sections.txt", &list);
+        cx.notify();
+    }
+
+    /// A collapsible section header: a ▾/▸ arrow + title that toggles the
+    /// section, plus an optional trailing element (e.g. the Bookmarks "+").
+    fn section_header_el(
+        &self,
+        title: &'static str,
+        trailing: Option<AnyElement>,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let t = theme();
+        let is_col = self.collapsed_sections.contains(title);
+        let arrow = if is_col { "▸" } else { "▾" };
+        let title_owned = title.to_string();
+        let mut row = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_3()
+            .pt_4()
+            .pb_1()
+            .child(
+                div()
+                    .id(SharedString::from(format!("sec-{title}")))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(rgb(t.text_dim))
+                    .hover(|s| s.text_color(rgb(t.text)))
+                    .child(div().w(px(10.0)).child(arrow.to_string()))
+                    .child(title.to_string())
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.toggle_section(title_owned.clone(), cx);
+                    })),
+            );
+        if let Some(tr) = trailing {
+            row = row.child(tr);
+        }
+        row.into_any_element()
+    }
+
+    /// Push a collapsible section header (expanded sidebar) or a divider
+    /// (icon-only rail). Returns whether the section's items should be rendered.
+    fn begin_section(
+        &self,
+        items: &mut Vec<AnyElement>,
+        title: &'static str,
+        sidebar_collapsed: bool,
+        cx: &Context<Self>,
+    ) -> bool {
+        if sidebar_collapsed {
+            push_divider(items);
+            return true;
+        }
+        items.push(self.section_header_el(title, None, cx));
+        !self.collapsed_sections.contains(title)
     }
 
     fn render_sidebar(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -4891,26 +4993,27 @@ impl Shuffle {
         );
 
         // --- Favorites (Applications, Documents, …) ---
-        push_section(&mut items, "FAVORITES", collapsed);
-        for (label, slug) in SIDEBAR_FAVORITES {
-            let path = fav_path(slug);
-            if !path.is_dir() {
-                continue;
+        if self.begin_section(&mut items, "FAVORITES", collapsed, cx) {
+            for (label, slug) in SIDEBAR_FAVORITES {
+                let path = fav_path(slug);
+                if !path.is_dir() {
+                    continue;
+                }
+                push_nav(
+                    &mut items,
+                    cx,
+                    &mut key,
+                    label.to_string(),
+                    fav_key(slug),
+                    path,
+                    current,
+                    collapsed,
+                );
             }
-            push_nav(
-                &mut items,
-                cx,
-                &mut key,
-                label.to_string(),
-                fav_key(slug),
-                path,
-                current,
-                collapsed,
-            );
         }
 
         // --- Bookmarks (with a "+" to pin the current folder) ---
-        if collapsed {
+        let show_bookmarks = if collapsed {
             push_divider(&mut items);
             items.push(
                 div()
@@ -4931,55 +5034,38 @@ impl Shuffle {
                     }))
                     .into_any_element(),
             );
+            true
         } else {
-            items.push(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .px_3()
-                    .pt_4()
-                    .pb_1()
-                    .child(div().text_xs().text_color(rgb(theme().text_dim)).child("BOOKMARKS"))
-                    .child(
-                        div()
-                            .id("add-bookmark")
-                            .cursor_pointer()
-                            .px_1()
-                            .text_color(rgb(theme().text_dim))
-                            .hover(|s| s.text_color(rgb(theme().text)))
-                            .child("+")
-                            .tooltip(tip("Pin current folder"))
-                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                this.add_bookmark(cx);
-                            })),
-                    )
-                    .into_any_element(),
-            );
-        }
-        if self.bookmarks.is_empty() {
-            if !collapsed {
-                items.push(empty_hint("Click + to pin a folder").into_any_element());
-            }
-        } else {
-            for p in &self.bookmarks {
-                push_nav(
-                    &mut items,
-                    cx,
-                    &mut key,
-                    path_label(p),
-                    FOLDER_KEY.to_string(),
-                    p.clone(),
-                    current,
-                    collapsed,
-                );
+            let plus = div()
+                .id("add-bookmark")
+                .cursor_pointer()
+                .px_1()
+                .text_color(rgb(theme().text_dim))
+                .hover(|s| s.text_color(rgb(theme().text)))
+                .child("+")
+                .tooltip(tip("Pin current folder"))
+                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.add_bookmark(cx);
+                }))
+                .into_any_element();
+            items.push(self.section_header_el("BOOKMARKS", Some(plus), cx));
+            !self.collapsed_sections.contains("BOOKMARKS")
+        };
+        if show_bookmarks {
+            if self.bookmarks.is_empty() {
+                if !collapsed {
+                    items.push(empty_hint("Click + to pin a folder").into_any_element());
+                }
+            } else {
+                for p in &self.bookmarks {
+                    push_bookmark_nav(&mut items, cx, &mut key, p.clone(), current, collapsed);
+                }
             }
         }
 
         // --- Recents (count is user-configurable; 0 hides the section) ---
         let recent_limit = prefs().recent_limit;
-        if recent_limit > 0 {
-            push_section(&mut items, "RECENTS", collapsed);
+        if recent_limit > 0 && self.begin_section(&mut items, "RECENTS", collapsed, cx) {
             if self.recents.is_empty() {
                 if !collapsed {
                     items.push(empty_hint("No recent folders").into_any_element());
@@ -5002,8 +5088,7 @@ impl Shuffle {
 
         // --- Cloud (Dropbox, Google Drive, iCloud, …) ---
         let cloud = cloud_locations();
-        if !cloud.is_empty() {
-            push_section(&mut items, "CLOUD", collapsed);
+        if !cloud.is_empty() && self.begin_section(&mut items, "CLOUD", collapsed, cx) {
             for (label, path) in cloud {
                 let icon_key = path.to_string_lossy().into_owned();
                 push_nav(&mut items, cx, &mut key, label, icon_key, path, current, collapsed);
@@ -5011,33 +5096,32 @@ impl Shuffle {
         }
 
         // --- Servers (the Mac, mounted volumes/shares, Connect to Server) ---
-        push_section(&mut items, "SERVERS", collapsed);
-        push_nav(
-            &mut items,
-            cx,
-            &mut key,
-            "Macintosh HD".to_string(),
-            fav_key("computer"),
-            PathBuf::from("/"),
-            current,
-            collapsed,
-        );
-        push_nav(
-            &mut items,
-            cx,
-            &mut key,
-            username(),
-            fav_key("home"),
-            home,
-            current,
-            collapsed,
-        );
-        for (label, path) in mounted_volumes() {
-            let icon_key = path.to_string_lossy().into_owned();
-            push_nav(&mut items, cx, &mut key, label, icon_key, path, current, collapsed);
-        }
-        // "Connect to Server…" action row.
-        {
+        if self.begin_section(&mut items, "SERVERS", collapsed, cx) {
+            push_nav(
+                &mut items,
+                cx,
+                &mut key,
+                "Macintosh HD".to_string(),
+                fav_key("computer"),
+                PathBuf::from("/"),
+                current,
+                collapsed,
+            );
+            push_nav(
+                &mut items,
+                cx,
+                &mut key,
+                username(),
+                fav_key("home"),
+                home,
+                current,
+                collapsed,
+            );
+            for (label, path) in mounted_volumes() {
+                let icon_key = path.to_string_lossy().into_owned();
+                push_nav(&mut items, cx, &mut key, label, icon_key, path, current, collapsed);
+            }
+            // "Connect to Server…" action row.
             let base = div()
                 .id("connect-server")
                 .flex()
@@ -6206,13 +6290,44 @@ fn push_nav(
     items.push(item.into_any_element());
 }
 
-/// Push a section header (expanded) or a thin divider (collapsed).
-fn push_section(items: &mut Vec<AnyElement>, title: &str, collapsed: bool) {
-    if collapsed {
-        push_divider(items);
+/// Like [`push_nav`] but for a bookmark, which may be a file or a folder:
+/// folders navigate, files open in their default app, and the icon reflects the
+/// file type.
+fn push_bookmark_nav(
+    items: &mut Vec<AnyElement>,
+    cx: &Context<Shuffle>,
+    key: &mut usize,
+    target: PathBuf,
+    current: &Path,
+    collapsed: bool,
+) {
+    *key += 1;
+    let is_dir = target.is_dir();
+    let active = is_dir && target.as_path() == current;
+    let label = path_label(&target);
+    let path_str = display_path(&target);
+    let tooltip = if collapsed || path_str == label {
+        format!("{label}\n{path_str}")
     } else {
-        items.push(section_header(title).into_any_element());
-    }
+        path_str
+    };
+    let nav_target = target.clone();
+    let item = nav_item(
+        label,
+        tooltip,
+        icon_element(&target, is_dir),
+        *key,
+        active,
+        collapsed,
+        cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if nav_target.is_dir() {
+                this.navigate_to(nav_target.clone(), cx);
+            } else {
+                let _ = Command::new("open").arg(&nav_target).spawn();
+            }
+        }),
+    );
+    items.push(item.into_any_element());
 }
 
 /// A 1px separator used between sections in the collapsed rail.
@@ -6616,16 +6731,6 @@ fn nav_item(
         base.child(div().min_w_0().overflow_hidden().child(label))
     };
     base.tooltip(tip(tooltip)).on_click(on_click)
-}
-
-fn section_header(title: &str) -> impl IntoElement {
-    div()
-        .px_3()
-        .pt_4()
-        .pb_1()
-        .text_xs()
-        .text_color(rgb(theme().text_dim))
-        .child(title.to_string())
 }
 
 fn empty_hint(text: &str) -> impl IntoElement {
@@ -8201,7 +8306,8 @@ fn read_path_list(name: &str) -> Vec<PathBuf> {
                     continue;
                 }
                 let path = PathBuf::from(line);
-                if path.is_dir() {
+                // Keep files too (bookmarks can be files); drop only stale paths.
+                if path.exists() {
                     paths.push(path);
                 }
             }
