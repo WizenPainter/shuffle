@@ -459,6 +459,148 @@ fn apply_menu_style(m: MenuStyle, cx: &mut App) {
     cx.refresh_windows();
 }
 
+// ----- app icon background (the Dock icon) -----------------------------------
+
+/// The foreground logo (transparent background) composited over the chosen
+/// icon background. Embedded so it's available at runtime without a bundle path.
+const LOGO_FG_PNG: &[u8] = include_bytes!("../logo2 Background Removed.png");
+
+/// How the app icon's background is drawn behind the logo.
+#[derive(Clone, PartialEq)]
+enum IconBg {
+    /// Leave the built-in bundle icon (off-white) as-is.
+    Default,
+    /// A solid color.
+    Color(u32),
+    /// A user-supplied background image (copied into the config dir).
+    Image(PathBuf),
+}
+
+thread_local! {
+    static ACTIVE_ICON_BG: RefCell<IconBg> = const { RefCell::new(IconBg::Default) };
+    /// Cached decoded foreground logo for the settings preview.
+    static LOGO_RENDER: RefCell<Option<Option<Arc<RenderImage>>>> = const { RefCell::new(None) };
+}
+
+fn icon_bg() -> IconBg {
+    ACTIVE_ICON_BG.with(|b| b.borrow().clone())
+}
+
+fn set_active_icon_bg(b: IconBg) {
+    ACTIVE_ICON_BG.with(|c| *c.borrow_mut() = b);
+}
+
+/// The decoded foreground logo as a GPUI image (for the settings preview).
+fn app_logo_render() -> Option<Arc<RenderImage>> {
+    LOGO_RENDER.with(|c| {
+        c.borrow_mut()
+            .get_or_insert_with(|| decode_icon(LOGO_FG_PNG))
+            .clone()
+    })
+}
+
+/// Apply the icon background: update the render copy, persist, redraw the Dock
+/// icon, and repaint (so the Settings preview updates).
+fn apply_icon_bg(bg: IconBg, cx: &mut App) {
+    set_active_icon_bg(bg.clone());
+    save_icon_bg(&bg);
+    refresh_dock_icon(&bg);
+    cx.refresh_windows();
+}
+
+/// Composite the icon (background + rounded mask + logo) and hand it to the Dock.
+/// `Default` leaves the bundle's own icon untouched.
+fn refresh_dock_icon(bg: &IconBg) {
+    if matches!(bg, IconBg::Default) {
+        return; // keep the built-in AppIcon.icns
+    }
+    if let Some(png) = compose_icon_png(bg) {
+        set_dock_icon(&png);
+    }
+}
+
+/// Build the composited app icon as PNG bytes: background (color or image),
+/// clipped to a rounded square, with the logo centered on top.
+fn compose_icon_png(bg: &IconBg) -> Option<Vec<u8>> {
+    use image::{imageops, Rgba, RgbaImage};
+    let size: u32 = 512;
+
+    // --- background layer ---
+    let mut canvas: RgbaImage = match bg {
+        IconBg::Color(c) => {
+            let [r, g, b] = [(c >> 16) as u8, (c >> 8) as u8, *c as u8];
+            RgbaImage::from_pixel(size, size, Rgba([r, g, b, 255]))
+        }
+        IconBg::Image(path) => {
+            let img = image::open(path).ok()?.to_rgba8();
+            // Cover-fit: scale so the image fills the square, then center-crop.
+            let (iw, ih) = img.dimensions();
+            let scale = (size as f32 / iw as f32).max(size as f32 / ih as f32);
+            let (nw, nh) = ((iw as f32 * scale) as u32, (ih as f32 * scale) as u32);
+            let resized = imageops::resize(&img, nw.max(1), nh.max(1), imageops::FilterType::Lanczos3);
+            let mut c = RgbaImage::from_pixel(size, size, Rgba([0, 0, 0, 255]));
+            let (ox, oy) = (
+                (nw as i64 - size as i64) / 2,
+                (nh as i64 - size as i64) / 2,
+            );
+            imageops::overlay(&mut c, &resized, -ox, -oy);
+            c
+        }
+        IconBg::Default => RgbaImage::from_pixel(size, size, Rgba([242, 242, 242, 255])),
+    };
+
+    // --- rounded-square mask (macOS-ish corner radius) ---
+    let radius = (size as f32 * 0.2237) as i32;
+    round_corners(&mut canvas, radius);
+
+    // --- foreground logo, centered with a margin ---
+    let logo = image::load_from_memory(LOGO_FG_PNG).ok()?.to_rgba8();
+    let inner = (size as f32 * 0.66) as u32;
+    let (lw, lh) = logo.dimensions();
+    let lscale = (inner as f32 / lw as f32).min(inner as f32 / lh as f32);
+    let (nw, nh) = ((lw as f32 * lscale) as u32, (lh as f32 * lscale) as u32);
+    let logo = imageops::resize(&logo, nw.max(1), nh.max(1), imageops::FilterType::Lanczos3);
+    let (ox, oy) = ((size - nw) as i64 / 2, (size - nh) as i64 / 2);
+    imageops::overlay(&mut canvas, &logo, ox, oy);
+
+    let mut out = Vec::new();
+    canvas
+        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
+}
+
+/// Zero the alpha outside a rounded-rectangle of corner `radius` (in pixels).
+fn round_corners(img: &mut image::RgbaImage, radius: i32) {
+    let (w, h) = img.dimensions();
+    let (w, h, r) = (w as i32, h as i32, radius.max(0));
+    for y in 0..h {
+        for x in 0..w {
+            // Distance into a corner, if any.
+            let cx = if x < r { r - x } else if x >= w - r { x - (w - r) + 1 } else { 0 };
+            let cy = if y < r { r - y } else if y >= h - r { y - (h - r) + 1 } else { 0 };
+            if cx > 0 && cy > 0 && (cx * cx + cy * cy) > r * r {
+                img.get_pixel_mut(x as u32, y as u32).0[3] = 0;
+            }
+        }
+    }
+}
+
+/// Hand a PNG to the running app as its Dock / cmd-tab icon.
+fn set_dock_icon(png: &[u8]) {
+    use objc2::AllocAnyThread;
+    use objc2_app_kit::{NSApplication, NSImage};
+    let Some(mtm) = objc2::MainThreadMarker::new() else {
+        return;
+    };
+    let data = objc2_foundation::NSData::with_bytes(png);
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else {
+        return;
+    };
+    let app = NSApplication::sharedApplication(mtm);
+    unsafe { app.setApplicationIconImage(Some(&image)) };
+}
+
 /// The pack image overriding the icon for `key` (a file extension, FOLDER_KEY,
 /// or FILE_KEY), if the active pack provides one.
 fn pack_icon_path(key: &str) -> Option<PathBuf> {
@@ -687,6 +829,48 @@ fn apply_keymap(k: Keymap, cx: &mut App) {
     save_keymap(&k);
     cx.set_global(KeymapGlobal(k));
     cx.refresh_windows();
+}
+
+/// Whether `c` counts as part of a "word" for Option+Arrow navigation.
+/// Only alphanumerics are word characters, so separators like `_`, `-`, `.`,
+/// `/` and spaces are boundaries — e.g. in "helix_vault" a word jump lands on
+/// "vault".
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric()
+}
+
+/// Char index of the word boundary to the LEFT of `cursor` in `s`: skip any
+/// separators immediately left of the cursor, then skip the word before them.
+fn prev_word_boundary(s: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = cursor.min(chars.len());
+    while i > 0 && !is_word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    while i > 0 && is_word_char(chars[i - 1]) {
+        i -= 1;
+    }
+    i
+}
+
+/// Char index of the word boundary to the RIGHT of `cursor` in `s`: skip any
+/// separators at the cursor, then skip the following word.
+fn next_word_boundary(s: &str, cursor: usize) -> usize {
+    let chars: Vec<char> = s.chars().collect();
+    let len = chars.len();
+    let mut i = cursor.min(len);
+    while i < len && !is_word_char(chars[i]) {
+        i += 1;
+    }
+    while i < len && is_word_char(chars[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// Byte offset of char index `i` in `s` (or `s.len()` if past the end).
+fn char_byte(s: &str, i: usize) -> usize {
+    s.char_indices().nth(i).map(|(b, _)| b).unwrap_or(s.len())
 }
 
 /// Canonical string for a keystroke, e.g. "cmd-shift-p" or "/".
@@ -1234,6 +1418,80 @@ impl Settings {
                     cx.notify();
                 }),
             ))
+            // ----- App icon background -----
+            .child(settings_title("App Icon"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .child(self.app_icon_preview())
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(t.text_muted))
+                                    .child("Change the icon background: pick a color or upload an image (PNG or JPG; square looks best)."),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .id("icon-bg-upload")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .bg(rgb(t.surface))
+                                            .border_1()
+                                            .border_color(rgb(t.border))
+                                            .hover(|s| s.border_color(rgb(t.accent)))
+                                            .child("Upload Background…")
+                                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                                let rx = cx.prompt_for_paths(PathPromptOptions {
+                                                    files: true,
+                                                    directories: false,
+                                                    multiple: false,
+                                                    prompt: Some("Choose Background Image".into()),
+                                                });
+                                                cx.spawn(async move |_, cx| {
+                                                    if let Ok(Ok(Some(paths))) = rx.await {
+                                                        if let Some(p) = paths.into_iter().next() {
+                                                            if let Some(dest) = store_icon_bg_image(&p) {
+                                                                let _ = cx.update(|cx| {
+                                                                    apply_icon_bg(IconBg::Image(dest), cx)
+                                                                });
+                                                            }
+                                                        }
+                                                    }
+                                                })
+                                                .detach();
+                                            })),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("icon-bg-reset")
+                                            .px_3()
+                                            .py_1()
+                                            .rounded_md()
+                                            .cursor_pointer()
+                                            .bg(rgb(t.hover))
+                                            .hover(|s| s.bg(rgb(t.selected)))
+                                            .child("Reset")
+                                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                                apply_icon_bg(IconBg::Default, cx);
+                                            })),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(self.icon_color_row(cx))
             .child(settings_title("Icon Pack"))
             .child(
                 div()
@@ -1403,6 +1661,75 @@ impl Settings {
             .child(row("Add to Bookmarks"))
             .child(div().my_1().mx_2().h(px(1.0)).bg(rgb(t.border_strong)))
             .child(row("Move to Trash"))
+    }
+
+    /// A live preview of the app icon with the current background + logo.
+    fn app_icon_preview(&self) -> impl IntoElement {
+        let t = theme();
+        let bg = icon_bg();
+        let mut base = div()
+            .relative()
+            .flex_none()
+            .w(px(72.0))
+            .h(px(72.0))
+            .rounded(px(16.0))
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(t.border))
+            .flex()
+            .items_center()
+            .justify_center();
+        match &bg {
+            IconBg::Color(c) => base = base.bg(rgb(*c)),
+            IconBg::Default => base = base.bg(rgb(0xf2f2f2)),
+            IconBg::Image(p) => {
+                if let Some(r) = decode_image_file(p) {
+                    base = base.child(
+                        img(ImageSource::Render(r))
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
+                    );
+                } else {
+                    base = base.bg(rgb(0xf2f2f2));
+                }
+            }
+        }
+        if let Some(logo) = app_logo_render() {
+            base = base.child(img(ImageSource::Render(logo)).w(px(48.0)).h(px(48.0)));
+        }
+        base
+    }
+
+    /// Color swatches that set the app-icon background color.
+    fn icon_color_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let cur = match icon_bg() {
+            IconBg::Color(c) => Some(c),
+            _ => None,
+        };
+        let mut swatches: Vec<AnyElement> = Vec::new();
+        for c in palette_colors() {
+            let selected = cur == Some(c);
+            swatches.push(
+                div()
+                    .id(("iconbg", c as usize))
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(c))
+                    .border_2()
+                    .border_color(if selected { rgb(t.accent) } else { rgb(t.border) })
+                    .hover(|s| s.border_color(rgb(t.accent)))
+                    .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                        apply_icon_bg(IconBg::Color(c), cx);
+                    }))
+                    .into_any_element(),
+            );
+        }
+        div().flex().flex_wrap().gap_1().children(swatches)
     }
 
     /// A small "current value + editable hex" control for a theme color.
@@ -1850,10 +2177,20 @@ struct Tab {
     deepest: Option<PathBuf>,
     /// When `Some`, the path bar is an editable text field holding this string.
     editing_path: Option<String>,
+    /// Text-cursor position (char index) within `editing_path`.
+    path_cursor: usize,
+    /// Selection anchor (char index) within `editing_path`; `Some` and different
+    /// from `path_cursor` means a range is selected (Option+Shift+Arrow, Cmd+A).
+    path_anchor: Option<usize>,
     /// When `Some`, an in-directory "find" filter is active (opened by `/`).
     /// `find_results` holds the matching `entries` indices, best match first.
     find_query: Option<String>,
     find_results: Vec<usize>,
+    /// Text cursor (char index) within `find_query`.
+    find_cursor: usize,
+    /// Selection anchor (char index) within `find_query`; `Some` and different
+    /// from `find_cursor` means a range is selected (Option+Shift+Arrow, Cmd+A).
+    find_anchor: Option<usize>,
     scroll_handle: UniformListScrollHandle,
     /// Horizontal scroll of the columns (when they're wider than the pane).
     h_scroll: ScrollHandle,
@@ -1886,8 +2223,12 @@ impl Tab {
             hist_pos: 0,
             deepest: Some(dir),
             editing_path: None,
+            path_cursor: 0,
+            path_anchor: None,
             find_query: None,
             find_results: Vec::new(),
+            find_cursor: 0,
+            find_anchor: None,
             scroll_handle: UniformListScrollHandle::new(),
             h_scroll: ScrollHandle::new(),
             selection: HashSet::new(),
@@ -1998,8 +2339,10 @@ struct Shuffle {
     query: String,
     /// Text-cursor position in `query`, as a char index (0..=char count).
     query_cursor: usize,
-    /// Whole query is selected (Cmd+A): the next character replaces it.
-    query_selected: bool,
+    /// Selection anchor (char index). When `Some` and different from the cursor,
+    /// the range between them is selected; Cmd+A selects all, Option+Shift+Arrow
+    /// extends by word. `None` means no selection.
+    query_anchor: Option<usize>,
     /// Past palette queries (newest last), when the history setting is on.
     palette_hist: Vec<String>,
     /// Which history entry is being browsed with Up/Down (None = live query).
@@ -2090,7 +2433,7 @@ impl Shuffle {
             palette_open: false,
             query: String::new(),
             query_cursor: 0,
-            query_selected: false,
+            query_anchor: None,
             palette_hist: read_string_list("palette_history.txt"),
             palette_hist_pos: None,
             palette_items: Vec::new(),
@@ -3358,7 +3701,7 @@ impl Shuffle {
         if self.palette_open {
             self.query.clear();
             self.query_cursor = 0;
-            self.query_selected = false;
+            self.query_anchor = None;
             self.palette_hist_pos = None;
             self.selected = 0;
             self.refresh_palette(cx);
@@ -3738,18 +4081,23 @@ impl Shuffle {
         let end = self.query.chars().count();
         if km.get(KeyAction::PaletteCursorStart) == Some(kc.as_str()) {
             self.query_cursor = 0;
-            self.query_selected = false;
+            self.query_anchor = None;
             cx.notify();
             return;
         }
         if km.get(KeyAction::PaletteCursorEnd) == Some(kc.as_str()) {
             self.query_cursor = end;
-            self.query_selected = false;
+            self.query_anchor = None;
             cx.notify();
             return;
         }
         if km.get(KeyAction::PaletteSelectAll) == Some(kc.as_str()) {
-            self.query_selected = !self.query.is_empty();
+            if self.query.is_empty() {
+                self.query_anchor = None;
+            } else {
+                self.query_anchor = Some(0);
+                self.query_cursor = end;
+            }
             cx.notify();
             return;
         }
@@ -3774,25 +4122,10 @@ impl Shuffle {
             "enter" => self.activate_selection(cx),
             "down" => self.move_selection(1, cx),
             "up" => self.move_selection(-1, cx),
-            // Left/Right move the text cursor (collapsing any selection).
-            "left" => {
-                self.query_cursor = if self.query_selected {
-                    0
-                } else {
-                    self.query_cursor.saturating_sub(1)
-                };
-                self.query_selected = false;
-                cx.notify();
-            }
-            "right" => {
-                self.query_cursor = if self.query_selected {
-                    end
-                } else {
-                    (self.query_cursor + 1).min(end)
-                };
-                self.query_selected = false;
-                cx.notify();
-            }
+            // Left/Right move the text cursor. Option jumps by word; Shift
+            // extends the selection (Option+Shift selects a word at a time).
+            "left" => self.palette_move_h(true, ks.modifiers.alt, ks.modifiers.shift, cx),
+            "right" => self.palette_move_h(false, ks.modifiers.alt, ks.modifiers.shift, cx),
             "backspace" => {
                 self.palette_backspace();
                 self.refresh_palette(cx);
@@ -3828,13 +4161,74 @@ impl Shuffle {
             .unwrap_or(self.query.len())
     }
 
+    /// The current selection as a sorted `(start, end)` char range, if any.
+    fn query_sel(&self) -> Option<(usize, usize)> {
+        match self.query_anchor {
+            Some(a) if a != self.query_cursor => {
+                Some((a.min(self.query_cursor), a.max(self.query_cursor)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Delete the selected range (if any), leaving the cursor at its start.
+    /// Returns true when a selection was removed. Always clears the anchor.
+    fn query_delete_sel(&mut self) -> bool {
+        if let Some((lo, hi)) = self.query_sel() {
+            let (bl, bh) = (self.query_byte(lo), self.query_byte(hi));
+            self.query.replace_range(bl..bh, "");
+            self.query_cursor = lo;
+            self.query_anchor = None;
+            true
+        } else {
+            self.query_anchor = None;
+            false
+        }
+    }
+
+    /// New cursor char index one step (or one word) left/right of the cursor.
+    fn query_h_target(&self, left: bool, word: bool) -> usize {
+        let end = self.query.chars().count();
+        match (left, word) {
+            (true, true) => prev_word_boundary(&self.query, self.query_cursor),
+            (true, false) => self.query_cursor.saturating_sub(1),
+            (false, true) => next_word_boundary(&self.query, self.query_cursor),
+            (false, false) => (self.query_cursor + 1).min(end),
+        }
+    }
+
+    /// Move (or extend) the palette text cursor. `word` jumps by word,
+    /// `select` extends the selection instead of collapsing it.
+    fn palette_move_h(&mut self, left: bool, word: bool, select: bool, cx: &mut Context<Self>) {
+        if select {
+            if self.query_anchor.is_none() {
+                self.query_anchor = Some(self.query_cursor);
+            }
+            self.query_cursor = self.query_h_target(left, word);
+            if self.query_anchor == Some(self.query_cursor) {
+                self.query_anchor = None;
+            }
+        } else if let Some((lo, hi)) = self.query_sel() {
+            // Plain arrow collapses a selection: char-move to the edge, word-move
+            // continues past it.
+            self.query_cursor = if word {
+                self.query_h_target(left, word)
+            } else if left {
+                lo
+            } else {
+                hi
+            };
+            self.query_anchor = None;
+        } else {
+            self.query_cursor = self.query_h_target(left, word);
+            self.query_anchor = None;
+        }
+        cx.notify();
+    }
+
     /// Insert `s` at the cursor (replacing the selection first, if any).
     fn palette_insert(&mut self, s: &str) {
-        if self.query_selected {
-            self.query.clear();
-            self.query_cursor = 0;
-            self.query_selected = false;
-        }
+        self.query_delete_sel();
         let b = self.query_byte(self.query_cursor);
         self.query.insert_str(b, s);
         self.query_cursor += s.chars().count();
@@ -3843,10 +4237,7 @@ impl Shuffle {
 
     /// Delete the char before the cursor (or the whole selection).
     fn palette_backspace(&mut self) {
-        if self.query_selected {
-            self.query.clear();
-            self.query_cursor = 0;
-            self.query_selected = false;
+        if self.query_delete_sel() {
             return;
         }
         if self.query_cursor == 0 {
@@ -3863,7 +4254,7 @@ impl Shuffle {
         let b = self.query_byte(self.query_cursor);
         self.query.replace_range(0..b, "");
         self.query_cursor = 0;
-        self.query_selected = false;
+        self.query_anchor = None;
     }
 
     /// Up in history mode: step to the previous (older) query.
@@ -3879,7 +4270,7 @@ impl Shuffle {
         self.palette_hist_pos = Some(pos);
         self.query = self.palette_hist[pos].clone();
         self.query_cursor = self.query.chars().count();
-        self.query_selected = false;
+        self.query_anchor = None;
         self.refresh_palette(cx);
     }
 
@@ -3892,7 +4283,7 @@ impl Shuffle {
                 self.palette_hist_pos = None;
                 self.query.clear();
                 self.query_cursor = 0;
-                self.query_selected = false;
+                self.query_anchor = None;
                 self.refresh_palette(cx);
             }
             Some(p) => {
@@ -3900,7 +4291,7 @@ impl Shuffle {
                 self.palette_hist_pos = Some(np);
                 self.query = self.palette_hist[np].clone();
                 self.query_cursor = self.query.chars().count();
-                self.query_selected = false;
+                self.query_anchor = None;
                 self.refresh_palette(cx);
             }
         }
@@ -3985,19 +4376,26 @@ impl Shuffle {
             })
             .collect();
 
-        // Input line: query with a caret, or a dim placeholder. When the whole
-        // query is selected (Cmd+A) it's shown highlighted.
+        // Input line: query with a caret, or a dim placeholder. A selection
+        // (whole via Cmd+A, or a word range via Option+Shift+Arrow) is drawn as
+        // a highlighted span between the unselected head and tail.
         let input = if self.query.is_empty() {
             div()
                 .text_color(rgb(t.text_dim))
                 .child("Type a path, or a file/folder name…")
-        } else if self.query_selected {
-            div().text_color(rgb(t.text)).child(
-                div()
-                    .bg(Theme::alpha(t.accent, 0x66))
-                    .rounded_sm()
-                    .child(self.query.clone()),
-            )
+        } else if let Some((lo, hi)) = self.query_sel() {
+            let (bl, bh) = (self.query_byte(lo), self.query_byte(hi));
+            div()
+                .flex()
+                .text_color(rgb(t.text))
+                .child(div().child(self.query[..bl].to_string()))
+                .child(
+                    div()
+                        .bg(Theme::alpha(t.accent, 0x66))
+                        .rounded_sm()
+                        .child(self.query[bl..bh].to_string()),
+                )
+                .child(div().child(self.query[bh..].to_string()))
         } else {
             // Insert a caret bar at the cursor position.
             let cursor = self.query_cursor.min(self.query.chars().count());
@@ -4219,15 +4617,101 @@ impl Shuffle {
     fn begin_path_edit(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.active_pane = pane;
         let text = self.tab(pane).current_dir.display().to_string();
-        self.tab_mut(pane).editing_path = Some(text);
+        let end = text.chars().count();
+        let tab = self.tab_mut(pane);
+        tab.editing_path = Some(text);
+        tab.path_cursor = end;
+        tab.path_anchor = None;
         window.focus(&self.focus);
         cx.notify();
+    }
+
+    /// The path editor's selection as a sorted `(start, end)` char range.
+    fn path_sel(&self, pane: usize) -> Option<(usize, usize)> {
+        let tab = self.tab(pane);
+        match tab.path_anchor {
+            Some(a) if a != tab.path_cursor => {
+                Some((a.min(tab.path_cursor), a.max(tab.path_cursor)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Delete the path editor's selected range (if any), placing the cursor at
+    /// its start. Returns true when something was removed. Clears the anchor.
+    fn path_delete_sel(&mut self, pane: usize) -> bool {
+        if let Some((lo, hi)) = self.path_sel(pane) {
+            let tab = self.tab_mut(pane);
+            if let Some(s) = tab.editing_path.as_mut() {
+                let (bl, bh) = (char_byte(s, lo), char_byte(s, hi));
+                s.replace_range(bl..bh, "");
+            }
+            tab.path_cursor = lo;
+            tab.path_anchor = None;
+            true
+        } else {
+            self.tab_mut(pane).path_anchor = None;
+            false
+        }
+    }
+
+    /// Insert `s` at the path cursor, replacing any selection first.
+    fn path_insert(&mut self, pane: usize, s: &str) {
+        self.path_delete_sel(pane);
+        let tab = self.tab_mut(pane);
+        if let Some(buf) = tab.editing_path.as_mut() {
+            let b = char_byte(buf, tab.path_cursor);
+            buf.insert_str(b, s);
+            tab.path_cursor += s.chars().count();
+        }
+    }
+
+    /// Move (or extend) the path text cursor. `word` jumps by word, `select`
+    /// extends the selection (Option+Shift selects a word at a time).
+    fn path_move_h(&mut self, pane: usize, left: bool, word: bool, select: bool) {
+        let tab = self.tab(pane);
+        let Some(s) = tab.editing_path.clone() else {
+            return;
+        };
+        let end = s.chars().count();
+        let cursor = tab.path_cursor.min(end);
+        let target = match (left, word) {
+            (true, true) => prev_word_boundary(&s, cursor),
+            (true, false) => cursor.saturating_sub(1),
+            (false, true) => next_word_boundary(&s, cursor),
+            (false, false) => (cursor + 1).min(end),
+        };
+        let sel = self.path_sel(pane);
+        let tab = self.tab_mut(pane);
+        if select {
+            if tab.path_anchor.is_none() {
+                tab.path_anchor = Some(cursor);
+            }
+            tab.path_cursor = target;
+            if tab.path_anchor == Some(target) {
+                tab.path_anchor = None;
+            }
+        } else if let Some((lo, hi)) = sel {
+            tab.path_cursor = if word {
+                target
+            } else if left {
+                lo
+            } else {
+                hi
+            };
+            tab.path_anchor = None;
+        } else {
+            tab.path_cursor = target;
+            tab.path_anchor = None;
+        }
     }
 
     /// Keystrokes while the path bar is being edited (acts on the active pane).
     fn handle_path_edit_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let cmd = ks.modifiers.platform;
+        let alt = ks.modifiers.alt;
+        let shift = ks.modifiers.shift;
         let pane = self.active_pane;
         match ks.key.as_str() {
             "escape" => {
@@ -4243,22 +4727,87 @@ impl Shuffle {
                 }
                 cx.notify();
             }
+            // Cmd+Left/Right jump to start/end (extending with Shift); otherwise
+            // Left/Right move by char, Option by word, Shift extends selection.
+            "left" => {
+                if cmd {
+                    let tab = self.tab_mut(pane);
+                    if shift && tab.path_anchor.is_none() {
+                        tab.path_anchor = Some(tab.path_cursor);
+                    }
+                    tab.path_cursor = 0;
+                    if !shift {
+                        tab.path_anchor = None;
+                    }
+                } else {
+                    self.path_move_h(pane, true, alt, shift);
+                }
+                cx.notify();
+            }
+            "right" => {
+                if cmd {
+                    let end = self
+                        .tab(pane)
+                        .editing_path
+                        .as_ref()
+                        .map_or(0, |s| s.chars().count());
+                    let tab = self.tab_mut(pane);
+                    if shift && tab.path_anchor.is_none() {
+                        tab.path_anchor = Some(tab.path_cursor);
+                    }
+                    tab.path_cursor = end;
+                    if !shift {
+                        tab.path_anchor = None;
+                    }
+                } else {
+                    self.path_move_h(pane, false, alt, shift);
+                }
+                cx.notify();
+            }
+            "a" if cmd => {
+                let end = self
+                    .tab(pane)
+                    .editing_path
+                    .as_ref()
+                    .map_or(0, |s| s.chars().count());
+                let tab = self.tab_mut(pane);
+                if end == 0 {
+                    tab.path_anchor = None;
+                } else {
+                    tab.path_anchor = Some(0);
+                    tab.path_cursor = end;
+                }
+                cx.notify();
+            }
             "backspace" => {
-                if let Some(s) = self.tab_mut(pane).editing_path.as_mut() {
-                    s.pop();
+                if !self.path_delete_sel(pane) {
+                    let tab = self.tab_mut(pane);
+                    if tab.path_cursor > 0 {
+                        if let Some(s) = tab.editing_path.as_mut() {
+                            let start = char_byte(s, tab.path_cursor - 1);
+                            let stop = char_byte(s, tab.path_cursor);
+                            s.replace_range(start..stop, "");
+                        }
+                        tab.path_cursor -= 1;
+                    }
                 }
                 cx.notify();
             }
             "c" if cmd => {
-                if let Some(s) = &self.tab(pane).editing_path {
-                    cx.write_to_clipboard(ClipboardItem::new_string(s.clone()));
+                // Copy the selection if there is one, else the whole path.
+                let text = match self.path_sel(pane) {
+                    Some((lo, hi)) => self.tab(pane).editing_path.as_ref().map(|s| {
+                        s[char_byte(s, lo)..char_byte(s, hi)].to_string()
+                    }),
+                    None => self.tab(pane).editing_path.clone(),
+                };
+                if let Some(text) = text {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
                 }
             }
             "v" if cmd => {
                 if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                    if let Some(s) = self.tab_mut(pane).editing_path.as_mut() {
-                        s.push_str(t.trim());
-                    }
+                    self.path_insert(pane, t.trim());
                     cx.notify();
                 }
             }
@@ -4268,9 +4817,7 @@ impl Shuffle {
                 }
                 if let Some(ch) = ks.key_char.as_ref() {
                     if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        if let Some(s) = self.tab_mut(pane).editing_path.as_mut() {
-                            s.push_str(ch);
-                        }
+                        self.path_insert(pane, ch);
                         cx.notify();
                     }
                 }
@@ -4283,9 +4830,91 @@ impl Shuffle {
     /// Open the find bar for a pane, filtering only its current directory.
     fn open_find(&mut self, pane: usize, cx: &mut Context<Self>) {
         self.active_pane = pane;
-        self.tab_mut(pane).find_query = Some(String::new());
+        let tab = self.tab_mut(pane);
+        tab.find_query = Some(String::new());
+        tab.find_cursor = 0;
+        tab.find_anchor = None;
         self.recompute_find(pane);
         cx.notify();
+    }
+
+    /// The find query's selected range (char indices), if any.
+    fn find_sel(&self, pane: usize) -> Option<(usize, usize)> {
+        let tab = self.tab(pane);
+        match tab.find_anchor {
+            Some(a) if a != tab.find_cursor => {
+                Some((a.min(tab.find_cursor), a.max(tab.find_cursor)))
+            }
+            _ => None,
+        }
+    }
+
+    /// Delete the find query's selected range (if any); cursor goes to its start.
+    fn find_delete_sel(&mut self, pane: usize) -> bool {
+        if let Some((lo, hi)) = self.find_sel(pane) {
+            let tab = self.tab_mut(pane);
+            if let Some(s) = tab.find_query.as_mut() {
+                let (bl, bh) = (char_byte(s, lo), char_byte(s, hi));
+                s.replace_range(bl..bh, "");
+            }
+            tab.find_cursor = lo;
+            tab.find_anchor = None;
+            true
+        } else {
+            self.tab_mut(pane).find_anchor = None;
+            false
+        }
+    }
+
+    /// Insert `s` at the find cursor, replacing any selection first.
+    fn find_insert(&mut self, pane: usize, s: &str) {
+        self.find_delete_sel(pane);
+        let tab = self.tab_mut(pane);
+        if let Some(buf) = tab.find_query.as_mut() {
+            let b = char_byte(buf, tab.find_cursor);
+            buf.insert_str(b, s);
+            tab.find_cursor += s.chars().count();
+        }
+    }
+
+    /// Move (or extend) the find text cursor. `word` jumps by word, `select`
+    /// extends the selection (Option+Shift selects a word at a time).
+    fn find_move_h(&mut self, pane: usize, left: bool, word: bool, select: bool) {
+        let tab = self.tab(pane);
+        let Some(s) = tab.find_query.clone() else {
+            return;
+        };
+        let end = s.chars().count();
+        let cursor = tab.find_cursor.min(end);
+        let target = match (left, word) {
+            (true, true) => prev_word_boundary(&s, cursor),
+            (true, false) => cursor.saturating_sub(1),
+            (false, true) => next_word_boundary(&s, cursor),
+            (false, false) => (cursor + 1).min(end),
+        };
+        let sel = self.find_sel(pane);
+        let tab = self.tab_mut(pane);
+        if select {
+            if tab.find_anchor.is_none() {
+                tab.find_anchor = Some(cursor);
+            }
+            tab.find_cursor = target;
+            if tab.find_anchor == Some(target) {
+                tab.find_anchor = None;
+            }
+        } else if let Some((lo, hi)) = sel {
+            tab.find_cursor = if word {
+                target
+            } else if left {
+                lo
+            } else {
+                hi
+            };
+            tab.find_anchor = None;
+        } else {
+            tab.find_cursor = target;
+            tab.find_anchor = None;
+        }
     }
 
     /// Recompute a pane's `find_results`. Empty query shows every entry;
@@ -4324,6 +4953,8 @@ impl Shuffle {
     fn handle_find_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let cmd = ks.modifiers.platform;
+        let alt = ks.modifiers.alt;
+        let shift = ks.modifiers.shift;
         let pane = self.active_pane;
         match ks.key.as_str() {
             "escape" => {
@@ -4347,18 +4978,87 @@ impl Shuffle {
                     cx.notify();
                 }
             }
+            // Cmd+Left/Right jump to start/end (Shift extends); otherwise Left/
+            // Right move by char, Option by word, Shift extends the selection.
+            "left" => {
+                if cmd {
+                    let tab = self.tab_mut(pane);
+                    if shift && tab.find_anchor.is_none() {
+                        tab.find_anchor = Some(tab.find_cursor);
+                    }
+                    tab.find_cursor = 0;
+                    if !shift {
+                        tab.find_anchor = None;
+                    }
+                } else {
+                    self.find_move_h(pane, true, alt, shift);
+                }
+                cx.notify();
+            }
+            "right" => {
+                if cmd {
+                    let end = self
+                        .tab(pane)
+                        .find_query
+                        .as_ref()
+                        .map_or(0, |s| s.chars().count());
+                    let tab = self.tab_mut(pane);
+                    if shift && tab.find_anchor.is_none() {
+                        tab.find_anchor = Some(tab.find_cursor);
+                    }
+                    tab.find_cursor = end;
+                    if !shift {
+                        tab.find_anchor = None;
+                    }
+                } else {
+                    self.find_move_h(pane, false, alt, shift);
+                }
+                cx.notify();
+            }
+            "a" if cmd => {
+                let end = self
+                    .tab(pane)
+                    .find_query
+                    .as_ref()
+                    .map_or(0, |s| s.chars().count());
+                let tab = self.tab_mut(pane);
+                if end == 0 {
+                    tab.find_anchor = None;
+                } else {
+                    tab.find_anchor = Some(0);
+                    tab.find_cursor = end;
+                }
+                cx.notify();
+            }
             "backspace" => {
-                if let Some(s) = self.tab_mut(pane).find_query.as_mut() {
-                    s.pop();
+                if !self.find_delete_sel(pane) {
+                    let tab = self.tab_mut(pane);
+                    if tab.find_cursor > 0 {
+                        if let Some(s) = tab.find_query.as_mut() {
+                            let start = char_byte(s, tab.find_cursor - 1);
+                            let stop = char_byte(s, tab.find_cursor);
+                            s.replace_range(start..stop, "");
+                        }
+                        tab.find_cursor -= 1;
+                    }
                 }
                 self.recompute_find(pane);
                 cx.notify();
             }
+            "c" if cmd => {
+                let text = match self.find_sel(pane) {
+                    Some((lo, hi)) => self.tab(pane).find_query.as_ref().map(|s| {
+                        s[char_byte(s, lo)..char_byte(s, hi)].to_string()
+                    }),
+                    None => self.tab(pane).find_query.clone(),
+                };
+                if let Some(text) = text {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
             "v" if cmd => {
                 if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                    if let Some(s) = self.tab_mut(pane).find_query.as_mut() {
-                        s.push_str(t.trim());
-                    }
+                    self.find_insert(pane, t.trim());
                     self.recompute_find(pane);
                     cx.notify();
                 }
@@ -4369,9 +5069,7 @@ impl Shuffle {
                 }
                 if let Some(ch) = ks.key_char.as_ref() {
                     if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        if let Some(s) = self.tab_mut(pane).find_query.as_mut() {
-                            s.push_str(ch);
-                        }
+                        self.find_insert(pane, ch);
                         self.recompute_find(pane);
                         cx.notify();
                     }
@@ -5253,7 +5951,41 @@ impl Shuffle {
     /// The floating filter box, anchored bottom-right while find is active.
     fn render_find_box(&self, pane: usize, query: &str) -> impl IntoElement {
         let t = theme();
-        let count = self.tab(pane).find_results.len();
+        let tab = self.tab(pane);
+        let count = tab.find_results.len();
+        // The editable text: placeholder, a highlighted selection span, or the
+        // text split around a static caret at the cursor.
+        let field = if query.is_empty() {
+            div()
+                .min_w(px(80.0))
+                .text_color(rgb(t.text_dim))
+                .child("type to filter…")
+        } else if let Some((lo, hi)) = self.find_sel(pane) {
+            let (bl, bh) = (char_byte(query, lo), char_byte(query, hi));
+            div()
+                .flex()
+                .items_center()
+                .min_w(px(80.0))
+                .child(div().flex_none().child(query[..bl].to_string()))
+                .child(
+                    div()
+                        .flex_none()
+                        .bg(Theme::alpha(t.accent, 0x66))
+                        .rounded_sm()
+                        .child(query[bl..bh].to_string()),
+                )
+                .child(div().flex_none().child(query[bh..].to_string()))
+        } else {
+            let cursor = tab.find_cursor.min(query.chars().count());
+            let b = char_byte(query, cursor);
+            div()
+                .flex()
+                .items_center()
+                .min_w(px(80.0))
+                .child(div().flex_none().child(query[..b].to_string()))
+                .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(t.text)))
+                .child(div().flex_none().child(query[b..].to_string()))
+        };
         div()
             .absolute()
             .bottom(px(16.0))
@@ -5270,15 +6002,7 @@ impl Shuffle {
             .shadow_lg()
             .text_color(rgb(t.text))
             .child(div().flex_none().text_color(rgb(t.text_muted)).child("Filter"))
-            .child(if query.is_empty() {
-                div()
-                    .min_w(px(80.0))
-                    .text_color(rgb(t.text_dim))
-                    .child("type to filter…")
-            } else {
-                div().min_w(px(80.0)).child(query.to_string())
-            })
-            .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(t.text)))
+            .child(field)
             .child(
                 div()
                     .flex_none()
@@ -5286,6 +6010,42 @@ impl Shuffle {
                     .text_xs()
                     .child(format!("{count}")),
             )
+    }
+
+    /// Bottom-right filter affordance for a pane. When a find is active it shows
+    /// the live editable box; otherwise it shows a compact, clickable "Filter"
+    /// pill so mouse users can start filtering without pressing "/".
+    fn render_filter_box(&self, pane: usize, cx: &Context<Self>) -> AnyElement {
+        let t = theme();
+        match self.tab(pane).find_query.clone() {
+            Some(q) => self.render_find_box(pane, &q).into_any_element(),
+            None => div()
+                .id(("filter-pill", pane))
+                .absolute()
+                .bottom(px(16.0))
+                .right(px(16.0))
+                .flex()
+                .items_center()
+                .gap_1()
+                .px_3()
+                .py_1()
+                .rounded_lg()
+                .cursor_pointer()
+                .bg(Theme::alpha(t.surface, 0xe6))
+                .border_1()
+                .border_color(rgb(t.border_strong))
+                .shadow_lg()
+                .text_color(rgb(t.text_muted))
+                .hover(|s| s.text_color(rgb(t.text)).border_color(rgb(t.accent)))
+                .child(div().flex_none().text_xs().child("🔍"))
+                .child(div().flex_none().child("Filter"))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.active_pane = pane;
+                    this.open_find(pane, cx);
+                    window.focus(&this.focus);
+                }))
+                .into_any_element(),
+        }
     }
 
     /// Build macOS file-type icons for the current directory off the render
@@ -5669,8 +6429,8 @@ impl Shuffle {
         let can_back = tab.hist_pos > 0;
         let can_fwd = tab.hist_pos + 1 < tab.history.len();
 
-        let content: AnyElement = if let Some(text) = &tab.editing_path {
-            self.render_path_editor(text).into_any_element()
+        let content: AnyElement = if tab.editing_path.is_some() {
+            self.render_path_editor(pane).into_any_element()
         } else {
             self.render_breadcrumb(pane, cx).into_any_element()
         };
@@ -5726,12 +6486,34 @@ impl Shuffle {
                     this.set_view(pane, mode, cx);
                 }))
         };
+        // Magnifier that opens the command palette (Cmd+P) — a mouse-reachable
+        // entry point sitting alongside the view-mode icons.
+        let search_btn = div()
+            .id(("palette-search", pane))
+            .flex_none()
+            .w(px(24.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(rgb(t.text_dim))
+            .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+            .child("🔍")
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.active_pane = pane;
+                if !this.palette_open {
+                    this.toggle_palette(window, cx);
+                }
+            }));
         div()
             .flex_none()
             .flex()
             .items_center()
             .gap_1()
             .pl_2()
+            .child(search_btn)
             .child(btn("view-list", "☰", ViewMode::List, cx))
             .child(btn("view-icons", "▦", ViewMode::Icons, cx))
             .child(btn("view-columns", "▥", ViewMode::Columns, cx))
@@ -5828,8 +6610,41 @@ impl Shuffle {
     }
 
     /// The editable address-bar field shown in edit mode.
-    fn render_path_editor(&self, text: &str) -> impl IntoElement {
+    fn render_path_editor(&self, pane: usize) -> impl IntoElement {
         let t = theme();
+        let tab = self.tab(pane);
+        let text = tab.editing_path.clone().unwrap_or_default();
+
+        // The editable text: either a highlighted selection span, or the text
+        // split around a static caret at the cursor.
+        let field = if let Some((lo, hi)) = self.path_sel(pane) {
+            let (bl, bh) = (char_byte(&text, lo), char_byte(&text, hi));
+            div()
+                .flex()
+                .items_center()
+                .min_w_0()
+                .child(div().flex_none().child(text[..bl].to_string()))
+                .child(
+                    div()
+                        .flex_none()
+                        .bg(Theme::alpha(t.accent, 0x66))
+                        .rounded_sm()
+                        .child(text[bl..bh].to_string()),
+                )
+                .child(div().flex_none().child(text[bh..].to_string()))
+        } else {
+            let cursor = tab.path_cursor.min(text.chars().count());
+            let b = char_byte(&text, cursor);
+            div()
+                .flex()
+                .items_center()
+                .min_w_0()
+                .child(div().flex_none().child(text[..b].to_string()))
+                // Blinking would need a timer; a static caret reads clearly.
+                .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(t.text)))
+                .child(div().flex_none().child(text[b..].to_string()))
+        };
+
         div()
             .flex_1()
             .min_w_0()
@@ -5842,9 +6657,7 @@ impl Shuffle {
             .border_1()
             .border_color(rgb(t.accent))
             .text_color(rgb(t.text))
-            .child(div().min_w_0().child(text.to_string()))
-            // Blinking would need a timer; a static caret reads clearly enough.
-            .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(t.text)))
+            .child(field)
     }
 
     /// The canvas: one full-width pane, or two panes split by a draggable
@@ -6083,7 +6896,18 @@ impl Shuffle {
             .child(self.render_tab_strip(pane, cx))
             // Path bar: back/forward arrows + breadcrumb + view/sort toolbar.
             .child(self.render_path_bar(pane, cx))
-            .child(body)
+            // Body plus the always-present bottom-right filter affordance,
+            // overlaid in a shared relative container so it covers every view.
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .child(body)
+                    .child(self.render_filter_box(pane, cx)),
+            )
     }
 
     /// The List view body: clickable column header + virtualized rows.
@@ -6323,13 +7147,7 @@ impl Shuffle {
                     .children(self.scrollbar_thumb(pane, cx))
                     // Horizontal scrollbar, shown when columns overflow.
                     .children(self.h_scrollbar_thumb(pane, total_w))
-                    // Floating filter box, when this pane's find is active.
-                    .children(
-                        self.tab(pane)
-                            .find_query
-                            .as_ref()
-                            .map(|q| self.render_find_box(pane, q).into_any_element()),
-                    )
+                    // (The filter box is rendered once at the pane level.)
                     .into_any_element()
     }
 
@@ -6402,12 +7220,7 @@ impl Shuffle {
                 })),
             )
             .children(self.scrollbar_thumb(pane, cx))
-            .children(
-                self.tab(pane)
-                    .find_query
-                    .as_ref()
-                    .map(|q| self.render_find_box(pane, q).into_any_element()),
-            )
+            // (The filter box is rendered once at the pane level.)
             .into_any_element()
     }
 
@@ -9001,6 +9814,55 @@ fn save_icon_pack(p: &Option<PathBuf>) {
     }
 }
 
+/// Persist the app-icon background choice.
+fn save_icon_bg(bg: &IconBg) {
+    if let Some(file) = config_file("app_icon.txt") {
+        if let Some(parent) = file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let body = match bg {
+            IconBg::Default => String::new(),
+            IconBg::Color(c) => format!("color={c:06x}"),
+            IconBg::Image(p) => format!("image={}", p.to_string_lossy()),
+        };
+        let _ = fs::write(&file, body);
+    }
+}
+
+/// Load the saved app-icon background choice.
+fn load_icon_bg() -> IconBg {
+    let Some(file) = config_file("app_icon.txt") else {
+        return IconBg::Default;
+    };
+    let Ok(s) = fs::read_to_string(&file) else {
+        return IconBg::Default;
+    };
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("color=") {
+        if let Ok(c) = u32::from_str_radix(hex.trim(), 16) {
+            return IconBg::Color(c);
+        }
+    } else if let Some(path) = s.strip_prefix("image=") {
+        let p = PathBuf::from(path.trim());
+        if p.is_file() {
+            return IconBg::Image(p);
+        }
+    }
+    IconBg::Default
+}
+
+/// Copy an uploaded background image into the config dir so it persists, and
+/// return the stored path.
+fn store_icon_bg_image(src: &Path) -> Option<PathBuf> {
+    let ext = src.extension().and_then(|e| e.to_str()).unwrap_or("png");
+    let dest = config_file(&format!("app_icon_bg.{ext}"))?;
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::copy(src, &dest).ok()?;
+    Some(dest)
+}
+
 /// Load the saved icon-pack folder, if it still exists.
 fn load_icon_pack() -> Option<PathBuf> {
     let file = config_file("icon_pack.txt")?;
@@ -9222,6 +10084,11 @@ fn main() {
         let saved_menu = load_menu_style();
         set_active_menu(saved_menu);
         cx.set_global(MenuStyleGlobal(saved_menu));
+
+        // Load the app-icon background and apply it to the Dock icon.
+        let saved_icon_bg = load_icon_bg();
+        set_active_icon_bg(saved_icon_bg.clone());
+        refresh_dock_icon(&saved_icon_bg);
 
         // Menu bar: app menu with Settings + Quit, plus their shortcuts.
         cx.bind_keys([
