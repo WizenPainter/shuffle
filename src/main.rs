@@ -327,6 +327,8 @@ struct Prefs {
     palette_history: bool,
     /// Enable custom sidebar "groups" of files/folders.
     groups_enabled: bool,
+    /// Show the always-on "Filter" pill in the bottom-right (/ still works).
+    show_filter_button: bool,
 }
 
 impl Default for Prefs {
@@ -341,6 +343,7 @@ impl Default for Prefs {
             recent_limit: 3,
             palette_history: false,
             groups_enabled: false,
+            show_filter_button: true,
         }
     }
 }
@@ -360,6 +363,7 @@ thread_local! {
         recent_limit: 3,
         palette_history: false,
         groups_enabled: false,
+        show_filter_button: true,
     }) };
 }
 
@@ -465,25 +469,27 @@ fn apply_menu_style(m: MenuStyle, cx: &mut App) {
 
 // ----- app icon background (the Dock icon) -----------------------------------
 
-/// The foreground logo (transparent background) composited over the chosen
-/// icon background. Embedded so it's available at runtime without a bundle path.
-const LOGO_FG_PNG: &[u8] = include_bytes!("../logo2 Background Removed.png");
+/// The default app icon (the exact bundle icon: blue folder on a light rounded
+/// square with the standard macOS margin). We recolor only its background so a
+/// customized icon keeps the identical size, shape, margin, and logo.
+const ICON_BASE_PNG: &[u8] = include_bytes!("../icon_base.png");
 
 /// How the app icon's background is drawn behind the logo.
 #[derive(Clone, PartialEq)]
 enum IconBg {
-    /// Leave the built-in bundle icon (off-white) as-is.
+    /// Keep the built-in bundle icon (light) as-is.
     Default,
-    /// A solid color.
+    /// Recolor the background to a solid color.
     Color(u32),
-    /// A user-supplied background image (copied into the config dir).
+    /// Fill the background with a user-supplied image (copied to the config dir).
     Image(PathBuf),
 }
 
 thread_local! {
     static ACTIVE_ICON_BG: RefCell<IconBg> = const { RefCell::new(IconBg::Default) };
-    /// Cached decoded foreground logo for the settings preview.
-    static LOGO_RENDER: RefCell<Option<Option<Arc<RenderImage>>>> = const { RefCell::new(None) };
+    /// Cached decoded preview icon: (config it was built for, decoded image).
+    static ICON_PREVIEW: RefCell<Option<(IconBg, Option<Arc<RenderImage>>)>> =
+        const { RefCell::new(None) };
 }
 
 fn icon_bg() -> IconBg {
@@ -494,12 +500,24 @@ fn set_active_icon_bg(b: IconBg) {
     ACTIVE_ICON_BG.with(|c| *c.borrow_mut() = b);
 }
 
-/// The decoded foreground logo as a GPUI image (for the settings preview).
-fn app_logo_render() -> Option<Arc<RenderImage>> {
-    LOGO_RENDER.with(|c| {
-        c.borrow_mut()
-            .get_or_insert_with(|| decode_icon(LOGO_FG_PNG))
-            .clone()
+/// The decoded icon for the settings preview (recolored base, cached per config).
+fn preview_icon_render() -> Option<Arc<RenderImage>> {
+    let bg = icon_bg();
+    ICON_PREVIEW.with(|c| {
+        {
+            let cache = c.borrow();
+            if let Some((cached, render)) = cache.as_ref() {
+                if *cached == bg {
+                    return render.clone();
+                }
+            }
+        }
+        let render = match &bg {
+            IconBg::Default => decode_icon(ICON_BASE_PNG),
+            _ => compose_icon_png(&bg).and_then(|png| decode_icon(&png)),
+        };
+        *c.borrow_mut() = Some((bg, render.clone()));
+        render
     })
 }
 
@@ -512,8 +530,8 @@ fn apply_icon_bg(bg: IconBg, cx: &mut App) {
     cx.refresh_windows();
 }
 
-/// Composite the icon (background + rounded mask + logo) and hand it to the Dock.
-/// `Default` leaves the bundle's own icon untouched.
+/// Recolor the base icon per `bg` and hand it to the Dock. `Default` leaves the
+/// bundle's own icon untouched.
 fn refresh_dock_icon(bg: &IconBg) {
     if matches!(bg, IconBg::Default) {
         return; // keep the built-in AppIcon.icns
@@ -523,71 +541,65 @@ fn refresh_dock_icon(bg: &IconBg) {
     }
 }
 
-/// Build the composited app icon as PNG bytes: background (color or image),
-/// clipped to a rounded square, with the logo centered on top.
-fn compose_icon_png(bg: &IconBg) -> Option<Vec<u8>> {
-    use image::{imageops, Rgba, RgbaImage};
-    let size: u32 = 512;
-
-    // --- background layer ---
-    let mut canvas: RgbaImage = match bg {
-        IconBg::Color(c) => {
-            let [r, g, b] = [(c >> 16) as u8, (c >> 8) as u8, *c as u8];
-            RgbaImage::from_pixel(size, size, Rgba([r, g, b, 255]))
-        }
-        IconBg::Image(path) => {
-            let img = image::open(path).ok()?.to_rgba8();
-            // Cover-fit: scale so the image fills the square, then center-crop.
-            let (iw, ih) = img.dimensions();
-            let scale = (size as f32 / iw as f32).max(size as f32 / ih as f32);
-            let (nw, nh) = ((iw as f32 * scale) as u32, (ih as f32 * scale) as u32);
-            let resized = imageops::resize(&img, nw.max(1), nh.max(1), imageops::FilterType::Lanczos3);
-            let mut c = RgbaImage::from_pixel(size, size, Rgba([0, 0, 0, 255]));
-            let (ox, oy) = (
-                (nw as i64 - size as i64) / 2,
-                (nh as i64 - size as i64) / 2,
-            );
-            imageops::overlay(&mut c, &resized, -ox, -oy);
-            c
-        }
-        IconBg::Default => RgbaImage::from_pixel(size, size, Rgba([242, 242, 242, 255])),
-    };
-
-    // --- rounded-square mask (macOS-ish corner radius) ---
-    let radius = (size as f32 * 0.2237) as i32;
-    round_corners(&mut canvas, radius);
-
-    // --- foreground logo, centered (large; independent of the background) ---
-    let logo = image::load_from_memory(LOGO_FG_PNG).ok()?.to_rgba8();
-    let inner = (size as f32 * 0.9) as u32;
-    let (lw, lh) = logo.dimensions();
-    let lscale = (inner as f32 / lw as f32).min(inner as f32 / lh as f32);
-    let (nw, nh) = ((lw as f32 * lscale) as u32, (lh as f32 * lscale) as u32);
-    let logo = imageops::resize(&logo, nw.max(1), nh.max(1), imageops::FilterType::Lanczos3);
-    let (ox, oy) = ((size - nw) as i64 / 2, (size - nh) as i64 / 2);
-    imageops::overlay(&mut canvas, &logo, ox, oy);
-
-    let mut out = Vec::new();
-    canvas
-        .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
-        .ok()?;
-    Some(out)
+/// Whether a base-icon pixel belongs to the (light, low-saturation) background
+/// rather than the (saturated blue) folder logo.
+fn is_icon_background(r: u8, g: u8, b: u8) -> bool {
+    let mx = r.max(g).max(b);
+    let mn = r.min(g).min(b);
+    mx >= 200 && (mx - mn) <= 26
 }
 
-/// Zero the alpha outside a rounded-rectangle of corner `radius` (in pixels).
-fn round_corners(img: &mut image::RgbaImage, radius: i32) {
-    let (w, h) = img.dimensions();
-    let (w, h, r) = (w as i32, h as i32, radius.max(0));
-    for y in 0..h {
-        for x in 0..w {
-            // Distance into a corner, if any.
-            let cx = if x < r { r - x } else if x >= w - r { x - (w - r) + 1 } else { 0 };
-            let cy = if y < r { r - y } else if y >= h - r { y - (h - r) + 1 } else { 0 };
-            if cx > 0 && cy > 0 && (cx * cx + cy * cy) > r * r {
-                img.get_pixel_mut(x as u32, y as u32).0[3] = 0;
-            }
+/// Build the customized icon PNG by recoloring ONLY the base icon's background,
+/// preserving its exact shape, margin, corner radius, logo, and shading.
+fn compose_icon_png(bg: &IconBg) -> Option<Vec<u8>> {
+    use image::imageops;
+    let mut base = image::load_from_memory(ICON_BASE_PNG).ok()?.to_rgba8();
+    let (w, h) = base.dimensions();
+
+    // For an image background, cover-fit it to the icon so each background pixel
+    // has a source color.
+    let bg_img = match bg {
+        IconBg::Image(path) => {
+            let img = image::open(path).ok()?.to_rgba8();
+            let (iw, ih) = img.dimensions();
+            let scale = (w as f32 / iw as f32).max(h as f32 / ih as f32);
+            let (nw, nh) = ((iw as f32 * scale) as u32, (ih as f32 * scale) as u32);
+            Some(imageops::resize(&img, nw.max(1), nh.max(1), imageops::FilterType::Lanczos3))
+        }
+        _ => None,
+    };
+    let color = match bg {
+        IconBg::Color(c) => Some([(c >> 16) as u8, (c >> 8) as u8, *c as u8]),
+        _ => None,
+    };
+
+    for (x, y, px) in base.enumerate_pixels_mut() {
+        let [r, g, b, a] = px.0;
+        if a == 0 || !is_icon_background(r, g, b) {
+            continue; // transparent margin or the logo → leave untouched
+        }
+        if let Some(img) = &bg_img {
+            let (bw, bh) = img.dimensions();
+            let sp = img.get_pixel(x.min(bw - 1), y.min(bh - 1)).0;
+            px.0 = [sp[0], sp[1], sp[2], a];
+        } else if let Some([cr, cg, cb]) = color {
+            // Preserve the base's subtle gradient by scaling the color by this
+            // pixel's brightness (near-white → full color, slightly darker →
+            // slightly darker color).
+            let lum = r.max(g).max(b) as f32 / 255.0;
+            px.0 = [
+                (cr as f32 * lum) as u8,
+                (cg as f32 * lum) as u8,
+                (cb as f32 * lum) as u8,
+                a,
+            ];
         }
     }
+
+    let mut out = Vec::new();
+    base.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+        .ok()?;
+    Some(out)
 }
 
 /// Hand a PNG to the running app as its Dock / cmd-tab icon.
@@ -1202,6 +1214,19 @@ impl Settings {
                     cx.notify();
                 }),
             ))
+            .child(toggle_row(
+                "tg-filter-button",
+                "Filter button",
+                "Show the always-on \"Filter\" button in the bottom-right corner. \
+                 Pressing / still opens the filter either way.",
+                p.show_filter_button,
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut np = prefs();
+                    np.show_filter_button = !np.show_filter_button;
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }),
+            ))
             .child(settings_title("Sidebar"))
             .child(stepper_row(
                 "st-recents",
@@ -1223,6 +1248,14 @@ impl Settings {
                     let mut np = prefs();
                     np.recent_limit = (np.recent_limit + 1).min(RECENTS_CAP);
                     apply_prefs(np, cx);
+                    cx.notify();
+                }),
+            ))
+            .child(reset_button(
+                "reset-general",
+                "Reset General to Default",
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    apply_prefs(Prefs::default(), cx);
                     cx.notify();
                 }),
             ))
@@ -1290,6 +1323,15 @@ impl Settings {
                     .child("Click a shortcut, then press the keys. ⌫ clears it; Esc cancels."),
             )
             .children(rows)
+            .child(reset_button(
+                "reset-keybinds",
+                "Reset Shortcuts to Default",
+                cx.listener(|this, _: &ClickEvent, _, cx| {
+                    this.recording = None;
+                    apply_keymap(Keymap::defaults(), cx);
+                    cx.notify();
+                }),
+            ))
     }
 
     fn render_customization(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1578,6 +1620,18 @@ impl Settings {
                          (e.g. pdf.png, png.png). PNG with transparency works best.",
                     ),
             )
+            .child(reset_button(
+                "reset-customization",
+                "Reset Customization to Default",
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    // Theme, menu style, app icon, and icon pack all back to stock.
+                    apply_theme(Theme::default(), cx);
+                    apply_menu_style(MenuStyle::default(), cx);
+                    apply_icon_bg(IconBg::Default, cx);
+                    apply_icon_pack(None, cx);
+                    cx.notify();
+                }),
+            ))
     }
 
     /// A grid of color swatches; clicking one sets a single theme field via
@@ -1680,42 +1734,17 @@ impl Settings {
             .child(row("Move to Trash"))
     }
 
-    /// A live preview of the app icon with the current background + logo.
+    /// A live preview of the app icon (the recolored base — matches the Dock).
     fn app_icon_preview(&self) -> impl IntoElement {
-        let t = theme();
-        let bg = icon_bg();
         let mut base = div()
-            .relative()
             .flex_none()
-            .w(px(72.0))
-            .h(px(72.0))
-            .rounded(px(16.0))
-            .overflow_hidden()
-            .border_1()
-            .border_color(rgb(t.border))
+            .w(px(80.0))
+            .h(px(80.0))
             .flex()
             .items_center()
             .justify_center();
-        match &bg {
-            IconBg::Color(c) => base = base.bg(rgb(*c)),
-            IconBg::Default => base = base.bg(rgb(0xf2f2f2)),
-            IconBg::Image(p) => {
-                if let Some(r) = decode_image_file(p) {
-                    base = base.child(
-                        img(ImageSource::Render(r))
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full(),
-                    );
-                } else {
-                    base = base.bg(rgb(0xf2f2f2));
-                }
-            }
-        }
-        if let Some(logo) = app_logo_render() {
-            // Match compose_icon_png's 0.9 fraction so the preview is accurate.
-            base = base.child(img(ImageSource::Render(logo)).w(px(65.0)).h(px(65.0)));
+        if let Some(r) = preview_icon_render() {
+            base = base.child(img(ImageSource::Render(r)).w(px(80.0)).h(px(80.0)));
         }
         base
     }
@@ -1859,6 +1888,33 @@ fn settings_title(text: &str) -> impl IntoElement {
 /// A small settings sub-label (normal case, not uppercased).
 fn menu_label(text: &str) -> impl IntoElement {
     div().text_color(rgb(theme().text)).child(text.to_string())
+}
+
+/// A "Reset to Default" button (used once per settings tab).
+fn reset_button(
+    id: &'static str,
+    label: &str,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    let t = theme();
+    div()
+        .flex()
+        .pt_2()
+        .child(
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(rgb(t.hover))
+                .text_color(rgb(t.text))
+                .border_1()
+                .border_color(rgb(t.border))
+                .hover(|s| s.border_color(rgb(0xd9544f)).text_color(rgb(0xd9544f)))
+                .child(label.to_string())
+                .on_click(on_click),
+        )
 }
 
 /// A labelled on/off toggle row used in the General settings tab. `id` must be
@@ -6291,6 +6347,8 @@ impl Shuffle {
         let t = theme();
         match self.tab(pane).find_query.clone() {
             Some(q) => self.render_find_box(pane, &q).into_any_element(),
+            // The always-on pill can be hidden in Settings; "/" still opens it.
+            None if !prefs().show_filter_button => gpui::Empty.into_any_element(),
             None => div()
                 .id(("filter-pill", pane))
                 .absolute()
@@ -10353,8 +10411,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\n",
-            p.terminal, p.term_history, p.preview, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled
+            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\n",
+            p.terminal, p.term_history, p.preview, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button
         );
         let _ = fs::write(&file, body);
     }
@@ -10489,6 +10547,7 @@ fn load_prefs() -> Prefs {
                     }
                     "palette_history" => p.palette_history = on,
                     "groups_enabled" => p.groups_enabled = on,
+                    "show_filter_button" => p.show_filter_button = on,
                     _ => {}
                 }
             }
