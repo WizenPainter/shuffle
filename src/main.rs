@@ -325,6 +325,8 @@ struct Prefs {
     recent_limit: usize,
     /// Give the command palette (Cmd+P) its own Up/Down query history.
     palette_history: bool,
+    /// Enable custom sidebar "groups" of files/folders.
+    groups_enabled: bool,
 }
 
 impl Default for Prefs {
@@ -338,6 +340,7 @@ impl Default for Prefs {
             sidebar_collapsed: false,
             recent_limit: 3,
             palette_history: false,
+            groups_enabled: false,
         }
     }
 }
@@ -356,6 +359,7 @@ thread_local! {
         sidebar_collapsed: false,
         recent_limit: 3,
         palette_history: false,
+        groups_enabled: false,
     }) };
 }
 
@@ -553,9 +557,9 @@ fn compose_icon_png(bg: &IconBg) -> Option<Vec<u8>> {
     let radius = (size as f32 * 0.2237) as i32;
     round_corners(&mut canvas, radius);
 
-    // --- foreground logo, centered with a margin ---
+    // --- foreground logo, centered (large; independent of the background) ---
     let logo = image::load_from_memory(LOGO_FG_PNG).ok()?.to_rgba8();
-    let inner = (size as f32 * 0.66) as u32;
+    let inner = (size as f32 * 0.9) as u32;
     let (lw, lh) = logo.dimensions();
     let lscale = (inner as f32 / lw as f32).min(inner as f32 / lh as f32);
     let (nw, nh) = ((lw as f32 * lscale) as u32, (lh as f32 * lscale) as u32);
@@ -1185,6 +1189,19 @@ impl Settings {
                     cx.notify();
                 }),
             ))
+            .child(toggle_row(
+                "tg-groups",
+                "Sidebar groups",
+                "Create custom groups of files/folders in the sidebar. Right-click \
+                 the sidebar to make a group, then right-click any item to add it.",
+                p.groups_enabled,
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut np = prefs();
+                    np.groups_enabled = !np.groups_enabled;
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }),
+            ))
             .child(settings_title("Sidebar"))
             .child(stepper_row(
                 "st-recents",
@@ -1697,7 +1714,8 @@ impl Settings {
             }
         }
         if let Some(logo) = app_logo_render() {
-            base = base.child(img(ImageSource::Render(logo)).w(px(48.0)).h(px(48.0)));
+            // Match compose_icon_png's 0.9 fraction so the preview is accurate.
+            base = base.child(img(ImageSource::Render(logo)).w(px(65.0)).h(px(65.0)));
         }
         base
     }
@@ -2107,6 +2125,27 @@ enum MenuView {
     Tags,
     QuickActions,
     Services,
+    AddToGroup,
+}
+
+/// A user-defined sidebar group: a named collection of files/folders.
+#[derive(Clone)]
+struct Group {
+    name: String,
+    paths: Vec<PathBuf>,
+}
+
+/// What a right-click in the sidebar targeted (drives its context menu).
+#[derive(Clone)]
+enum SidebarTarget {
+    /// Empty sidebar space → offer "New Group".
+    Empty,
+    /// A pinned bookmark path → offer "Remove Bookmark".
+    Bookmark(PathBuf),
+    /// A group's header (by index) → offer "Delete Group".
+    GroupHeader(usize),
+    /// A member of a group: (group index, path) → offer "Remove from Group".
+    GroupMember(usize, PathBuf),
 }
 
 /// One row in the command palette: a title, a gray subtitle (full path), and
@@ -2328,6 +2367,12 @@ struct Shuffle {
     divider_drag: Option<(f32, f32)>,
     recents: Vec<PathBuf>,
     bookmarks: Vec<PathBuf>,
+    /// User-defined sidebar groups (when the feature is enabled).
+    groups: Vec<Group>,
+    /// Open sidebar context menu: (x, y, what was clicked).
+    sidebar_menu: Option<(f32, f32, SidebarTarget)>,
+    /// Open "New Group" naming dialog: the name being typed (None = closed).
+    group_dialog: Option<String>,
     /// Sidebar section titles the user has collapsed (hidden their items).
     collapsed_sections: HashSet<String>,
     widths: ColumnWidths,
@@ -2425,6 +2470,9 @@ impl Shuffle {
             divider_drag: None,
             recents: read_path_list("recents.txt"),
             bookmarks: read_path_list("bookmarks.txt"),
+            groups: load_groups(),
+            sidebar_menu: None,
+            group_dialog: None,
             collapsed_sections: read_string_list("collapsed_sections.txt").into_iter().collect(),
             widths: ColumnWidths::default(),
             resize: None,
@@ -2985,6 +3033,15 @@ impl Shuffle {
                 )
                 .into_any_element(),
             );
+            // "Add to Group ▸" submenu (only when groups are enabled and exist).
+            if prefs().groups_enabled && !self.groups.is_empty() {
+                items.push(
+                    ctx_parent("Add to Group", cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.set_menu_view(MenuView::AddToGroup, cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
             let p = path.clone();
             items.push(
                 ctx_item("Duplicate", cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -3075,6 +3132,37 @@ impl Shuffle {
             items.push(
                 ctx_app(i, name, cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.open_with(&app, &p, cx);
+                }))
+                .into_any_element(),
+            );
+        }
+        items
+    }
+
+    /// "Add to Group" submenu — one row per group.
+    fn menu_add_to_group(&self, path: PathBuf, cx: &Context<Self>) -> Vec<AnyElement> {
+        let mut items: Vec<AnyElement> = vec![
+            ctx_item("‹ Back", cx.listener(|this, _: &ClickEvent, _, cx| {
+                this.set_menu_view(MenuView::Root, cx);
+            }))
+            .into_any_element(),
+            ctx_separator().into_any_element(),
+        ];
+        if self.groups.is_empty() {
+            items.push(ctx_disabled("No groups").into_any_element());
+        }
+        for (i, g) in self.groups.iter().enumerate() {
+            let p = path.clone();
+            let has = g.paths.contains(&p);
+            let label = if has {
+                format!("✓ {}", g.name)
+            } else {
+                g.name.clone()
+            };
+            items.push(
+                ctx_app(i, label, cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.close_context_menu(cx);
+                    this.add_to_group(i, p.clone(), cx);
                 }))
                 .into_any_element(),
             );
@@ -3229,6 +3317,7 @@ impl Shuffle {
         let pane = menu.pane;
         let items: Vec<AnyElement> = match (menu.view, menu.target.clone()) {
             (MenuView::OpenWith, Some((path, _))) => self.menu_open_with(pane, path, cx),
+            (MenuView::AddToGroup, Some((path, _))) => self.menu_add_to_group(path, cx),
             (MenuView::Tags, Some((path, _))) => self.menu_tags(pane, path, cx),
             (MenuView::QuickActions, Some((path, _))) => self.menu_quick_actions(pane, path, cx),
             (MenuView::Services, Some((path, is_dir))) => self.menu_services(pane, path, is_dir, cx),
@@ -3635,6 +3724,183 @@ impl Shuffle {
             )
     }
 
+    /// The "New Group" naming dialog.
+    fn render_group_dialog(&self, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let name = self.group_dialog.clone().unwrap_or_default();
+        let placeholder = name.is_empty();
+        let shown = if placeholder { "Group name".to_string() } else { name.clone() };
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000066))
+            .occlude()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
+                this.group_dialog = None;
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .w(px(360.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_5()
+                    .rounded_lg()
+                    .bg(rgb(t.surface))
+                    .border_1()
+                    .border_color(rgb(t.border_strong))
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
+                    .child(div().text_color(rgb(t.text)).child("New Group"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(t.bg))
+                            .border_1()
+                            .border_color(rgb(t.accent))
+                            .text_color(rgb(if placeholder { t.text_dim } else { t.text }))
+                            .child(shown),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("grp-cancel")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(rgb(t.text))
+                                    .bg(rgb(t.hover))
+                                    .hover(|s| s.bg(rgb(t.selected)))
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        this.group_dialog = None;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("grp-create")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_color(rgb(0xffffff))
+                                    .bg(rgb(t.accent))
+                                    .hover(|s| s.bg(Theme::alpha(t.accent, 0xdd)))
+                                    .child("Create")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                        if let Some(name) = this.group_dialog.clone() {
+                                            this.create_group(&name, cx);
+                                        }
+                                    })),
+                            ),
+                    ),
+            )
+    }
+
+    /// The sidebar right-click context menu (New Group / Remove / Delete Group).
+    fn render_sidebar_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+        let (x, y, target) = self.sidebar_menu.clone().expect("only when open");
+        let groups_on = prefs().groups_enabled;
+        let mut items: Vec<AnyElement> = Vec::new();
+        match target {
+            SidebarTarget::Empty => {
+                if groups_on {
+                    items.push(
+                        ctx_item("New Group", cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.close_sidebar_menu(cx);
+                            this.open_group_dialog(cx);
+                        }))
+                        .into_any_element(),
+                    );
+                }
+            }
+            SidebarTarget::Bookmark(p) => {
+                items.push(
+                    ctx_item("Remove Bookmark", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.remove_bookmark(&p, cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
+            SidebarTarget::GroupHeader(idx) => {
+                if groups_on {
+                    items.push(
+                        ctx_item("New Group", cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.close_sidebar_menu(cx);
+                            this.open_group_dialog(cx);
+                        }))
+                        .into_any_element(),
+                    );
+                    items.push(ctx_separator().into_any_element());
+                }
+                items.push(
+                    ctx_item("Delete Group", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.delete_group(idx, cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
+            SidebarTarget::GroupMember(idx, p) => {
+                items.push(
+                    ctx_item("Remove from Group", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.remove_from_group(idx, &p, cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
+        }
+        if items.is_empty() {
+            items.push(ctx_disabled("No actions").into_any_element());
+        }
+
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .occlude()
+            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| this.close_sidebar_menu(cx)))
+            .on_mouse_down(MouseButton::Right, cx.listener(|this, _, _, cx| this.close_sidebar_menu(cx)))
+            .child(
+                anchored().position(point(px(x), px(y))).snap_to_window().child(
+                    div()
+                        .min_w(px(180.0))
+                        .py_1()
+                        .bg(menu_style().bg_rgba())
+                        .text_color(rgb(menu_style().text))
+                        .text_size(px(menu_style().font_px))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(theme().border_strong))
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
+                        .children(items),
+                ),
+            )
+    }
+
     /// Build the ~/ fuzzy index on a background thread, then store it.
     fn build_index(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
@@ -3989,6 +4255,12 @@ impl Shuffle {
         // The Connect-to-Server dialog captures all typing while open.
         if self.server_dialog.is_some() {
             self.handle_server_key(ev, cx);
+            return;
+        }
+
+        // The New Group dialog captures all typing while open.
+        if self.group_dialog.is_some() {
+            self.handle_group_key(ev, cx);
             return;
         }
 
@@ -6148,6 +6420,112 @@ impl Shuffle {
         }
     }
 
+    // ----- sidebar groups -----
+
+    /// Open the "New Group" naming dialog.
+    fn open_group_dialog(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_menu = None;
+        self.group_dialog = Some(String::new());
+        cx.notify();
+    }
+
+    /// Create a group with the given name (ignored if blank or a duplicate).
+    fn create_group(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.trim().to_string();
+        if !name.is_empty() && !self.groups.iter().any(|g| g.name == name) {
+            self.groups.push(Group { name, paths: Vec::new() });
+            save_groups(&self.groups);
+        }
+        self.group_dialog = None;
+        cx.notify();
+    }
+
+    /// Delete a group entirely.
+    fn delete_group(&mut self, idx: usize, cx: &mut Context<Self>) {
+        if idx < self.groups.len() {
+            self.groups.remove(idx);
+            save_groups(&self.groups);
+            cx.notify();
+        }
+    }
+
+    /// Add a path (file or folder) to a group.
+    fn add_to_group(&mut self, idx: usize, path: PathBuf, cx: &mut Context<Self>) {
+        if let Some(g) = self.groups.get_mut(idx) {
+            if !g.paths.contains(&path) {
+                g.paths.push(path);
+                save_groups(&self.groups);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Remove a path from a group.
+    fn remove_from_group(&mut self, idx: usize, path: &Path, cx: &mut Context<Self>) {
+        if let Some(g) = self.groups.get_mut(idx) {
+            let before = g.paths.len();
+            g.paths.retain(|p| p != path);
+            if g.paths.len() != before {
+                save_groups(&self.groups);
+                cx.notify();
+            }
+        }
+    }
+
+    fn open_sidebar_menu(&mut self, x: f32, y: f32, target: SidebarTarget, cx: &mut Context<Self>) {
+        self.sidebar_menu = Some((x, y, target));
+        cx.notify();
+    }
+
+    fn close_sidebar_menu(&mut self, cx: &mut Context<Self>) {
+        if self.sidebar_menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    fn handle_group_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let cmd = ks.modifiers.platform;
+        match ks.key.as_str() {
+            "escape" => {
+                self.group_dialog = None;
+                cx.notify();
+            }
+            "enter" => {
+                if let Some(name) = self.group_dialog.clone() {
+                    self.create_group(&name, cx);
+                }
+            }
+            "backspace" => {
+                if let Some(s) = self.group_dialog.as_mut() {
+                    s.pop();
+                }
+                cx.notify();
+            }
+            "v" if cmd => {
+                if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                    if let Some(s) = self.group_dialog.as_mut() {
+                        s.push_str(t.trim());
+                    }
+                    cx.notify();
+                }
+            }
+            _ => {
+                if cmd {
+                    return;
+                }
+                if let Some(ch) = ks.key_char.as_ref() {
+                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
+                        if let Some(s) = self.group_dialog.as_mut() {
+                            s.push_str(ch);
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
     /// Toggle whether a sidebar section (by title) is collapsed, and persist it.
     fn toggle_section(&mut self, title: String, cx: &mut Context<Self>) {
         if !self.collapsed_sections.remove(&title) {
@@ -6321,6 +6699,74 @@ impl Shuffle {
             }
         }
 
+        // --- Groups (user-defined; only when the feature is enabled) ---
+        if prefs().groups_enabled {
+            for (gidx, g) in self.groups.iter().enumerate() {
+                if collapsed {
+                    push_divider(&mut items);
+                    for p in &g.paths {
+                        push_group_member(&mut items, cx, &mut key, gidx, p.clone(), current, true);
+                    }
+                    continue;
+                }
+                let ckey = format!("group:{}", g.name);
+                let is_col = self.collapsed_sections.contains(&ckey);
+                let arrow = if is_col { "▸" } else { "▾" };
+                let toggle_key = ckey.clone();
+                items.push(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .px_3()
+                        .pt_4()
+                        .pb_1()
+                        .child(
+                            div()
+                                .id(SharedString::from(format!("grp-{gidx}")))
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .cursor_pointer()
+                                .text_xs()
+                                .text_color(rgb(theme().text_dim))
+                                .hover(|s| s.text_color(rgb(theme().text)))
+                                .child(div().w(px(10.0)).child(arrow.to_string()))
+                                .child(g.name.to_uppercase())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.toggle_section(toggle_key.clone(), cx);
+                                }))
+                                .on_mouse_down(
+                                    MouseButton::Right,
+                                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                        let (x, y) = (
+                                            f64::from(ev.position.x) as f32,
+                                            f64::from(ev.position.y) as f32,
+                                        );
+                                        this.open_sidebar_menu(
+                                            x,
+                                            y,
+                                            SidebarTarget::GroupHeader(gidx),
+                                            cx,
+                                        );
+                                        cx.stop_propagation();
+                                    }),
+                                ),
+                        )
+                        .into_any_element(),
+                );
+                if !is_col {
+                    if g.paths.is_empty() {
+                        items.push(empty_hint("Right-click a file to add it").into_any_element());
+                    } else {
+                        for p in &g.paths {
+                            push_group_member(&mut items, cx, &mut key, gidx, p.clone(), current, false);
+                        }
+                    }
+                }
+            }
+        }
+
         // --- Recents (count is user-configurable; 0 hides the section) ---
         let recent_limit = prefs().recent_limit;
         if recent_limit > 0 && self.begin_section(&mut items, "RECENTS", collapsed, cx) {
@@ -6407,6 +6853,7 @@ impl Shuffle {
             );
         }
 
+        let groups_on = prefs().groups_enabled;
         div()
             .id("sidebar")
             .flex_none()
@@ -6419,6 +6866,19 @@ impl Shuffle {
             .bg(rgb(theme().sidebar))
             .border_r_1()
             .border_color(rgb(theme().border))
+            // Right-click empty sidebar space → "New Group" (when enabled).
+            .when(groups_on, |d| {
+                d.on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                        let (x, y) = (
+                            f64::from(ev.position.x) as f32,
+                            f64::from(ev.position.y) as f32,
+                        );
+                        this.open_sidebar_menu(x, y, SidebarTarget::Empty, cx);
+                    }),
+                )
+            })
             .children(items)
     }
 
@@ -7569,6 +8029,12 @@ impl Render for Shuffle {
         if self.server_dialog.is_some() {
             root = root.child(self.render_server_dialog(cx));
         }
+        if self.sidebar_menu.is_some() {
+            root = root.child(self.render_sidebar_menu(cx));
+        }
+        if self.group_dialog.is_some() {
+            root = root.child(self.render_group_dialog(cx));
+        }
         root
     }
 }
@@ -7606,6 +8072,7 @@ fn push_nav(
         cx.listener(move |this, _: &ClickEvent, _, cx| {
             this.navigate_to(nav_target.clone(), cx);
         }),
+        |_, _, _| {},
     );
     items.push(item.into_any_element());
 }
@@ -7632,6 +8099,7 @@ fn push_bookmark_nav(
         path_str
     };
     let nav_target = target.clone();
+    let right_target = target.clone();
     let item = nav_item(
         label,
         tooltip,
@@ -7645,6 +8113,63 @@ fn push_bookmark_nav(
             } else {
                 let _ = Command::new("open").arg(&nav_target).spawn();
             }
+        }),
+        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+            let (x, y) = (f64::from(ev.position.x) as f32, f64::from(ev.position.y) as f32);
+            this.open_sidebar_menu(x, y, SidebarTarget::Bookmark(right_target.clone()), cx);
+            cx.stop_propagation();
+        }),
+    );
+    items.push(item.into_any_element());
+}
+
+/// A group member row: click opens/navigates, right-click offers "Remove from
+/// Group". `gidx` is the owning group's index.
+#[allow(clippy::too_many_arguments)]
+fn push_group_member(
+    items: &mut Vec<AnyElement>,
+    cx: &Context<Shuffle>,
+    key: &mut usize,
+    gidx: usize,
+    target: PathBuf,
+    current: &Path,
+    collapsed: bool,
+) {
+    *key += 1;
+    let is_dir = target.is_dir();
+    let active = is_dir && target.as_path() == current;
+    let label = path_label(&target);
+    let path_str = display_path(&target);
+    let tooltip = if collapsed || path_str == label {
+        format!("{label}\n{path_str}")
+    } else {
+        path_str
+    };
+    let nav_target = target.clone();
+    let right_target = target.clone();
+    let item = nav_item(
+        label,
+        tooltip,
+        icon_element(&target, is_dir),
+        *key,
+        active,
+        collapsed,
+        cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if nav_target.is_dir() {
+                this.navigate_to(nav_target.clone(), cx);
+            } else {
+                let _ = Command::new("open").arg(&nav_target).spawn();
+            }
+        }),
+        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+            let (x, y) = (f64::from(ev.position.x) as f32, f64::from(ev.position.y) as f32);
+            this.open_sidebar_menu(
+                x,
+                y,
+                SidebarTarget::GroupMember(gidx, right_target.clone()),
+                cx,
+            );
+            cx.stop_propagation();
         }),
     );
     items.push(item.into_any_element());
@@ -8017,6 +8542,7 @@ fn trash_path(path: &Path) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn nav_item(
     label: String,
     tooltip: String,
@@ -8025,6 +8551,7 @@ fn nav_item(
     active: bool,
     collapsed: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let t = theme();
     let mut base = div()
@@ -8050,7 +8577,9 @@ fn nav_item(
     } else {
         base.child(div().min_w_0().overflow_hidden().child(label))
     };
-    base.tooltip(tip(tooltip)).on_click(on_click)
+    base.tooltip(tip(tooltip))
+        .on_click(on_click)
+        .on_mouse_down(MouseButton::Right, on_right)
 }
 
 fn empty_hint(text: &str) -> impl IntoElement {
@@ -9669,6 +10198,48 @@ fn write_string_list(name: &str, items: &[String]) {
     }
 }
 
+/// Load sidebar groups from `groups.txt`. A `[name]` line starts a group; the
+/// lines after it are member paths, until the next `[name]`.
+fn load_groups() -> Vec<Group> {
+    let mut groups: Vec<Group> = Vec::new();
+    if let Some(file) = config_file("groups.txt") {
+        if let Ok(contents) = fs::read_to_string(&file) {
+            for line in contents.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(name) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+                    groups.push(Group { name: name.to_string(), paths: Vec::new() });
+                } else if let Some(g) = groups.last_mut() {
+                    g.paths.push(PathBuf::from(line));
+                }
+            }
+        }
+    }
+    groups
+}
+
+/// Persist sidebar groups to `groups.txt`.
+fn save_groups(groups: &[Group]) {
+    if let Some(file) = config_file("groups.txt") {
+        if let Some(parent) = file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut body = String::new();
+        for g in groups {
+            body.push('[');
+            body.push_str(&g.name);
+            body.push_str("]\n");
+            for p in &g.paths {
+                body.push_str(&p.to_string_lossy());
+                body.push('\n');
+            }
+        }
+        let _ = fs::write(&file, body);
+    }
+}
+
 fn write_path_list(name: &str, paths: &[PathBuf]) {
     if let Some(file) = config_file(name) {
         if let Some(parent) = file.parent() {
@@ -9782,8 +10353,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\n",
-            p.terminal, p.term_history, p.preview, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history
+            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\n",
+            p.terminal, p.term_history, p.preview, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled
         );
         let _ = fs::write(&file, body);
     }
@@ -9917,6 +10488,7 @@ fn load_prefs() -> Prefs {
                         }
                     }
                     "palette_history" => p.palette_history = on,
+                    "groups_enabled" => p.groups_enabled = on,
                     _ => {}
                 }
             }
