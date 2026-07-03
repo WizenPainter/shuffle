@@ -10690,7 +10690,16 @@ fn main() {
         return;
     }
 
-    Application::new().run(|cx: &mut App| {
+    let app = Application::new();
+    // Re-open the window when the Dock icon is clicked after the last window was
+    // closed (otherwise the app stays running with no way to show it).
+    app.on_reopen(|cx: &mut App| {
+        if cx.windows().is_empty() {
+            open_main_window(cx);
+            cx.activate(true);
+        }
+    });
+    app.run(|cx: &mut App| {
         // Load the saved theme into both the render-side copy and the global.
         let saved_theme = load_theme();
         set_active_theme(saved_theme);
@@ -10737,35 +10746,37 @@ fn main() {
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &OpenSettings, cx: &mut App| open_settings_window(cx));
 
-        let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
-
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                titlebar: Some(TitlebarOptions {
-                    // No title text; transparent so our own colored bar shows.
-                    title: None,
-                    appears_transparent: true,
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            |window, cx| {
-                let view = cx.new(|cx| {
-                    let mut finder = Shuffle::new(load_last_dir(), cx);
-                    finder.prewarm_icons(cx);
-                    finder.build_index(cx);
-                    // Fill the initial folder's metadata in the background.
-                    finder.reload_pane(0, cx);
-                    finder
-                });
-                // Focus the root so it receives keystrokes (Cmd+P) immediately.
-                window.focus(&view.read(cx).focus);
-                view
-            },
-        )
-        .unwrap();
-
+        open_main_window(cx);
         cx.activate(true);
     });
+}
+
+/// Open the main explorer window.
+fn open_main_window(cx: &mut App) {
+    let bounds = Bounds::centered(None, size(px(1100.0), px(720.0)), cx);
+    let _ = cx.open_window(
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            titlebar: Some(TitlebarOptions {
+                // No title text; transparent so our own colored bar shows.
+                title: None,
+                appears_transparent: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        |window, cx| {
+            let view = cx.new(|cx| {
+                let mut finder = Shuffle::new(load_last_dir(), cx);
+                finder.prewarm_icons(cx);
+                finder.build_index(cx);
+                // Fill the initial folder's metadata in the background.
+                finder.reload_pane(0, cx);
+                finder
+            });
+            // Focus the root so it receives keystrokes (Cmd+P) immediately.
+            window.focus(&view.read(cx).focus);
+            view
+        },
+    );
 }
