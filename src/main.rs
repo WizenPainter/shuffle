@@ -2477,6 +2477,20 @@ struct Shuffle {
     term_output: Vec<String>,
     term_focused: bool,
     term_scroll: ScrollHandle,
+    /// State of the self-updater's banner. `None` = up to date / not checked /
+    /// dismissed.
+    update: Option<UpdateStatus>,
+}
+
+/// Drives the update banner under the titlebar.
+#[derive(Clone)]
+enum UpdateStatus {
+    /// A newer release (tag like "v0.2.4") is available to install.
+    Available(String),
+    /// The user clicked Update; we're downloading + verifying it now.
+    Downloading(String),
+    /// The install couldn't complete; carries a short reason.
+    Failed(String),
 }
 
 impl Shuffle {
@@ -2558,6 +2572,7 @@ impl Shuffle {
             term_output: Vec::new(),
             term_focused: false,
             term_scroll: ScrollHandle::new(),
+            update: None,
         }
     }
 
@@ -3970,6 +3985,205 @@ impl Shuffle {
             .ok();
         })
         .detach();
+    }
+
+    /// Quietly ask GitHub for the latest published release and, if it's newer
+    /// than this build (and the user hasn't dismissed that exact version),
+    /// surface the update banner. Best-effort: any failure (offline, timeout,
+    /// unparseable) just leaves the banner hidden. Never blocks the UI.
+    fn check_for_update(&self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let body = cx
+                .background_spawn(async move {
+                    Command::new("curl")
+                        .args([
+                            "-sL",
+                            "--max-time",
+                            "8",
+                            "-H",
+                            "Accept: application/vnd.github+json",
+                            &format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest"),
+                        ])
+                        .output()
+                        .ok()
+                        .filter(|o| o.status.success())
+                        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                })
+                .await;
+            let Some(body) = body else { return };
+            let Some(tag) = json_string_field(&body, "tag_name") else { return };
+            // Only surface real upgrades over the running build.
+            if parse_version(&tag) <= parse_version(env!("CARGO_PKG_VERSION")) {
+                return;
+            }
+            // Respect a prior "dismiss" of this exact version so we don't nag.
+            if config_string("update_skip.txt").as_deref() == Some(tag.trim()) {
+                return;
+            }
+            this.update(cx, |this, cx| {
+                this.update = Some(UpdateStatus::Available(tag.trim().to_string()));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Hide the update banner and remember the dismissed version so it doesn't
+    /// come back on the next launch (until a still-newer release appears).
+    fn dismiss_update(&mut self, cx: &mut Context<Self>) {
+        if let Some(UpdateStatus::Available(ver)) = self.update.take() {
+            write_config_string("update_skip.txt", &ver);
+        }
+        cx.notify();
+    }
+
+    /// Download the newest release, verify it's genuinely ours (notarized +
+    /// signed by our Team ID), then swap the running bundle and relaunch. Kicked
+    /// off by the banner's "Update" button. All network/disk work is off-thread;
+    /// the actual replace happens in a tiny helper that waits for us to quit.
+    fn start_self_update(&mut self, cx: &mut Context<Self>) {
+        let ver = match &self.update {
+            Some(UpdateStatus::Available(v)) => v.clone(),
+            _ => return,
+        };
+        let bundle = current_app_bundle();
+        self.update = Some(UpdateStatus::Downloading(ver));
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let prepared = cx
+                .background_spawn(async move {
+                    let bundle = bundle.ok_or_else(|| "couldn't locate the app bundle".to_string())?;
+                    let ready = download_and_verify_update()?;
+                    Ok::<_, String>((bundle, ready))
+                })
+                .await;
+            match prepared {
+                Ok((bundle, ready)) => {
+                    if let Err(e) = launch_swap_and_relaunch(&bundle, &ready) {
+                        ready.detach(); // unmount the dmg we couldn't hand off
+                        this.update(cx, |this, cx| {
+                            this.update = Some(UpdateStatus::Failed(e));
+                            cx.notify();
+                        })
+                        .ok();
+                        return;
+                    }
+                    // Helper is armed and waiting for us to exit; quit so it can
+                    // replace the bundle and relaunch the new version.
+                    let _ = cx.update(|cx| cx.quit());
+                }
+                Err(e) => {
+                    this.update(cx, |this, cx| {
+                        this.update = Some(UpdateStatus::Failed(e));
+                        cx.notify();
+                    })
+                    .ok();
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// The slim update bar shown under the titlebar (available / downloading /
+    /// failed). Returns `None` when there's nothing to show.
+    fn render_update_banner(&self, cx: &Context<Self>) -> Option<AnyElement> {
+        let status = self.update.clone()?;
+        let t = theme();
+        let bar = div()
+            .flex_none()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_3()
+            .px_4()
+            .py_1p5()
+            .bg(rgb(t.accent))
+            .text_color(rgb(0xffffff))
+            .text_xs();
+
+        let bar = match status {
+            UpdateStatus::Available(ver) => bar
+                .child(div().child("↑").text_sm())
+                .child(div().flex_1().child(format!(
+                    "Shuffle {ver} is available (you have v{}).",
+                    env!("CARGO_PKG_VERSION")
+                )))
+                .child(
+                    div()
+                        .id("update-install")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgba(0xffffff33))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgba(0xffffff55)))
+                        .child("Update")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.start_self_update(cx)),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("update-dismiss")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgba(0xffffff33)))
+                        .child("✕")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| this.dismiss_update(cx)),
+                        ),
+                ),
+            UpdateStatus::Downloading(ver) => bar.child(div().child("↓").text_sm()).child(
+                div()
+                    .flex_1()
+                    .child(format!("Downloading Shuffle {ver}… the app will relaunch itself.")),
+            ),
+            UpdateStatus::Failed(reason) => bar
+                .child(div().child("⚠").text_sm())
+                .child(div().flex_1().child(format!("Update failed: {reason}.")))
+                .child(
+                    div()
+                        .id("update-manual")
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgba(0xffffff33))
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgba(0xffffff55)))
+                        .child("Download manually")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                let _ = Command::new("open").arg(DMG_URL).spawn();
+                                this.update = None;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("update-dismiss-failed")
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|s| s.bg(rgba(0xffffff33)))
+                        .child("✕")
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _, _, cx| {
+                                this.update = None;
+                                cx.notify();
+                            }),
+                        ),
+                ),
+        };
+        Some(bar.into_any_element())
     }
 
     /// Current scrolled distance from the top, in pixels.
@@ -8064,8 +8278,14 @@ impl Render for Shuffle {
             // A slim titlebar strip in the app's own background color. With the
             // OS titlebar transparent, this is what shows behind the traffic
             // lights, and it keeps the content clear of them.
-            .child(div().flex_none().w_full().h(px(TITLEBAR_H)).bg(rgb(t.bg)))
-            .child(main_row);
+            .child(div().flex_none().w_full().h(px(TITLEBAR_H)).bg(rgb(t.bg)));
+
+        // The update bar (available / downloading / failed), just under the titlebar.
+        if let Some(banner) = self.render_update_banner(cx) {
+            root = root.child(banner);
+        }
+
+        root = root.child(main_row);
 
         // Terminal-mode command bar at the bottom.
         if prefs().terminal {
@@ -10293,6 +10513,230 @@ fn write_string_list(name: &str, items: &[String]) {
     }
 }
 
+/// Read a single-line config value (trimmed), or `None` if absent/empty.
+fn config_string(name: &str) -> Option<String> {
+    let file = config_file(name)?;
+    let s = fs::read_to_string(&file).ok()?;
+    let s = s.trim().to_string();
+    if s.is_empty() {
+        None
+    } else {
+        Some(s)
+    }
+}
+
+/// Write a single-line config value.
+fn write_config_string(name: &str, value: &str) {
+    if let Some(file) = config_file(name) {
+        if let Some(parent) = file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let _ = fs::write(&file, value.as_bytes());
+    }
+}
+
+// --- Update check (GitHub "latest release" → dismissible banner) ---
+
+/// The GitHub repo whose latest release drives the update banner.
+const GITHUB_REPO: &str = "WizenPainter/shuffle";
+/// The stable "always the newest DMG" download link (same one the website uses).
+const DMG_URL: &str = "https://github.com/WizenPainter/shuffle/releases/latest/download/Shuffle.dmg";
+
+/// Parse a version like "v0.2.3" / "0.2.3" into numeric components for
+/// comparison. `Vec<u32>` compares lexicographically, so [0,2,4] > [0,2,3].
+/// Non-numeric junk in a component parses as 0 rather than failing.
+fn parse_version(s: &str) -> Vec<u32> {
+    s.trim()
+        .trim_start_matches(['v', 'V'])
+        .split('.')
+        .map(|p| {
+            p.chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .unwrap_or(0)
+        })
+        .collect()
+}
+
+/// Pull a top-level string field out of a JSON blob without a JSON dependency:
+/// find `"key"`, then the first `"..."` after the following `:`. Good enough for
+/// GitHub's `tag_name`; not a general JSON parser.
+fn json_string_field(body: &str, key: &str) -> Option<String> {
+    let pat = format!("\"{key}\"");
+    let after_key = &body[body.find(&pat)? + pat.len()..];
+    let after_colon = &after_key[after_key.find(':')? + 1..];
+    let open = after_colon.find('"')? + 1;
+    let rest = &after_colon[open..];
+    let close = rest.find('"')?;
+    Some(rest[..close].to_string())
+}
+
+/// The Apple Developer Team that legitimately signs Shuffle. The self-updater
+/// refuses to install a download signed by anyone else, so a tampered or
+/// spoofed DMG can never replace the app.
+const EXPECTED_TEAM_ID: &str = "Z69U4AQSH3";
+
+/// A downloaded, mounted, and verified update, ready to be swapped in.
+struct PreparedUpdate {
+    dmg: PathBuf,
+    mount: PathBuf,
+    app: PathBuf,
+}
+
+impl PreparedUpdate {
+    /// Unmount the update DMG (used on the error path).
+    fn detach(&self) {
+        let _ = Command::new("hdiutil")
+            .args(["detach", "-quiet"])
+            .arg(&self.mount)
+            .status();
+    }
+}
+
+/// The `.app` bundle the running process lives in (…/Shuffle.app), if it can be
+/// located from the executable path.
+fn current_app_bundle() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    exe.ancestors()
+        .find(|a| a.extension().is_some_and(|e| e == "app"))
+        .map(Path::to_path_buf)
+}
+
+/// Download the latest DMG, mount it, and verify the app inside is notarized and
+/// signed by our Team ID. Returns the mounted, verified update or a short reason
+/// on failure. Runs entirely off the UI thread.
+fn download_and_verify_update() -> Result<PreparedUpdate, String> {
+    let dir = std::env::temp_dir().join("shuffle-update");
+    let _ = fs::create_dir_all(&dir);
+    let dmg = dir.join("Shuffle-latest.dmg");
+
+    // Download (follow redirects, fail on HTTP errors, cap the time).
+    let ok = Command::new("curl")
+        .args(["-sL", "--fail", "--max-time", "180", "-o"])
+        .arg(&dmg)
+        .arg(DMG_URL)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        return Err("couldn't download the update".to_string());
+    }
+
+    // Mount it read-only.
+    let out = Command::new("hdiutil")
+        .args(["attach", "-nobrowse", "-readonly", "-noverify"])
+        .arg(&dmg)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        return Err("couldn't mount the update".to_string());
+    }
+    let mount = parse_hdiutil_mount(&String::from_utf8_lossy(&out.stdout))
+        .ok_or_else(|| "couldn't find the mounted volume".to_string())?;
+
+    let app = mount.join("Shuffle.app");
+    let prepared = PreparedUpdate { dmg, mount, app: app.clone() };
+    if !app.exists() {
+        prepared.detach();
+        return Err("the update didn't contain Shuffle.app".to_string());
+    }
+    // Only install a download that is genuinely, verifiably ours.
+    if let Err(e) = verify_app(&app) {
+        prepared.detach();
+        return Err(e);
+    }
+    Ok(prepared)
+}
+
+/// Confirm `app` has a valid signature, passes Gatekeeper (i.e. is notarized),
+/// and is signed by our Team ID. Any of these failing aborts the update.
+fn verify_app(app: &Path) -> Result<(), String> {
+    let sig_ok = Command::new("codesign")
+        .args(["--verify", "--deep", "--strict"])
+        .arg(app)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !sig_ok {
+        return Err("the update's signature was invalid".to_string());
+    }
+
+    let gatekeeper_ok = Command::new("spctl")
+        .args(["-a", "-t", "exec", "-vv"])
+        .arg(app)
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !gatekeeper_ok {
+        return Err("the update wasn't notarized by Apple".to_string());
+    }
+
+    // codesign prints the signing info to stderr.
+    let info = Command::new("codesign")
+        .args(["-dv", "--verbose=4"])
+        .arg(app)
+        .output()
+        .map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&info.stderr);
+    let team_matches = text
+        .lines()
+        .any(|l| l.trim() == format!("TeamIdentifier={EXPECTED_TEAM_ID}"));
+    if !team_matches {
+        return Err("the update was signed by an unexpected developer".to_string());
+    }
+    Ok(())
+}
+
+/// Parse `hdiutil attach` output for the `/Volumes/…` mount point (the volume
+/// name may contain spaces, so take everything from `/Volumes/` to line end).
+fn parse_hdiutil_mount(output: &str) -> Option<PathBuf> {
+    output.lines().find_map(|line| {
+        line.find("/Volumes/")
+            .map(|i| PathBuf::from(line[i..].trim_end()))
+    })
+}
+
+/// Write and launch a detached helper that waits for this process to quit, then
+/// replaces the installed bundle with the verified update and relaunches it. If
+/// the replace fails (e.g. no write permission), it falls back to opening the
+/// DMG so the user can install by hand. We must do this from a separate process
+/// because a running app can't overwrite its own executable.
+fn launch_swap_and_relaunch(bundle: &Path, ready: &PreparedUpdate) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let pid = std::process::id();
+    let script = std::env::temp_dir().join("shuffle-selfupdate.sh");
+    // $1 DEST bundle  $2 SRC app  $3 MOUNT  $4 DMG  $5 PID  $6 fallback URL
+    let body = r#"#!/bin/bash
+DEST="$1"; SRC="$2"; MOUNT="$3"; DMG="$4"; PID="$5"; URL="$6"
+# Wait (up to ~20s) for the old app to exit before touching its bundle.
+for _ in $(seq 1 200); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
+if ditto "$SRC" "$DEST.updnew" 2>/dev/null && rm -rf "$DEST" 2>/dev/null && mv "$DEST.updnew" "$DEST" 2>/dev/null; then
+  hdiutil detach "$MOUNT" -quiet 2>/dev/null
+  rm -f "$DMG" 2>/dev/null
+  open "$DEST"
+else
+  rm -rf "$DEST.updnew" 2>/dev/null
+  hdiutil detach "$MOUNT" -quiet 2>/dev/null
+  open "$DMG" 2>/dev/null || open "$URL" 2>/dev/null
+fi
+"#;
+    fs::write(&script, body).map_err(|e| e.to_string())?;
+    let _ = fs::set_permissions(&script, fs::Permissions::from_mode(0o755));
+
+    Command::new("/bin/bash")
+        .arg(&script)
+        .arg(bundle)
+        .arg(&ready.app)
+        .arg(&ready.mount)
+        .arg(&ready.dmg)
+        .arg(pid.to_string())
+        .arg(DMG_URL)
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 /// Load sidebar groups from `groups.txt`. A `[name]` line starts a group; the
 /// lines after it are member paths, until the next `[name]`.
 fn load_groups() -> Vec<Group> {
@@ -10807,6 +11251,8 @@ fn open_main_window(cx: &mut App) {
                 let mut finder = Shuffle::new(load_last_dir(), cx);
                 finder.prewarm_icons(cx);
                 finder.build_index(cx);
+                // Quietly check GitHub for a newer release (shows a banner if so).
+                finder.check_for_update(cx);
                 // Fill the initial folder's metadata in the background.
                 finder.reload_pane(0, cx);
                 finder
