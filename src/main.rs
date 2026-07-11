@@ -9889,21 +9889,58 @@ struct FileIndex {
 /// Non-hidden directory names we never descend into (huge + irrelevant to file
 /// search). Hidden dirs (dotfiles like .bun, .pyenv, .cargo, .git, .Trash) are
 /// skipped wholesale via `skip_hidden`, which removes the bulk of the noise.
-const SKIP_DIRS: &[&str] = &["node_modules", "Library"];
+///
+/// The build-output/dependency dirs below are the big win on a developer
+/// machine: a single `~/Documents/Projects` can hide hundreds of thousands of
+/// generated files under `target`/`build`/`Pods`/etc. Indexing those bloats the
+/// walk (slow launch), the memory, and the search results. We skip them the way
+/// `ripgrep`/`fd` do by default.
+const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    "Library",
+    // Build outputs / generated artifacts.
+    "target",       // Rust/Java
+    "build",        // Gradle/CMake/Xcode/etc.
+    "dist",         // JS/Python bundles
+    "DerivedData",  // Xcode
+    "Pods",         // CocoaPods
+    "Carthage",     // Carthage
+    "__pycache__",  // Python bytecode
+    // Vendored dependencies.
+    "vendor",
+    "bower_components",
+];
 
 impl FileIndex {
     /// Walk `root` in parallel (jwalk), skipping hidden dirs and noise dirs,
     /// into a flat list. Runs off the UI thread.
     fn build(root: PathBuf) -> Self {
+        // Leave a couple of cores for the UI thread so the (still fairly large)
+        // first-launch walk can't starve rendering and make Cmd+P feel frozen.
+        let threads = std::thread::available_parallelism()
+            .map(|n| (n.get().saturating_sub(2)).max(2))
+            .unwrap_or(2);
         let walker = jwalk::WalkDir::new(&root)
             .skip_hidden(true)
-            .process_read_dir(|_depth, _path, _state, children| {
+            .parallelism(jwalk::Parallelism::RayonNewPool(threads))
+            .process_read_dir(|_depth, path, _state, children| {
+                // The Go module cache (`~/go/pkg`, hundreds of thousands of files)
+                // is the single biggest source of index noise, but `pkg` is a
+                // legitimate source-dir name in Go projects — so only skip it
+                // when its parent directory is literally `go`.
+                let parent_is_go = path.file_name().is_some_and(|n| n == "go");
                 children.retain(|res| match res {
                     Ok(e) => {
                         if e.file_type().is_dir() {
                             let name = e.file_name();
                             let name = name.to_string_lossy();
-                            !SKIP_DIRS.contains(&name.as_ref())
+                            if SKIP_DIRS.contains(&name.as_ref()) {
+                                return false;
+                            }
+                            if parent_is_go && name == "pkg" {
+                                return false;
+                            }
+                            true
                         } else {
                             true
                         }
