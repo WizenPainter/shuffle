@@ -14,12 +14,14 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    actions, anchored, div, img, point, prelude::*, px, relative, rgb, rgba, size, uniform_list, AnyElement, App,
+    actions, anchored, div, ease_out_quint, img, point, prelude::*, px, relative, rgb, rgba, size,
+    uniform_list, Animation, AnimationExt, AnyElement, App,
     Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ExternalPaths, FocusHandle, ImageSource,
     KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
     PathPromptOptions, Rgba,
@@ -30,7 +32,8 @@ use objc2::runtime::NSObjectProtocol;
 use objc2::{define_class, AllocAnyThread, MainThreadOnly};
 use objc2_app_kit::{
     NSBitmapImageRep, NSCompositingOperation, NSDeviceRGBColorSpace, NSDraggingContext,
-    NSDraggingSession, NSDraggingSource, NSDragOperation, NSGraphicsContext, NSImage, NSWorkspace,
+    NSDraggingSession, NSDraggingSource, NSDragOperation, NSGraphicsContext, NSImage,
+    NSPDFImageRep, NSWorkspace,
 };
 use objc2_foundation::{NSData, NSFileManager, NSObject, NSString, NSURL};
 use rayon::prelude::*;
@@ -315,6 +318,8 @@ struct Prefs {
     term_history: bool,
     /// Show a file preview in the inspector when a file is selected.
     preview: bool,
+    /// Show ‹ › page arrows on multi-page PDF previews in the inspector.
+    preview_pages: bool,
     /// Show file information in the inspector when a file is selected.
     info: bool,
     /// Show the leading ".." row that goes up one level.
@@ -329,6 +334,8 @@ struct Prefs {
     groups_enabled: bool,
     /// Show the always-on "Filter" pill in the bottom-right (/ still works).
     show_filter_button: bool,
+    /// Show a live frame-rate meter in the top-right (debug; costs some CPU).
+    show_fps: bool,
 }
 
 impl Default for Prefs {
@@ -337,6 +344,7 @@ impl Default for Prefs {
             terminal: false,
             term_history: false,
             preview: false,
+            preview_pages: true,
             info: false,
             show_parent: true,
             sidebar_collapsed: false,
@@ -344,6 +352,7 @@ impl Default for Prefs {
             palette_history: false,
             groups_enabled: false,
             show_filter_button: true,
+            show_fps: false,
         }
     }
 }
@@ -357,6 +366,7 @@ thread_local! {
         terminal: false,
         term_history: false,
         preview: false,
+        preview_pages: true,
         info: false,
         show_parent: true,
         sidebar_collapsed: false,
@@ -364,6 +374,7 @@ thread_local! {
         palette_history: false,
         groups_enabled: false,
         show_filter_button: true,
+        show_fps: false,
     }) };
 }
 
@@ -1163,6 +1174,19 @@ impl Settings {
                 }),
             ))
             .child(toggle_row(
+                "tg-preview-pages",
+                "Preview page controls",
+                "Show ‹ › arrows under multi-page PDF previews to flip through \
+                 the pages without opening the file.",
+                p.preview_pages,
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut np = prefs();
+                    np.preview_pages = !np.preview_pages;
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }),
+            ))
+            .child(toggle_row(
                 "tg-info",
                 "Information",
                 "Click a file once to see its details (kind, size, dates, \
@@ -1223,6 +1247,20 @@ impl Settings {
                 cx.listener(|_, _: &ClickEvent, _, cx| {
                     let mut np = prefs();
                     np.show_filter_button = !np.show_filter_button;
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }),
+            ))
+            .child(toggle_row(
+                "tg-show-fps",
+                "Frame rate meter",
+                "Show a live FPS readout in the top-right of the explorer window. \
+                 Forces continuous redraws to measure them, so it uses some CPU \
+                 while on — meant for checking smoothness, not everyday use.",
+                p.show_fps,
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut np = prefs();
+                    np.show_fps = !np.show_fps;
                     apply_prefs(np, cx);
                     cx.notify();
                 }),
@@ -2057,6 +2095,12 @@ const TITLEBAR_H: f32 = 34.0;
 const TAB_H: f32 = 30.0;
 /// Fixed list-row height (so marquee selection can map y-coordinates to rows).
 const ROW_H: f32 = 24.0;
+/// Overlay scrollbar: stays solid this long after the last scroll…
+const SCROLLBAR_LINGER: f32 = 1.0;
+/// …then fades out over this long (seconds).
+const SCROLLBAR_FADE: f32 = 0.35;
+/// Duration of the pane split open/close animation.
+const SPLIT_ANIM_MS: u64 = 220;
 
 /// The four resizable columns of the main listing.
 #[derive(Clone, Copy, PartialEq)]
@@ -2305,6 +2349,10 @@ struct Tab {
     /// Generation of the latest load, so a stale background metadata fill is
     /// discarded if the user navigated away.
     load_gen: u64,
+    /// Last time this tab's list scrolled; drives the scrollbar's fade-out.
+    last_scroll: Instant,
+    /// Bumped per scroll so the fade-out animation restarts from opaque.
+    scroll_epoch: u64,
 }
 
 impl Tab {
@@ -2334,6 +2382,8 @@ impl Tab {
             col_chain: Vec::new(),
             col_active: 0,
             load_gen: 0,
+            last_scroll: Instant::now(),
+            scroll_epoch: 0,
         }
     }
 }
@@ -2421,6 +2471,15 @@ struct Shuffle {
     split_ratio: f32,
     /// In-progress divider drag: (cursor x at grab, split_ratio at grab).
     divider_drag: Option<(f32, f32)>,
+    /// Bumped whenever the pane layout changes (split created or collapsed) so
+    /// the one-shot open/close width animations restart.
+    split_epoch: usize,
+    /// Set when the split collapses back to one pane: the surviving pane's
+    /// starting width fraction and whether it's anchored to the right edge
+    /// (i.e. the *left* pane was the one removed). Drives the grow animation.
+    collapse_anim: Option<(f32, bool)>,
+    /// True while the scrollbar-fade repaint ticker task is alive.
+    fade_ticker: bool,
     recents: Vec<PathBuf>,
     bookmarks: Vec<PathBuf>,
     /// User-defined sidebar groups (when the feature is enabled).
@@ -2480,6 +2539,8 @@ struct Shuffle {
     /// State of the self-updater's banner. `None` = up to date / not checked /
     /// dismissed.
     update: Option<UpdateStatus>,
+    /// Current page of the inspector's PDF preview (0-based; reset on focus).
+    preview_page: usize,
 }
 
 /// Drives the update banner under the titlebar.
@@ -2538,6 +2599,9 @@ impl Shuffle {
             active_pane: 0,
             split_ratio: 0.5,
             divider_drag: None,
+            split_epoch: 0,
+            collapse_anim: None,
+            fade_ticker: false,
             recents: read_path_list("recents.txt"),
             bookmarks: read_path_list("bookmarks.txt"),
             groups: load_groups(),
@@ -2573,6 +2637,7 @@ impl Shuffle {
             term_focused: false,
             term_scroll: ScrollHandle::new(),
             update: None,
+            preview_page: 0,
         }
     }
 
@@ -4226,8 +4291,13 @@ impl Shuffle {
         cx.notify();
     }
 
-    fn end_scroll_drag(&mut self) {
-        self.scroll_drag = None;
+    fn end_scroll_drag(&mut self, cx: &mut Context<Self>) {
+        // Releasing the thumb counts as the last scroll: starts the fade timer.
+        if let Some(drag) = self.scroll_drag.take() {
+            if drag.pane < self.panes.len() {
+                self.mark_scrolled(drag.pane, cx);
+            }
+        }
     }
 
     // ----- command palette (Cmd+P) -----
@@ -5028,35 +5098,55 @@ impl Shuffle {
         let thumb_h = (viewport * viewport / content).clamp(min_thumb, viewport);
         let thumb_top = (viewport - thumb_h) * (scrolled / max);
 
-        // Brighter while this pane's thumb is being dragged.
+        // macOS-style overlay bar: solid while scrolling or dragging, fades out
+        // shortly after the last scroll, and disappears entirely once faded.
         let dragging = self.scroll_drag.is_some_and(|d| d.pane == pane);
+        let tab = self.tab(pane);
+        let idle = tab.last_scroll.elapsed().as_secs_f32();
+        if !dragging && idle > SCROLLBAR_LINGER + SCROLLBAR_FADE {
+            return None;
+        }
         let color = if dragging {
             rgba(0xffffff66)
         } else {
             rgba(0xffffff33)
         };
 
-        Some(
-            div()
-                .id(("scrollbar-thumb", pane))
-                .absolute()
-                .top(px(thumb_top))
-                .right(px(2.0))
-                .w(px(8.0))
-                .h(px(thumb_h))
-                .rounded_full()
-                .bg(color)
-                .cursor(CursorStyle::PointingHand)
-                .hover(|s| s.bg(rgba(0xffffff55)))
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                        this.begin_scroll_drag(pane, f64::from(ev.position.y) as f32);
-                        cx.notify();
-                    }),
-                )
-                .into_any_element(),
-        )
+        let thumb = div()
+            .id(("scrollbar-thumb", pane))
+            .absolute()
+            .top(px(thumb_top))
+            .right(px(2.0))
+            .w(px(8.0))
+            .h(px(thumb_h))
+            .rounded_full()
+            .bg(color)
+            .cursor(CursorStyle::PointingHand)
+            .hover(|s| s.bg(rgba(0xffffff55)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    this.begin_scroll_drag(pane, f64::from(ev.position.y) as f32);
+                    cx.notify();
+                }),
+            );
+
+        if dragging || idle < SCROLLBAR_LINGER {
+            Some(thumb.into_any_element())
+        } else {
+            // Idle: ease the thumb's opacity out. The epoch keys the animation
+            // so each scroll burst restarts the fade from opaque.
+            Some(
+                thumb
+                    .with_animation(
+                        SharedString::from(format!("sb-fade-{pane}-{}", tab.scroll_epoch)),
+                        Animation::new(Duration::from_millis((SCROLLBAR_FADE * 1000.0) as u64))
+                            .with_easing(ease_out_quint()),
+                        move |el, t| el.opacity(1.0 - t),
+                    )
+                    .into_any_element(),
+            )
+        }
     }
 
     fn begin_resize(&mut self, col: Column, x: f32) {
@@ -5622,6 +5712,58 @@ impl Shuffle {
 
     // ----- tabs & split panes -----
 
+    /// Record that the split just collapsed so the surviving pane animates out
+    /// of its old footprint. `removed_left` = the removed pane was the left one
+    /// (the survivor grows leftward from the right edge). Call after removing
+    /// the pane but *before* resetting `split_ratio`.
+    fn begin_collapse_anim(&mut self, removed_left: bool) {
+        let survivor_w = if removed_left {
+            1.0 - self.split_ratio
+        } else {
+            self.split_ratio
+        };
+        self.collapse_anim = Some((survivor_w, removed_left));
+        self.split_epoch += 1;
+    }
+
+    /// Record scroll activity on a pane's list (keeps its overlay scrollbar
+    /// visible) and make sure a low-rate ticker is alive to repaint once the
+    /// fade-out is due — without it the thumb would linger until the next
+    /// unrelated repaint.
+    fn mark_scrolled(&mut self, pane: usize, cx: &mut Context<Self>) {
+        {
+            let tab = self.tab_mut(pane);
+            tab.last_scroll = Instant::now();
+            tab.scroll_epoch += 1;
+        }
+        if self.fade_ticker {
+            return;
+        }
+        self.fade_ticker = true;
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(250))
+                    .await;
+                let all_faded = this.update(cx, |this, cx| {
+                    cx.notify();
+                    let done = this.panes.iter().flat_map(|p| p.tabs.iter()).all(|t| {
+                        t.last_scroll.elapsed().as_secs_f32() > SCROLLBAR_LINGER + SCROLLBAR_FADE
+                    });
+                    if done {
+                        this.fade_ticker = false;
+                    }
+                    done
+                });
+                match all_faded {
+                    Ok(false) => {}
+                    _ => break,
+                }
+            }
+        })
+        .detach();
+    }
+
     /// Open a new tab in `pane`, starting in that pane's current directory.
     fn new_tab_in(&mut self, pane: usize, cx: &mut Context<Self>) {
         let dir = self.tab(pane).current_dir.clone();
@@ -5664,6 +5806,7 @@ impl Shuffle {
             }
         } else if self.panes.len() > 1 {
             self.panes.remove(pane);
+            self.begin_collapse_anim(pane == 0);
             self.split_ratio = 0.5;
         } else {
             return; // last tab of the only pane — keep it
@@ -5680,6 +5823,15 @@ impl Shuffle {
         if from.pane >= self.panes.len() || from.tab >= self.panes[from.pane].tabs.len() {
             return;
         }
+        // Two panes max: a split-zone drop while the canvas is already split
+        // moves the tab to the end of the right pane instead of creating an
+        // invisible third pane.
+        let (to_pane, to_index) = if to_pane >= self.panes.len() && self.panes.len() >= 2 {
+            let right = self.panes.len() - 1;
+            (right, self.panes[right].tabs.len())
+        } else {
+            (to_pane, to_index)
+        };
         let splitting = to_pane >= self.panes.len();
         // Don't bother splitting when the source pane has a single tab and we'd
         // just move it to a brand-new pane (no visible change).
@@ -5703,6 +5855,8 @@ impl Shuffle {
             // New pane on the right with just this tab.
             self.panes.push(Pane { tabs: vec![tab], active: 0 });
             self.split_ratio = 0.5;
+            self.split_epoch += 1;
+            self.collapse_anim = None;
             // Drop the source pane if it's now empty.
             if self.panes[from.pane].tabs.is_empty() {
                 self.panes.remove(from.pane);
@@ -5726,6 +5880,7 @@ impl Shuffle {
                 if from.pane < dst {
                     dst -= 1;
                 }
+                self.begin_collapse_anim(from.pane == 0);
                 self.split_ratio = 0.5;
             }
             self.active_pane = dst;
@@ -5757,7 +5912,11 @@ impl Shuffle {
     fn focus_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
         let gallery = self.tab(pane).view == ViewMode::Gallery;
         self.tab_mut(pane).anchor = Some(path.clone());
+        self.preview_page = 0;
         self.ensure_preview(path.clone(), gallery, cx);
+        if prefs().preview && prefs().preview_pages {
+            self.ensure_pdf_page(path.clone(), 0, cx);
+        }
         self.ensure_info(path, cx);
     }
 
@@ -5881,12 +6040,28 @@ impl Shuffle {
         let has_parent =
             self.tab(pane).find_query.is_none() && prefs().show_parent && self.tab(pane).current_dir.parent().is_some();
         let off = i64::from(has_parent);
-        let paths = self.display_paths(pane);
+        // Only touch the covered rows — cloning every path in the directory per
+        // mouse-move made marquee drags crawl in large folders.
         let mut sel = HashSet::new();
-        for i in i0..=i1 {
-            let di = i - off;
-            if di >= 0 && (di as usize) < paths.len() {
-                sel.insert(paths[di as usize].clone());
+        {
+            let tab = self.tab(pane);
+            let find = tab.find_query.is_some();
+            let len = if find {
+                tab.find_results.len()
+            } else {
+                tab.entries.len()
+            };
+            for i in i0..=i1 {
+                let di = i - off;
+                if di < 0 {
+                    continue;
+                }
+                let di = di as usize;
+                if di >= len {
+                    break;
+                }
+                let ix = if find { tab.find_results[di] } else { di };
+                sel.insert(tab.current_dir.join(&tab.entries[ix].name));
             }
         }
         self.tab_mut(pane).selection = sel;
@@ -6061,6 +6236,8 @@ impl Shuffle {
             _ => ni as usize + offset,
         };
         self.tab(pane).scroll_handle.scroll_to_item(item, ScrollStrategy::Center);
+        // Keyboard scrolling shows the overlay scrollbar too.
+        self.mark_scrolled(pane, cx);
         self.focus_entry(pane, target, cx);
     }
 
@@ -6168,9 +6345,38 @@ impl Shuffle {
         .detach();
     }
 
+    /// Render one page of a PDF for the inspector pager in the background
+    /// (once), recording the document's page count along the way.
+    fn ensure_pdf_page(&self, path: PathBuf, page: usize, cx: &mut Context<Self>) {
+        if !is_pdf(&path) || lookup_pdf_page(&path, page).is_some() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let p = path.clone();
+            let out = cx.background_spawn(async move { render_pdf_page(&p, page) }).await;
+            let _ = this.update(cx, |this, cx| {
+                match out {
+                    Some((img, count)) => {
+                        insert_pdf_page(path.clone(), page, Some(img));
+                        PDF_COUNT_CACHE.with(|c| {
+                            c.borrow_mut().insert(path.clone(), count);
+                        });
+                        // Have the second page ready before the first ‹ › click.
+                        if page == 0 && count > 1 {
+                            this.ensure_pdf_page(path, 1, cx);
+                        }
+                    }
+                    None => insert_pdf_page(path, page, None),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// The right-hand inspector: preview and/or information for the selected
     /// file. `None` when neither feature is on or nothing is selected.
-    fn render_inspector(&self, _cx: &Context<Self>) -> Option<AnyElement> {
+    fn render_inspector(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let p = prefs();
         // In Gallery view the big preview already shows, so don't duplicate it
         // in the side inspector even when the Preview toggle is on.
@@ -6202,29 +6408,119 @@ impl Shuffle {
             );
 
         if show_preview {
-            let body: AnyElement = match lookup_preview(&sel) {
-                Some(Some(handle)) => img(ImageSource::Render(handle))
+            // Multi-page PDFs: show the natively rendered current page when the
+            // pager is on, falling back to the QuickLook thumbnail (page 1)
+            // while it builds.
+            let paging = p.preview_pages && is_pdf(&sel);
+            let page_count = if paging { lookup_pdf_count(&sel) } else { None };
+            let page = self
+                .preview_page
+                .min(page_count.unwrap_or(1).saturating_sub(1));
+            let page_img = if paging {
+                lookup_pdf_page(&sel, page).flatten()
+            } else {
+                None
+            };
+            let handle = page_img.or_else(|| lookup_preview(&sel).flatten());
+            let body: AnyElement = match handle {
+                Some(handle) => img(ImageSource::Render(handle))
                     .max_w(px(288.0))
                     .max_h(px(360.0))
                     .object_fit(ObjectFit::Contain)
                     .into_any_element(),
                 // Not ready yet or unavailable → show the file's icon.
-                _ => icon_element_sized(&sel, false, 96.0),
+                None => icon_element_sized(&sel, false, 96.0),
             };
-            col = col.child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .w_full()
-                    .min_h(px(120.0))
-                    .p_2()
-                    .rounded_md()
-                    // White "page" so document/text previews (black text, often
-                    // transparent background) stay readable on dark themes.
-                    .bg(rgb(0xffffff))
-                    .child(body),
-            );
+            let preview_box = div()
+                .relative()
+                .flex()
+                .items_center()
+                .justify_center()
+                .w_full()
+                .min_h(px(120.0))
+                .p_2()
+                .rounded_md()
+                // White "page" so document/text previews (black text, often
+                // transparent background) stay readable on dark themes.
+                .bg(rgb(0xffffff))
+                .child(body);
+
+            // Finder-style ‹ 2 / 14 › pill over the bottom of the preview.
+            if let Some(count) = page_count.filter(|&c| c > 1) {
+                let prev_sel = sel.clone();
+                let next_sel = sel.clone();
+                let pager_btn = |id: &'static str, label: &'static str, enabled: bool| {
+                    div()
+                        .id(id)
+                        .px_1p5()
+                        .rounded_full()
+                        .cursor_pointer()
+                        .text_color(if enabled {
+                            rgba(0xffffffff)
+                        } else {
+                            rgba(0xffffff44)
+                        })
+                        .when(enabled, |s| s.hover(|s| s.bg(rgba(0xffffff33))))
+                        .child(label)
+                };
+                col = col.child(
+                    preview_box.child(
+                        div()
+                            .absolute()
+                            .bottom_2()
+                            .left_0()
+                            .right_0()
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .px_1()
+                                    .py_0p5()
+                                    .rounded_full()
+                                    .bg(rgba(0x000000aa))
+                                    .text_xs()
+                                    .child(pager_btn("pdf-prev", "‹", page > 0).on_click(
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            if this.preview_page > 0 {
+                                                this.preview_page -= 1;
+                                                let pg = this.preview_page;
+                                                this.ensure_pdf_page(prev_sel.clone(), pg, cx);
+                                                if pg > 0 {
+                                                    this.ensure_pdf_page(prev_sel.clone(), pg - 1, cx);
+                                                }
+                                                cx.notify();
+                                            }
+                                        }),
+                                    ))
+                                    .child(
+                                        div()
+                                            .text_color(rgba(0xffffffdd))
+                                            .child(format!("{} / {}", page + 1, count)),
+                                    )
+                                    .child(pager_btn("pdf-next", "›", page + 1 < count).on_click(
+                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                            let count =
+                                                lookup_pdf_count(&next_sel).unwrap_or(1);
+                                            if this.preview_page + 1 < count {
+                                                this.preview_page += 1;
+                                                let pg = this.preview_page;
+                                                this.ensure_pdf_page(next_sel.clone(), pg, cx);
+                                                if pg + 1 < count {
+                                                    this.ensure_pdf_page(next_sel.clone(), pg + 1, cx);
+                                                }
+                                                cx.notify();
+                                            }
+                                        }),
+                                    )),
+                            ),
+                    ),
+                );
+            } else {
+                col = col.child(preview_box);
+            }
         }
 
         if p.info {
@@ -6904,7 +7200,7 @@ impl Shuffle {
         if self.begin_section(&mut items, "FAVORITES", collapsed, cx) {
             for (label, slug) in SIDEBAR_FAVORITES {
                 let path = fav_path(slug);
-                if !path.is_dir() {
+                if !cached_is_dir(&path) {
                     continue;
                 }
                 push_nav(
@@ -7063,7 +7359,7 @@ impl Shuffle {
         }
 
         // --- Cloud (Dropbox, Google Drive, iCloud, …) ---
-        let cloud = cloud_locations();
+        let (cloud, volumes) = sidebar_locations();
         if !cloud.is_empty() && self.begin_section(&mut items, "CLOUD", collapsed, cx) {
             for (label, path) in cloud {
                 let icon_key = path.to_string_lossy().into_owned();
@@ -7093,7 +7389,7 @@ impl Shuffle {
                 current,
                 collapsed,
             );
-            for (label, path) in mounted_volumes() {
+            for (label, path) in volumes {
                 let icon_key = path.to_string_lossy().into_owned();
                 push_nav(&mut items, cx, &mut key, label, icon_key, path, current, collapsed);
             }
@@ -7398,22 +7694,54 @@ impl Shuffle {
         let mut row = div().flex_1().flex().min_w_0().h_full().relative();
 
         if self.panes.len() == 1 {
-            row = row.child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(self.render_pane(0, cx)),
-            );
+            // After a split collapses, the survivor eases from its old width to
+            // full; anchored right when the *left* pane was the one closed, so
+            // it grows toward where its sibling was.
+            if let Some((start_w, anchor_right)) = self.collapse_anim {
+                if anchor_right {
+                    row = row.justify_end();
+                }
+                row = row.child(
+                    div()
+                        .flex_none()
+                        .min_w_0()
+                        .h_full()
+                        .child(self.render_pane(0, cx))
+                        .with_animation(
+                            ("split-close", self.split_epoch),
+                            Animation::new(Duration::from_millis(SPLIT_ANIM_MS))
+                                .with_easing(ease_out_quint()),
+                            move |el, t| el.w(relative(start_w + (1.0 - start_w) * t)),
+                        ),
+                );
+            } else {
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .child(self.render_pane(0, cx)),
+                );
+            }
         } else {
+            // On split creation the left pane eases from full width down to the
+            // ratio, so the right pane slides in from the edge. Once finished
+            // the animation pins at t=1, i.e. exactly `split_ratio`, which the
+            // divider drag then updates live.
+            let ratio = self.split_ratio;
             row = row
                 .child(
                     div()
                         .flex_none()
-                        .w(relative(self.split_ratio))
                         .min_w_0()
                         .h_full()
-                        .child(self.render_pane(0, cx)),
+                        .child(self.render_pane(0, cx))
+                        .with_animation(
+                            ("split-open", self.split_epoch),
+                            Animation::new(Duration::from_millis(SPLIT_ANIM_MS))
+                                .with_easing(ease_out_quint()),
+                            move |el, t| el.w(relative(1.0 + (ratio - 1.0) * t)),
+                        ),
                 )
                 .child(self.render_divider(cx))
                 .child(
@@ -7453,6 +7781,8 @@ impl Shuffle {
 
     /// The draggable divider between two panes.
     fn render_divider(&self, cx: &Context<Self>) -> impl IntoElement {
+        // Accent + slightly thicker while grabbed, so the drag feels "held".
+        let dragging = self.divider_drag.is_some();
         div()
             .id("pane-divider")
             .flex_none()
@@ -7461,7 +7791,17 @@ impl Shuffle {
             .flex()
             .justify_center()
             .cursor(CursorStyle::ResizeLeftRight)
-            .child(div().w(px(1.0)).h_full().bg(rgb(theme().border_strong)))
+            .child(
+                div()
+                    .w(px(if dragging { 2.0 } else { 1.0 }))
+                    .h_full()
+                    .bg(if dragging {
+                        rgb(theme().accent)
+                    } else {
+                        rgb(theme().border_strong)
+                    }),
+            )
+            .when(dragging, |s| s.bg(Theme::alpha(theme().accent, 0x22)))
             .hover(|s| s.bg(rgb(theme().hover)))
             .on_mouse_down(
                 MouseButton::Left,
@@ -7520,6 +7860,7 @@ impl Shuffle {
                     .text_color(if active { rgb(t.text) } else { rgb(t.text_muted) })
                     .bg(if active { rgb(t.surface) } else { rgba(0x00000000) })
                     .hover(|s| s.bg(rgb(t.hover)))
+                    .active(|s| s.bg(rgb(t.selected)))
                     // Drag this tab (live floating preview).
                     .on_drag(drag, move |_, _, _, cx| {
                         cx.new(|_| TabDragPreview {
@@ -7588,6 +7929,7 @@ impl Shuffle {
                     .cursor_pointer()
                     .text_color(rgb(t.text_muted))
                     .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+                    .active(|s| s.bg(rgb(t.selected)))
                     .child("+")
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.new_tab_in(pane, cx);
@@ -7659,6 +8001,15 @@ impl Shuffle {
         let pane_dir = tab.current_dir.clone();
         let total_w =
             self.widths.name + self.widths.kind + self.widths.date + self.widths.size + 24.0;
+        // Only engage horizontal scrolling when the columns genuinely overflow
+        // the pane — otherwise the small x component of a trackpad flick
+        // jiggles the listing sideways while scrolling vertically.
+        let h_vw = f64::from(h_scroll.bounds().size.width) as f32;
+        let h_overflows = h_vw <= 1.0 || total_w > h_vw + 1.0;
+        if !h_overflows && h_scroll.offset().x < px(0.0) {
+            let y = h_scroll.offset().y;
+            h_scroll.set_offset(point(px(0.0), y));
+        }
 
                 div()
                     .relative()
@@ -7677,7 +8028,7 @@ impl Shuffle {
                         div()
                             .id(("hscroll", pane))
                             .size_full()
-                            .overflow_x_scroll()
+                            .when(h_overflows, |d| d.overflow_x_scroll())
                             .track_scroll(&h_scroll)
                             .child(
                                 div()
@@ -7869,6 +8220,7 @@ impl Shuffle {
                 .track_scroll(scroll)
                 .on_scroll_wheel(cx.listener(move |this, _: &ScrollWheelEvent, _, cx| {
                     this.active_pane = pane;
+                    this.mark_scrolled(pane, cx);
                     cx.notify()
                 })),
                                             ) // close listing div .child(uniform_list)
@@ -7948,6 +8300,7 @@ impl Shuffle {
                 .track_scroll(scroll)
                 .on_scroll_wheel(cx.listener(move |this, _: &ScrollWheelEvent, _, cx| {
                     this.active_pane = pane;
+                    this.mark_scrolled(pane, cx);
                     cx.notify()
                 })),
             )
@@ -8270,7 +8623,7 @@ impl Render for Shuffle {
                 cx.listener(|this, _, _, cx| {
                     this.drag_candidate = None;
                     this.end_resize();
-                    this.end_scroll_drag();
+                    this.end_scroll_drag(cx);
                     this.divider_drag = None;
                     this.end_marquee(cx);
                 }),
@@ -8312,6 +8665,9 @@ impl Render for Shuffle {
         }
         if self.group_dialog.is_some() {
             root = root.child(self.render_group_dialog(cx));
+        }
+        if prefs().show_fps {
+            root = root.child(fps_overlay());
         }
         root
     }
@@ -8367,7 +8723,7 @@ fn push_bookmark_nav(
     collapsed: bool,
 ) {
     *key += 1;
-    let is_dir = target.is_dir();
+    let is_dir = cached_is_dir(&target);
     let active = is_dir && target.as_path() == current;
     let label = path_label(&target);
     let path_str = display_path(&target);
@@ -8414,7 +8770,7 @@ fn push_group_member(
     collapsed: bool,
 ) {
     *key += 1;
-    let is_dir = target.is_dir();
+    let is_dir = cached_is_dir(&target);
     let active = is_dir && target.as_path() == current;
     let label = path_label(&target);
     let path_str = display_path(&target);
@@ -8848,6 +9204,7 @@ fn nav_item(
         base.bg(rgb(t.surface))
     } else {
         base.hover(|s| s.bg(rgb(t.hover)))
+            .active(|s| s.bg(rgb(t.selected)))
     };
     let base = base.child(icon);
     let base = if collapsed {
@@ -8943,6 +9300,8 @@ fn file_row(
         .when(selected, |s| s.bg(rgb(t.selected)))
         .when(ctx_active && !selected, |s| s.bg(rgb(t.hover)))
         .hover(|s| s.bg(rgb(t.hover)))
+        // Instant press feedback (the click action lands on mouse-up).
+        .active(|s| s.bg(rgb(t.selected)))
         // Press records a drag candidate (promoted to a native OS drag on move)
         // and stops a marquee from starting on the list behind it.
         .on_mouse_down(MouseButton::Left, on_press)
@@ -9037,6 +9396,8 @@ fn icon_cell(
         .when(selected, |s| s.bg(rgb(t.selected)))
         .when(ctx_active && !selected, |s| s.bg(rgb(t.hover)))
         .hover(|s| s.bg(rgb(t.hover)))
+        // Instant press feedback (the click action lands on mouse-up).
+        .active(|s| s.bg(rgb(t.selected)))
         // Press records a drag candidate; moving past the threshold starts a
         // native OS drag (drop into Finder / other apps or back into Shuffle).
         .on_mouse_down(
@@ -9346,6 +9707,132 @@ fn ensure_sidebar_icons() {
     }
 }
 
+thread_local! {
+    /// Render timestamps from the last second, for the FPS meter.
+    static FRAME_TIMES: RefCell<std::collections::VecDeque<Instant>> =
+        RefCell::new(std::collections::VecDeque::new());
+}
+
+/// Record this render and return how many happened in the last second.
+fn fps_sample() -> usize {
+    let now = Instant::now();
+    FRAME_TIMES.with(|q| {
+        let mut q = q.borrow_mut();
+        q.push_back(now);
+        while q.front().is_some_and(|t| now.duration_since(*t) > Duration::from_secs(1)) {
+            q.pop_front();
+        }
+        q.len()
+    })
+}
+
+/// The live FPS readout (Settings → "Frame rate meter"). The repeating no-op
+/// animation forces a redraw every vsync, so the number reflects the real
+/// achievable frame rate rather than going stale between repaints.
+fn fps_overlay() -> AnyElement {
+    let fps = fps_sample();
+    let color = if fps >= 55 {
+        rgb(0x4ade80) // green: smooth
+    } else if fps >= 30 {
+        rgb(0xfacc15) // yellow: noticeable
+    } else {
+        rgb(0xf87171) // red: janky
+    };
+    div()
+        .absolute()
+        .top(px(TITLEBAR_H + 8.0))
+        .right(px(12.0))
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .bg(rgba(0x000000aa))
+        .text_xs()
+        .text_color(color)
+        .child(format!("{fps} fps"))
+        .with_animation(
+            "fps-tick",
+            Animation::new(Duration::from_millis(100)).repeat(),
+            |el, _| el,
+        )
+        .into_any_element()
+}
+
+/// Snapshot of the sidebar's cloud + volume scans, refreshed off-thread.
+static SIDEBAR_SCAN: OnceLock<Mutex<Option<SidebarScan>>> = OnceLock::new();
+static SIDEBAR_SCANNING: AtomicBool = AtomicBool::new(false);
+type SidebarScan = (Instant, Vec<(String, PathBuf)>, Vec<(String, PathBuf)>);
+
+/// The sidebar's cloud providers + mounted volumes, from a short-lived cache.
+/// `render` calls this every frame; the actual `read_dir`/`stat` walk (which
+/// can block for seconds on a stale network mount) runs at most every couple of
+/// seconds, on a background thread. The very first call scans synchronously so
+/// the sidebar is complete on first paint.
+fn sidebar_locations() -> (Vec<(String, PathBuf)>, Vec<(String, PathBuf)>) {
+    const TTL: Duration = Duration::from_secs(2);
+    let cell = SIDEBAR_SCAN.get_or_init(|| Mutex::new(None));
+    let cached = cell.lock().unwrap().clone();
+    match cached {
+        Some((at, cloud, vols)) => {
+            if at.elapsed() > TTL && !SIDEBAR_SCANNING.swap(true, Ordering::SeqCst) {
+                std::thread::spawn(|| {
+                    let fresh = (Instant::now(), cloud_locations(), mounted_volumes());
+                    *SIDEBAR_SCAN.get().unwrap().lock().unwrap() = Some(fresh);
+                    SIDEBAR_SCANNING.store(false, Ordering::SeqCst);
+                });
+            }
+            (cloud, vols)
+        }
+        None => {
+            let cloud = cloud_locations();
+            let vols = mounted_volumes();
+            *cell.lock().unwrap() = Some((Instant::now(), cloud.clone(), vols.clone()));
+            (cloud, vols)
+        }
+    }
+}
+
+/// `stat` results for sidebar rows (bookmarks, group members, favorites),
+/// cached so `render` never touches the filesystem per frame — a single dead
+/// network bookmark would otherwise freeze every repaint. Stale entries are
+/// re-checked on a background thread.
+static DIR_STAT: OnceLock<Mutex<HashMap<PathBuf, (bool, Instant)>>> = OnceLock::new();
+static DIR_STAT_SCANNING: AtomicBool = AtomicBool::new(false);
+
+fn cached_is_dir(path: &Path) -> bool {
+    const TTL: Duration = Duration::from_secs(3);
+    let map = DIR_STAT.get_or_init(|| Mutex::new(HashMap::new()));
+    let hit = map.lock().unwrap().get(path).copied();
+    match hit {
+        Some((v, at)) => {
+            if at.elapsed() > TTL && !DIR_STAT_SCANNING.swap(true, Ordering::SeqCst) {
+                std::thread::spawn(|| {
+                    let map = DIR_STAT.get().unwrap();
+                    let stale: Vec<PathBuf> = {
+                        let m = map.lock().unwrap();
+                        m.iter()
+                            .filter(|(_, (_, at))| at.elapsed() > TTL)
+                            .map(|(p, _)| p.clone())
+                            .collect()
+                    };
+                    for p in stale {
+                        let v = p.is_dir(); // may block; we're off-thread
+                        map.lock().unwrap().insert(p, (v, Instant::now()));
+                    }
+                    DIR_STAT_SCANNING.store(false, Ordering::SeqCst);
+                });
+            }
+            v
+        }
+        None => {
+            // First sighting (startup / newly added): one synchronous stat so
+            // the answer is correct immediately.
+            let v = path.is_dir();
+            map.lock().unwrap().insert(path.to_path_buf(), (v, Instant::now()));
+            v
+        }
+    }
+}
+
 /// Cloud-storage locations macOS syncs to disk: iCloud Drive plus every
 /// provider under `~/Library/CloudStorage` (Dropbox, Google Drive, OneDrive,
 /// Box, …), and a legacy `~/Dropbox` if present. Returns `(label, path)`.
@@ -9649,6 +10136,103 @@ thread_local! {
 
 fn lookup_preview(path: &Path) -> Option<Option<Arc<RenderImage>>> {
     PREVIEW_CACHE.with(|c| c.borrow().get(path).cloned())
+}
+
+thread_local! {
+    /// Rendered PDF pages for the inspector pager: (path, page) → image.
+    /// `None` = that page couldn't be rendered.
+    static PDF_PAGE_CACHE: RefCell<HashMap<(PathBuf, usize), Option<Arc<RenderImage>>>> =
+        RefCell::new(HashMap::new());
+    /// Page counts of PDFs we've rendered at least one page of.
+    static PDF_COUNT_CACHE: RefCell<HashMap<PathBuf, usize>> = RefCell::new(HashMap::new());
+}
+
+fn lookup_pdf_page(path: &Path, page: usize) -> Option<Option<Arc<RenderImage>>> {
+    PDF_PAGE_CACHE.with(|c| c.borrow().get(&(path.to_path_buf(), page)).cloned())
+}
+
+fn lookup_pdf_count(path: &Path) -> Option<usize> {
+    PDF_COUNT_CACHE.with(|c| c.borrow().get(path).copied())
+}
+
+/// Insert a rendered page, evicting far-away pages so flipping through a long
+/// PDF can't accumulate unbounded image memory (each page is a few MB).
+fn insert_pdf_page(path: PathBuf, page: usize, img: Option<Arc<RenderImage>>) {
+    PDF_PAGE_CACHE.with(|c| {
+        let mut m = c.borrow_mut();
+        if m.len() >= 12 {
+            let lo = page.saturating_sub(3);
+            let hi = page + 3;
+            m.retain(|(p, pg), _| p == &path && (lo..=hi).contains(pg));
+        }
+        m.insert((path, page), img);
+    });
+}
+
+/// Rasterize one page of a PDF via AppKit's `NSPDFImageRep`, off the render
+/// thread. Returns the page image and the document's page count.
+fn render_pdf_page(path: &Path, page: usize) -> Option<(Arc<RenderImage>, usize)> {
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    let bytes = fs::read(path).ok()?;
+    let data = NSData::with_bytes(&bytes);
+    let rep = NSPDFImageRep::imageRepWithData(&data)?;
+    let count = rep.pageCount().max(1) as usize;
+    rep.setCurrentPage(page.min(count - 1) as isize);
+
+    let size = rep.size();
+    if size.width < 1.0 || size.height < 1.0 {
+        return None;
+    }
+    // ~800px on the long edge: crisp at the inspector's 288px (incl. retina)
+    // without ballooning the page cache.
+    let scale = (800.0 / size.width.max(size.height)).clamp(0.5, 4.0);
+    let (w, h) = (
+        (size.width * scale).round() as isize,
+        (size.height * scale).round() as isize,
+    );
+
+    let bmp = unsafe {
+        NSBitmapImageRep::initWithBitmapDataPlanes_pixelsWide_pixelsHigh_bitsPerSample_samplesPerPixel_hasAlpha_isPlanar_colorSpaceName_bytesPerRow_bitsPerPixel(
+            NSBitmapImageRep::alloc(),
+            std::ptr::null_mut(),
+            w,
+            h,
+            8,
+            4,
+            true,
+            false,
+            NSDeviceRGBColorSpace,
+            0,
+            0,
+        )
+    }?;
+    let ctx = NSGraphicsContext::graphicsContextWithBitmapImageRep(&bmp)?;
+    NSGraphicsContext::saveGraphicsState_class();
+    NSGraphicsContext::setCurrentContext(Some(&ctx));
+    let dst = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w as f64, h as f64));
+    let ok = rep.drawInRect(dst);
+    NSGraphicsContext::restoreGraphicsState_class();
+    if !ok {
+        return None;
+    }
+
+    let tiff = bmp.TIFFRepresentation()?;
+    if tiff.len() == 0 {
+        return None;
+    }
+    let decoded = image::load_from_memory(&tiff.to_vec()).ok()?;
+    let rgba = decoded.to_rgba8();
+    let (dw, dh) = rgba.dimensions();
+    let mut raw = rgba.into_raw();
+    for px in raw.chunks_exact_mut(4) {
+        px.swap(0, 2); // RGBA → BGRA
+    }
+    let buffer = image::RgbaImage::from_raw(dw, dh, raw)?;
+    Some((
+        Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])),
+        count,
+    ))
 }
 
 fn lookup_info(path: &Path) -> Option<FileInfo> {
@@ -10892,8 +11476,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\n",
-            p.terminal, p.term_history, p.preview, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button
+            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\n",
+            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps
         );
         let _ = fs::write(&file, body);
     }
@@ -11018,6 +11602,7 @@ fn load_prefs() -> Prefs {
                     "terminal" => p.terminal = on,
                     "term_history" => p.term_history = on,
                     "preview" => p.preview = on,
+                    "preview_pages" => p.preview_pages = on,
                     "info" => p.info = on,
                     "show_parent" => p.show_parent = on,
                     "sidebar_collapsed" => p.sidebar_collapsed = on,
@@ -11029,6 +11614,7 @@ fn load_prefs() -> Prefs {
                     "palette_history" => p.palette_history = on,
                     "groups_enabled" => p.groups_enabled = on,
                     "show_filter_button" => p.show_filter_button = on,
+                    "show_fps" => p.show_fps = on,
                     _ => {}
                 }
             }
@@ -11064,6 +11650,23 @@ fn main() {
                 name,
                 path.display()
             );
+        }
+        return;
+    }
+    // Hidden check: `shuffle --pdf-bench <file> [page]` renders one PDF page
+    // through the inspector-pager pipeline and prints the result, then exits.
+    if args.len() >= 3 && args[1] == "--pdf-bench" {
+        let path = PathBuf::from(&args[2]);
+        let page: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+        let t0 = std::time::Instant::now();
+        match render_pdf_page(&path, page) {
+            Some((_, count)) => eprintln!(
+                "ok: rendered page {} of {} in {} ms",
+                page + 1,
+                count,
+                t0.elapsed().as_millis()
+            ),
+            None => eprintln!("failed to render {}", path.display()),
         }
         return;
     }
