@@ -2101,6 +2101,8 @@ const SCROLLBAR_LINGER: f32 = 1.0;
 const SCROLLBAR_FADE: f32 = 0.35;
 /// Duration of the pane split open/close animation.
 const SPLIT_ANIM_MS: u64 = 220;
+/// Red used for an invalid rename (field border/text + the reason pill).
+const RENAME_ERR_COLOR: u32 = 0xef4444;
 
 /// The four resizable columns of the main listing.
 #[derive(Clone, Copy, PartialEq)]
@@ -2213,8 +2215,11 @@ struct Rename {
     pane: usize,
     path: PathBuf,
     text: String,
-    /// Whole-text selected (Cmd+A or on start): typing replaces everything.
-    selected_all: bool,
+    /// Text cursor (char index) within `text`.
+    cursor: usize,
+    /// Selection anchor (char index); `Some` and different from `cursor` means
+    /// that range is selected (starts as the whole name, like Finder).
+    anchor: Option<usize>,
 }
 
 /// The current level shown in the context menu.
@@ -2353,6 +2358,9 @@ struct Tab {
     last_scroll: Instant,
     /// Bumped per scroll so the fade-out animation restarts from opaque.
     scroll_epoch: u64,
+    /// The directory's mtime as of the last load; the watcher reloads the tab
+    /// when the folder changes underneath us (new download, deletion, …).
+    dir_mtime: Option<SystemTime>,
 }
 
 impl Tab {
@@ -2384,6 +2392,7 @@ impl Tab {
             load_gen: 0,
             last_scroll: Instant::now(),
             scroll_epoch: 0,
+            dir_mtime: None,
         }
     }
 }
@@ -2541,6 +2550,9 @@ struct Shuffle {
     update: Option<UpdateStatus>,
     /// Current page of the inspector's PDF preview (0-based; reset on focus).
     preview_page: usize,
+    /// The row the mouse is currently over: (pane, path). Enter renames it
+    /// even when nothing is selected (point-and-rename).
+    hovered: Option<(usize, PathBuf)>,
 }
 
 /// Drives the update banner under the titlebar.
@@ -2581,6 +2593,56 @@ impl Shuffle {
         cx.observe_global::<KeymapGlobal>(|_, cx| {
             set_active_keymap(cx.global::<KeymapGlobal>().0.clone());
             cx.notify();
+        })
+        .detach();
+        // Watch the visible folders for outside changes (a finishing download,
+        // files created/deleted by other apps): poll each pane's directory
+        // mtime once a second — off-thread, so a slow network mount can't
+        // stall a frame — and reload the pane when it changes. The reload
+        // re-applies the tab's sort and any active filter, so new files land
+        // in the right spot immediately.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(1000))
+                    .await;
+                let dirs = match this.update(cx, |this, _| {
+                    this.panes
+                        .iter()
+                        .map(|p| p.active_tab().current_dir.clone())
+                        .collect::<Vec<_>>()
+                }) {
+                    Ok(d) => d,
+                    Err(_) => break,
+                };
+                let sampled = dirs.clone();
+                let stats = cx
+                    .background_spawn(async move {
+                        sampled
+                            .iter()
+                            .map(|d| fs::metadata(d).ok().and_then(|m| m.modified().ok()))
+                            .collect::<Vec<Option<SystemTime>>>()
+                    })
+                    .await;
+                let alive = this.update(cx, |this, cx| {
+                    for (pane, (dir, cur)) in dirs.into_iter().zip(stats).enumerate() {
+                        // Skip if the pane went away or navigated meanwhile.
+                        if pane >= this.panes.len() || this.tab(pane).current_dir != dir {
+                            continue;
+                        }
+                        match (this.tab(pane).dir_mtime, cur) {
+                            (Some(prev), Some(now)) if prev != now => {
+                                this.reload_pane(pane, cx);
+                            }
+                            (None, Some(now)) => this.tab_mut(pane).dir_mtime = Some(now),
+                            _ => {}
+                        }
+                    }
+                });
+                if alive.is_err() {
+                    break;
+                }
+            }
         })
         .detach();
         // Rebuild icons when the icon pack changes.
@@ -2638,6 +2700,7 @@ impl Shuffle {
             term_scroll: ScrollHandle::new(),
             update: None,
             preview_page: 0,
+            hovered: None,
         }
     }
 
@@ -2703,6 +2766,9 @@ impl Shuffle {
     fn reload_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
         let dir = self.tab(pane).current_dir.clone();
         ensure_dynamic_sidebar_icons(); // pick up newly-mounted volumes/cloud
+        // Stamp the mtime *before* reading so a change racing the read bumps
+        // it again and the watcher catches it on the next tick.
+        self.tab_mut(pane).dir_mtime = fs::metadata(&dir).ok().and_then(|m| m.modified().ok());
         self.tab_mut(pane).entries = read_entries_fast(&dir);
         self.next_load_gen += 1;
         let gen = self.next_load_gen;
@@ -2782,18 +2848,53 @@ impl Shuffle {
         cx.notify();
     }
 
-    fn new_folder(&mut self, pane: usize, cx: &mut Context<Self>) {
+    fn new_folder(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
         let path = unique_child(&self.tab(pane).current_dir, "untitled folder");
         if fs::create_dir(&path).is_ok() {
             self.refresh_pane(pane, cx);
+            self.reveal_and_rename(pane, path, window, cx);
         }
     }
 
-    fn new_file(&mut self, pane: usize, cx: &mut Context<Self>) {
+    fn new_file(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
         let path = unique_child(&self.tab(pane).current_dir, "untitled file");
         if fs::File::create(&path).is_ok() {
             self.refresh_pane(pane, cx);
+            self.reveal_and_rename(pane, path, window, cx);
         }
+    }
+
+    /// Scroll a freshly-created item into view, select it, and open the name
+    /// editor so the user can type the real name immediately. Enter with
+    /// nothing typed, Escape, or clicking elsewhere keeps the default name.
+    fn reveal_and_rename(
+        &mut self,
+        pane: usize,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = self.display_paths(pane);
+        if let Some(ix) = paths.iter().position(|p| p == &path) {
+            let (view, off) = {
+                let tab = self.tab(pane);
+                let off = usize::from(
+                    tab.find_query.is_none()
+                        && prefs().show_parent
+                        && tab.current_dir.parent().is_some(),
+                );
+                (tab.view, off)
+            };
+            let item = match view {
+                ViewMode::Icons => ix / self.icon_cols(pane),
+                _ => ix + off,
+            };
+            self.tab(pane).scroll_handle.scroll_to_item(item, ScrollStrategy::Center);
+            self.mark_scrolled(pane, cx);
+        }
+        self.tab_mut(pane).selection = std::iter::once(path.clone()).collect();
+        self.focus_entry(pane, path.clone(), cx);
+        self.begin_rename(pane, path, window, cx);
     }
 
     fn open_path(&mut self, pane: usize, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
@@ -2881,19 +2982,73 @@ impl Shuffle {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_default();
         // Start with the whole name selected, like Finder.
-        self.rename = Some(Rename { pane, path, text, selected_all: true });
+        let end = text.chars().count();
+        self.rename = Some(Rename {
+            pane,
+            path,
+            text,
+            cursor: end,
+            anchor: if end > 0 { Some(0) } else { None },
+        });
         window.focus(&self.focus);
         cx.notify();
     }
 
+    /// Why the current rename text can't be committed (`None` = it can).
+    /// Shown live under the pane and blocks Enter while present.
+    fn rename_error(&self) -> Option<&'static str> {
+        let r = self.rename.as_ref()?;
+        let name = r.text.trim();
+        if name.is_empty() {
+            return None; // Enter on an empty name just cancels, like Finder
+        }
+        if name.contains('/') {
+            return Some("Names can’t contain “/”");
+        }
+        if name.contains(':') {
+            return Some("Names can’t contain “:”");
+        }
+        if name == "." || name == ".." {
+            return Some("That name is reserved");
+        }
+        if name.len() > 255 {
+            return Some("That name is too long");
+        }
+        let current = r.path.file_name().map(|n| n.to_string_lossy().into_owned());
+        // Renaming to itself (or a case-only variant on this case-insensitive
+        // filesystem) is fine; anything else that exists is taken.
+        let same = current
+            .as_deref()
+            .is_some_and(|c| c.eq_ignore_ascii_case(name));
+        if !same && r.path.parent().is_some_and(|p| p.join(name).exists()) {
+            return Some("Another item here already has this name");
+        }
+        None
+    }
+
     /// Commit the in-progress rename (Enter), renaming the file on disk.
     fn commit_rename(&mut self, cx: &mut Context<Self>) {
+        // An invalid name keeps the field open with the error showing — Enter
+        // shouldn't silently discard the edit. Escape still cancels.
+        if self.rename.is_some() && self.rename_error().is_some() {
+            cx.notify();
+            return;
+        }
         if let Some(r) = self.rename.take() {
             let new = r.text.trim();
-            if !new.is_empty() && !new.contains('/') {
+            if !new.is_empty() {
                 if let Some(parent) = r.path.parent() {
                     let dest = parent.join(new);
-                    if dest != r.path && !dest.exists() && fs::rename(&r.path, &dest).is_ok() {
+                    // Case-only renames are legal even though the destination
+                    // "exists" on APFS's case-insensitive default.
+                    let case_only = r
+                        .path
+                        .file_name()
+                        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(new));
+                    if dest != r.path
+                        && (case_only || !dest.exists())
+                        && fs::rename(&r.path, &dest).is_ok()
+                    {
                         let tab = self.tab_mut(r.pane);
                         if tab.selection.remove(&r.path) {
                             tab.selection.insert(dest.clone());
@@ -2909,63 +3064,192 @@ impl Shuffle {
         cx.notify();
     }
 
-    /// Keystrokes while a rename field is active.
+    /// The rename field's selected range as (lo, hi) char indices, if any.
+    fn rename_sel(&self) -> Option<(usize, usize)> {
+        let r = self.rename.as_ref()?;
+        let a = r.anchor?;
+        if a == r.cursor {
+            return None;
+        }
+        Some((a.min(r.cursor), a.max(r.cursor)))
+    }
+
+    /// Delete the rename selection; returns whether there was one.
+    fn rename_delete_sel(&mut self) -> bool {
+        if let Some((lo, hi)) = self.rename_sel() {
+            if let Some(r) = self.rename.as_mut() {
+                let (bl, bh) = (char_byte(&r.text, lo), char_byte(&r.text, hi));
+                r.text.replace_range(bl..bh, "");
+                r.cursor = lo;
+                r.anchor = None;
+            }
+            true
+        } else {
+            if let Some(r) = self.rename.as_mut() {
+                r.anchor = None;
+            }
+            false
+        }
+    }
+
+    /// Insert `s` at the rename cursor, replacing any selection first.
+    fn rename_insert(&mut self, s: &str) {
+        self.rename_delete_sel();
+        if let Some(r) = self.rename.as_mut() {
+            let b = char_byte(&r.text, r.cursor);
+            r.text.insert_str(b, s);
+            r.cursor += s.chars().count();
+        }
+    }
+
+    /// Move (or extend) the rename cursor. `word` jumps by word, `select`
+    /// extends the selection (Option+Shift selects a word at a time).
+    fn rename_move_h(&mut self, left: bool, word: bool, select: bool) {
+        let Some(r) = self.rename.as_ref() else {
+            return;
+        };
+        let s = r.text.clone();
+        let end = s.chars().count();
+        let cursor = r.cursor.min(end);
+        let target = match (left, word) {
+            (true, true) => prev_word_boundary(&s, cursor),
+            (true, false) => cursor.saturating_sub(1),
+            (false, true) => next_word_boundary(&s, cursor),
+            (false, false) => (cursor + 1).min(end),
+        };
+        let sel = self.rename_sel();
+        let Some(r) = self.rename.as_mut() else {
+            return;
+        };
+        if select {
+            if r.anchor.is_none() {
+                r.anchor = Some(cursor);
+            }
+            r.cursor = target;
+            if r.anchor == Some(target) {
+                r.anchor = None;
+            }
+        } else if let Some((lo, hi)) = sel {
+            r.cursor = if word {
+                target
+            } else if left {
+                lo
+            } else {
+                hi
+            };
+            r.anchor = None;
+        } else {
+            r.cursor = target;
+            r.anchor = None;
+        }
+    }
+
+    /// Keystrokes while a rename field is active. Full text editing: arrows
+    /// move, Option jumps words, Cmd jumps to the ends, Shift extends the
+    /// selection, Cmd+A/C/X/V work on the selection.
     fn handle_rename_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
         let ks = &ev.keystroke;
         let cmd = ks.modifiers.platform;
+        let alt = ks.modifiers.alt;
+        let shift = ks.modifiers.shift;
         match ks.key.as_str() {
             "escape" => {
                 self.rename = None;
                 cx.notify();
             }
             "enter" => self.commit_rename(cx),
+            "left" | "right" => {
+                let left = ks.key == "left";
+                if cmd {
+                    if let Some(r) = self.rename.as_mut() {
+                        let end = r.text.chars().count();
+                        let cursor = r.cursor;
+                        if shift && r.anchor.is_none() {
+                            r.anchor = Some(cursor);
+                        }
+                        r.cursor = if left { 0 } else { end };
+                        if !shift {
+                            r.anchor = None;
+                        }
+                    }
+                } else {
+                    self.rename_move_h(left, alt, shift);
+                }
+                cx.notify();
+            }
             "a" if cmd => {
                 if let Some(r) = self.rename.as_mut() {
-                    r.selected_all = true;
+                    let end = r.text.chars().count();
+                    if end == 0 {
+                        r.anchor = None;
+                    } else {
+                        r.anchor = Some(0);
+                        r.cursor = end;
+                    }
                 }
                 cx.notify();
             }
             "c" if cmd => {
-                if let Some(r) = &self.rename {
-                    cx.write_to_clipboard(ClipboardItem::new_string(r.text.clone()));
+                let text = match self.rename_sel() {
+                    Some((lo, hi)) => self.rename.as_ref().map(|r| {
+                        r.text[char_byte(&r.text, lo)..char_byte(&r.text, hi)].to_string()
+                    }),
+                    None => self.rename.as_ref().map(|r| r.text.clone()),
+                };
+                if let Some(text) = text {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }
+            "x" if cmd => {
+                if let Some((lo, hi)) = self.rename_sel() {
+                    if let Some(r) = self.rename.as_ref() {
+                        let cut =
+                            r.text[char_byte(&r.text, lo)..char_byte(&r.text, hi)].to_string();
+                        cx.write_to_clipboard(ClipboardItem::new_string(cut));
+                    }
+                    self.rename_delete_sel();
+                    cx.notify();
+                }
+            }
+            "v" if cmd => {
+                if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                    self.rename_insert(t.trim());
+                    cx.notify();
                 }
             }
             "backspace" => {
-                if let Some(r) = self.rename.as_mut() {
-                    if r.selected_all {
-                        r.text.clear();
-                        r.selected_all = false;
-                    } else {
-                        r.text.pop();
+                if !self.rename_delete_sel() {
+                    if let Some(r) = self.rename.as_mut() {
+                        if r.cursor > 0 {
+                            let start = char_byte(&r.text, r.cursor - 1);
+                            let stop = char_byte(&r.text, r.cursor);
+                            r.text.replace_range(start..stop, "");
+                            r.cursor -= 1;
+                        }
                     }
                 }
                 cx.notify();
             }
-            "v" if cmd => {
-                if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
+            "delete" => {
+                if !self.rename_delete_sel() {
                     if let Some(r) = self.rename.as_mut() {
-                        if r.selected_all {
-                            r.text.clear();
-                            r.selected_all = false;
+                        let end = r.text.chars().count();
+                        if r.cursor < end {
+                            let start = char_byte(&r.text, r.cursor);
+                            let stop = char_byte(&r.text, r.cursor + 1);
+                            r.text.replace_range(start..stop, "");
                         }
-                        r.text.push_str(t.trim());
                     }
-                    cx.notify();
                 }
+                cx.notify();
             }
             _ => {
                 if cmd {
                     return;
                 }
-                if let Some(ch) = ks.key_char.as_ref() {
+                if let Some(ch) = ks.key_char.clone() {
                     if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        if let Some(r) = self.rename.as_mut() {
-                            if r.selected_all {
-                                r.text.clear();
-                                r.selected_all = false;
-                            }
-                            r.text.push_str(ch);
-                        }
+                        self.rename_insert(&ch);
                         cx.notify();
                     }
                 }
@@ -3234,16 +3518,16 @@ impl Shuffle {
             items.push(ctx_separator().into_any_element());
         }
         items.push(
-            ctx_item("New Folder", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            ctx_item("New Folder", cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.close_context_menu(cx);
-                this.new_folder(pane, cx);
+                this.new_folder(pane, window, cx);
             }))
             .into_any_element(),
         );
         items.push(
-            ctx_item("New File", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            ctx_item("New File", cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.close_context_menu(cx);
-                this.new_file(pane, cx);
+                this.new_file(pane, window, cx);
             }))
             .into_any_element(),
         );
@@ -4537,8 +4821,8 @@ impl Shuffle {
                 self.tab_mut(pane).selection = all;
                 cx.notify();
             }
-            KeyAction::NewFile => self.new_file(pane, cx),
-            KeyAction::NewFolder => self.new_folder(pane, cx),
+            KeyAction::NewFile => self.new_file(pane, window, cx),
+            KeyAction::NewFolder => self.new_folder(pane, window, cx),
             KeyAction::Rename => {
                 if let Some(p) = anchor {
                     self.begin_rename(pane, p, window, cx);
@@ -4672,11 +4956,23 @@ impl Shuffle {
                     return;
                 }
             }
-            // Enter renames the focused file (Finder-style; not rebindable).
+            // Enter renames the item under the mouse first (point-and-rename),
+            // else the focused one (Finder-style; not rebindable). The hover
+            // target must still live in that pane's current folder — a stale
+            // hover from before a navigation must never rename off-screen.
             if !cmd && key == "enter" {
-                let pane = self.active_pane;
-                if let Some(sel) = self.tab(pane).anchor.clone() {
-                    self.begin_rename(pane, sel, window, cx);
+                let hovered = self.hovered.clone().filter(|(hp, p)| {
+                    *hp < self.panes.len()
+                        && p.parent() == Some(self.tab(*hp).current_dir.as_path())
+                        && p.exists()
+                });
+                if let Some((hpane, p)) = hovered {
+                    self.begin_rename(hpane, p, window, cx);
+                } else {
+                    let pane = self.active_pane;
+                    if let Some(sel) = self.tab(pane).anchor.clone() {
+                        self.begin_rename(pane, sel, window, cx);
+                    }
                 }
             }
             // Backspace / Delete asks to move the selection to Trash.
@@ -5561,6 +5857,18 @@ impl Shuffle {
             tab.find_results = (0..tab.entries.len()).collect();
             return;
         }
+        // With a column sort active, the filtered rows follow the list's sort
+        // order (entries are already sorted), so clicking Date/Size/Name
+        // re-orders the search results too. No sort → best match first.
+        if tab.sort_key != SortKey::None {
+            tab.find_results = tab
+                .entries
+                .iter()
+                .enumerate()
+                .filter_map(|(i, e)| find_score(q, &e.name).map(|_| i))
+                .collect();
+            return;
+        }
         let mut scored: Vec<(i32, usize)> = tab
             .entries
             .iter()
@@ -6069,7 +6377,19 @@ impl Shuffle {
     }
 
     fn end_marquee(&mut self, cx: &mut Context<Self>) {
-        if self.marquee.take().is_some() {
+        if let Some((pane, _, _)) = self.marquee.take() {
+            // Give the marquee'd selection a focused item so Enter (rename),
+            // the inspector, and shift-extension have a target.
+            if self.tab(pane).anchor.is_none() {
+                let last = self
+                    .display_paths(pane)
+                    .into_iter()
+                    .rev()
+                    .find(|p| self.tab(pane).selection.contains(p));
+                if let Some(p) = last {
+                    self.focus_entry(pane, p, cx);
+                }
+            }
             cx.notify();
         }
     }
@@ -6372,6 +6692,43 @@ impl Shuffle {
             });
         })
         .detach();
+    }
+
+    /// The floating "why this name won't work" pill shown over `pane` while an
+    /// in-progress rename there has an invalid name.
+    fn rename_error_pill(&self, pane: usize) -> Option<AnyElement> {
+        let r = self.rename.as_ref()?;
+        if r.pane != pane {
+            return None;
+        }
+        let msg = self.rename_error()?;
+        let t = theme();
+        Some(
+            div()
+                .absolute()
+                .bottom(px(16.0))
+                .left_0()
+                .right_0()
+                .flex()
+                .justify_center()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_lg()
+                        .bg(Theme::alpha(t.surface, 0xf2))
+                        .border_1()
+                        .border_color(rgb(RENAME_ERR_COLOR))
+                        .shadow_lg()
+                        .text_color(rgb(RENAME_ERR_COLOR))
+                        .child("⚠")
+                        .child(div().text_color(rgb(t.text)).child(msg)),
+                )
+                .into_any_element(),
+        )
     }
 
     /// The right-hand inspector: preview and/or information for the selected
@@ -7980,6 +8337,7 @@ impl Shuffle {
                     .flex_1()
                     .min_h_0()
                     .child(body)
+                    .children(self.rename_error_pill(pane))
                     .child(self.render_filter_box(pane, cx)),
             )
     }
@@ -8122,6 +8480,8 @@ impl Shuffle {
                                         }),
                                         // ".." isn't draggable; just swallow the press.
                                         |_, _, cx: &mut App| cx.stop_propagation(),
+                                        // ".." can't be renamed; no hover tracking.
+                                        |_: &bool, _, _| {},
                                     )
                                     .into_any_element(),
                                 );
@@ -8145,13 +8505,14 @@ impl Shuffle {
                             let target = base_dir.join(&name);
                             let ctx_target = target.clone();
                             let drop_target = target.clone();
+                            let hover_target = target.clone();
                             let is_selected = tab.selection.contains(&target);
                             let ctx_active = this.is_ctx_target(&target);
                             let rename_text = this
                                 .rename
                                 .as_ref()
                                 .filter(|r| r.path == target)
-                                .map(|r| (r.text.clone(), r.selected_all));
+                                .map(|r| (r.text.clone(), r.cursor, r.anchor, this.rename_error().is_some()));
                             // Don't drag the row while it's being renamed.
                             let drag_target = if rename_text.is_some() {
                                 None
@@ -8208,6 +8569,17 @@ impl Shuffle {
                                             this.drag_candidate = Some((pane, dp.clone(), (x, y)));
                                         }
                                         cx.stop_propagation();
+                                    }),
+                                    cx.listener(move |this, on: &bool, _, _| {
+                                        if *on {
+                                            this.hovered = Some((pane, hover_target.clone()));
+                                        } else if this
+                                            .hovered
+                                            .as_ref()
+                                            .is_some_and(|(hp, p)| *hp == pane && *p == hover_target)
+                                        {
+                                            this.hovered = None;
+                                        }
                                     }),
                                 )
                                 .into_any_element(),
@@ -9243,14 +9615,17 @@ fn file_row(
     // Drag-and-drop: `accept_drop` true => it's a drop target (a folder or the
     // ".." row) that runs `on_drop_file` when files are dropped on it.
     accept_drop: bool,
-    // When Some, this row is being renamed: the name shows as an editable field.
-    // The bool is whether the whole text is selected (Cmd+A / on start).
-    rename_text: Option<(String, bool)>,
+    // When Some, this row is being renamed: the name shows as an editable field
+    // with (text, cursor char-index, selection-anchor char-index, invalid).
+    // Invalid names render the field in red (the pane shows the reason).
+    rename_text: Option<(String, usize, Option<usize>, bool)>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_drop_file: impl Fn(&ExternalPaths, &mut Window, &mut App) + 'static,
     // Left-press handler: records a drag candidate + stops marquee propagation.
     on_press: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    // Hover tracking, so Enter can rename the row under the mouse.
+    on_hover_row: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> impl IntoElement {
     let t = theme();
     let kind = kind_label(name, is_dir);
@@ -9258,7 +9633,8 @@ fn file_row(
     let meta_color = rgb(t.text_muted);
     // The name element: an editable field while renaming, else the label.
     let name_el: AnyElement = match &rename_text {
-        Some((txt, selected)) => {
+        Some((txt, cursor, anchor, invalid)) => {
+            let edge = if *invalid { RENAME_ERR_COLOR } else { t.accent };
             let field = div()
                 .flex_1()
                 .min_w_0()
@@ -9266,19 +9642,37 @@ fn file_row(
                 .rounded_sm()
                 .bg(rgb(t.bg))
                 .border_1()
-                .border_color(rgb(t.accent))
-                .text_color(rgb(t.text));
-            if *selected {
-                // Whole-text selection: highlight the text block.
+                .border_color(rgb(edge))
+                .text_color(rgb(if *invalid { RENAME_ERR_COLOR } else { t.text }))
+                .flex()
+                .items_center();
+            let n = txt.chars().count();
+            let cursor = (*cursor).min(n);
+            let sel = anchor
+                .filter(|&a| a != cursor)
+                .map(|a| (a.min(cursor), a.max(cursor)));
+            if let Some((lo, hi)) = sel {
+                // Highlighted selection between the plain head and tail.
+                let (bl, bh) = (char_byte(txt, lo), char_byte(txt, hi));
                 field
+                    .child(div().flex_none().child(txt[..bl].to_string()))
                     .child(
                         div()
-                            .bg(Theme::alpha(t.accent, 0x66))
-                            .child(txt.clone()),
+                            .flex_none()
+                            .bg(Theme::alpha(edge, 0x66))
+                            .rounded_sm()
+                            .child(txt[bl..bh].to_string()),
                     )
+                    .child(div().flex_none().child(txt[bh..].to_string()))
                     .into_any_element()
             } else {
-                field.child(format!("{txt}\u{2502}")).into_any_element()
+                // Static caret at the cursor position.
+                let b = char_byte(txt, cursor);
+                field
+                    .child(div().flex_none().child(txt[..b].to_string()))
+                    .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(t.text)))
+                    .child(div().flex_none().child(txt[b..].to_string()))
+                    .into_any_element()
             }
         }
         None => div()
@@ -9302,6 +9696,7 @@ fn file_row(
         .hover(|s| s.bg(rgb(t.hover)))
         // Instant press feedback (the click action lands on mouse-up).
         .active(|s| s.bg(rgb(t.selected)))
+        .on_hover(on_hover_row)
         // Press records a drag candidate (promoted to a native OS drag on move)
         // and stops a marquee from starting on the list behind it.
         .on_mouse_down(MouseButton::Left, on_press)
@@ -9382,6 +9777,7 @@ fn icon_cell(
     let drop_t = target.clone();
     let ctx_t = target.clone();
     let click_t = target.clone();
+    let hover_t = target.clone();
     let mut cell = div()
         .id(SharedString::from(format!("cell:{}", target.to_string_lossy())))
         .flex_none()
@@ -9398,6 +9794,18 @@ fn icon_cell(
         .hover(|s| s.bg(rgb(t.hover)))
         // Instant press feedback (the click action lands on mouse-up).
         .active(|s| s.bg(rgb(t.selected)))
+        // Track the hovered item so Enter renames the cell under the mouse.
+        .on_hover(cx.listener(move |this, on: &bool, _, _| {
+            if *on {
+                this.hovered = Some((pane, hover_t.clone()));
+            } else if this
+                .hovered
+                .as_ref()
+                .is_some_and(|(hp, p)| *hp == pane && *p == hover_t)
+            {
+                this.hovered = None;
+            }
+        }))
         // Press records a drag candidate; moving past the threshold starts a
         // native OS drag (drop into Finder / other apps or back into Shuffle).
         .on_mouse_down(
