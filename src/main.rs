@@ -942,12 +942,35 @@ struct Settings {
 
 impl Settings {
     fn new(cx: &mut Context<Self>) -> Self {
+        // Repaint when the shared update-check state changes (the check runs
+        // async; the main window may also drive it).
+        cx.observe_global::<UpdateCheckGlobal>(|_, cx| cx.notify()).detach();
         Settings {
             tab: 0,
             focus: cx.focus_handle(),
             recording: None,
             color_edit: None,
         }
+    }
+
+    /// Kick off a GitHub check from the Settings "Updates" row.
+    fn start_update_check(&self, cx: &mut Context<Self>) {
+        cx.set_global(UpdateCheckGlobal(UpdateCheck::Checking));
+        cx.spawn(async move |_, cx| {
+            let tag = cx.background_spawn(async move { fetch_latest_tag() }).await;
+            let next = match tag {
+                None => UpdateCheck::Failed,
+                Some(tag) => {
+                    if parse_version(&tag) > parse_version(env!("CARGO_PKG_VERSION")) {
+                        UpdateCheck::Available(tag)
+                    } else {
+                        UpdateCheck::UpToDate
+                    }
+                }
+            };
+            let _ = cx.update(|cx| cx.set_global(UpdateCheckGlobal(next)));
+        })
+        .detach();
     }
 
     /// Route key events: hex entry first, then keybind recording.
@@ -1289,6 +1312,92 @@ impl Settings {
                     cx.notify();
                 }),
             ))
+            .child(settings_title("Updates"))
+            .child({
+                let t = theme();
+                let state = cx.global::<UpdateCheckGlobal>().0.clone();
+                let status: Option<String> = match &state {
+                    UpdateCheck::Idle => None,
+                    UpdateCheck::Checking => Some("Checking…".into()),
+                    UpdateCheck::UpToDate => Some("You’re up to date.".into()),
+                    UpdateCheck::Available(v) => Some(format!("{v} is available.")),
+                    UpdateCheck::Failed => Some("Couldn’t reach GitHub — try again.".into()),
+                    UpdateCheck::Install(v) => {
+                        Some(format!("Installing {v}… the app will relaunch."))
+                    }
+                };
+                let button: Option<&'static str> = match &state {
+                    UpdateCheck::Idle => Some("Check for Updates"),
+                    UpdateCheck::UpToDate => Some("Check Again"),
+                    UpdateCheck::Failed => Some("Try Again"),
+                    UpdateCheck::Available(_) => Some("Install & Relaunch"),
+                    UpdateCheck::Checking | UpdateCheck::Install(_) => None,
+                };
+                let avail = matches!(state, UpdateCheck::Available(_));
+                let avail_tag = match &state {
+                    UpdateCheck::Available(v) => Some(v.clone()),
+                    _ => None,
+                };
+                let mut right = div().flex_none().flex().items_center().gap_2();
+                if let Some(s) = status {
+                    right = right.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(if avail { t.accent } else { t.text_muted }))
+                            .child(s),
+                    );
+                }
+                if let Some(label) = button {
+                    right = right.child(
+                        div()
+                            .id("update-check-btn")
+                            .flex_none()
+                            .px_3()
+                            .py_1()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .bg(if avail { rgb(t.accent) } else { rgb(t.surface) })
+                            .text_color(if avail { rgb(0xffffff) } else { rgb(t.text) })
+                            .hover(|s| s.bg(rgb(t.hover)))
+                            .active(|s| s.bg(rgb(t.selected)))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                if let Some(v) = avail_tag.clone() {
+                                    // Hand the install to the main window (it
+                                    // owns the banner + swap-and-relaunch).
+                                    cx.set_global(UpdateCheckGlobal(UpdateCheck::Install(v)));
+                                } else {
+                                    this.start_update_check(cx);
+                                }
+                                cx.notify();
+                            })),
+                    );
+                }
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(
+                                div()
+                                    .text_color(rgb(t.text))
+                                    .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                            )
+                            .child(div().text_xs().text_color(rgb(t.text_muted)).child(
+                                "Check GitHub for a newer release and install it in \
+                                 place — the app swaps itself and relaunches.",
+                            )),
+                    )
+                    .child(right)
+            })
             .child(reset_button(
                 "reset-general",
                 "Reset General to Default",
@@ -2555,6 +2664,27 @@ struct Shuffle {
     hovered: Option<(usize, PathBuf)>,
 }
 
+/// Update-check state shared between the Settings window (which drives the
+/// "Check for Updates" button) and the main window (which shows the banner
+/// and performs the install).
+#[derive(Clone, PartialEq, Default)]
+enum UpdateCheck {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    /// A newer tag (like "v0.2.7") is available to install.
+    Available(String),
+    /// The GitHub query failed (offline, rate limit, …).
+    Failed,
+    /// Settings asked the main window to download + install this tag now.
+    Install(String),
+}
+
+#[derive(Clone, Default)]
+struct UpdateCheckGlobal(UpdateCheck);
+impl gpui::Global for UpdateCheckGlobal {}
+
 /// Drives the update banner under the titlebar.
 #[derive(Clone)]
 enum UpdateStatus {
@@ -2593,6 +2723,25 @@ impl Shuffle {
         cx.observe_global::<KeymapGlobal>(|_, cx| {
             set_active_keymap(cx.global::<KeymapGlobal>().0.clone());
             cx.notify();
+        })
+        .detach();
+        // React to the Settings window's update checks: an explicit check that
+        // finds a new version shows the banner here (even a previously
+        // dismissed one), and "Install & Relaunch" starts the self-update.
+        cx.observe_global::<UpdateCheckGlobal>(|this, cx| {
+            match cx.global::<UpdateCheckGlobal>().0.clone() {
+                UpdateCheck::Available(tag) => {
+                    this.update = Some(UpdateStatus::Available(tag));
+                    cx.notify();
+                }
+                UpdateCheck::Install(tag) => {
+                    if !matches!(this.update, Some(UpdateStatus::Downloading(_))) {
+                        this.update = Some(UpdateStatus::Available(tag));
+                        this.start_self_update(cx);
+                    }
+                }
+                _ => {}
+            }
         })
         .detach();
         // Watch the visible folders for outside changes (a finishing download,
@@ -4342,35 +4491,19 @@ impl Shuffle {
     /// unparseable) just leaves the banner hidden. Never blocks the UI.
     fn check_for_update(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
-            let body = cx
-                .background_spawn(async move {
-                    Command::new("curl")
-                        .args([
-                            "-sL",
-                            "--max-time",
-                            "8",
-                            "-H",
-                            "Accept: application/vnd.github+json",
-                            &format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest"),
-                        ])
-                        .output()
-                        .ok()
-                        .filter(|o| o.status.success())
-                        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-                })
-                .await;
-            let Some(body) = body else { return };
-            let Some(tag) = json_string_field(&body, "tag_name") else { return };
+            let Some(tag) = cx.background_spawn(async move { fetch_latest_tag() }).await else {
+                return;
+            };
             // Only surface real upgrades over the running build.
             if parse_version(&tag) <= parse_version(env!("CARGO_PKG_VERSION")) {
                 return;
             }
             // Respect a prior "dismiss" of this exact version so we don't nag.
-            if config_string("update_skip.txt").as_deref() == Some(tag.trim()) {
+            if config_string("update_skip.txt").as_deref() == Some(tag.as_str()) {
                 return;
             }
             this.update(cx, |this, cx| {
-                this.update = Some(UpdateStatus::Available(tag.trim().to_string()));
+                this.update = Some(UpdateStatus::Available(tag));
                 cx.notify();
             })
             .ok();
@@ -11564,6 +11697,25 @@ fn json_string_field(body: &str, key: &str) -> Option<String> {
     Some(rest[..close].to_string())
 }
 
+/// Ask GitHub for the newest release tag (like "v0.2.6"). Blocking network
+/// call — run it off the render thread.
+fn fetch_latest_tag() -> Option<String> {
+    let out = Command::new("curl")
+        .args([
+            "-sL",
+            "--max-time",
+            "8",
+            "-H",
+            "Accept: application/vnd.github+json",
+            &format!("https://api.github.com/repos/{GITHUB_REPO}/releases/latest"),
+        ])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let body = String::from_utf8_lossy(&out.stdout).into_owned();
+    json_string_field(&body, "tag_name").map(|t| t.trim().to_string())
+}
+
 /// The Apple Developer Team that legitimately signs Shuffle. The self-updater
 /// refuses to install a download signed by anyone else, so a tampered or
 /// spoofed DMG can never replace the app.
@@ -12206,6 +12358,10 @@ fn main() {
         let saved_keymap = load_keymap();
         set_active_keymap(saved_keymap.clone());
         cx.set_global(KeymapGlobal(saved_keymap));
+
+        // Shared update-check state (Settings drives it, the main window
+        // installs from it).
+        cx.set_global(UpdateCheckGlobal::default());
 
         // Load the icon pack (if any).
         let saved_pack = load_icon_pack();
