@@ -2213,6 +2213,11 @@ const SPLIT_ANIM_MS: u64 = 220;
 /// Red used for an invalid rename (field border/text + the reason pill).
 const RENAME_ERR_COLOR: u32 = 0xef4444;
 
+/// True while a *tab* is being dragged (gpui only exposes "some drag is
+/// active", and the file-drop highlight must not appear during tab drags).
+/// Set by the chip's drag constructor; cleared on drop or when the drag ends.
+static TAB_DRAG_LIVE: AtomicBool = AtomicBool::new(false);
+
 /// The four resizable columns of the main listing.
 #[derive(Clone, Copy, PartialEq)]
 enum Column {
@@ -2662,6 +2667,11 @@ struct Shuffle {
     /// The row the mouse is currently over: (pane, path). Enter renames it
     /// even when nothing is selected (point-and-rename).
     hovered: Option<(usize, PathBuf)>,
+    /// Where a file drag would land right now: (pane, Some(display row)) for
+    /// a folder row, (pane, None) for the pane's own directory. Computed from
+    /// the drag position on every synthesized drag-move — one source of truth,
+    /// so the highlight can't flicker between panes.
+    drop_hover: Option<(usize, Option<usize>)>,
 }
 
 /// Update-check state shared between the Settings window (which drives the
@@ -2850,6 +2860,7 @@ impl Shuffle {
             update: None,
             preview_page: 0,
             hovered: None,
+            drop_hover: None,
         }
     }
 
@@ -3433,16 +3444,62 @@ impl Shuffle {
     }
 
     /// Compress a file/folder into a `.zip` beside it (Finder uses `ditto`).
+    /// Zip a file/folder beside itself, off-thread so a big folder can't
+    /// freeze the UI while `ditto` runs.
     fn compress_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
         let Some(parent) = path.parent() else { return };
         let stem = path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let dest = unique_child(parent, &format!("{stem}.zip"));
-        let _ = Command::new("ditto")
-            .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
-            .arg(&path)
-            .arg(&dest)
-            .status();
-        self.refresh_pane(pane, cx);
+        cx.spawn(async move |this, cx| {
+            cx.background_spawn(async move {
+                let _ = Command::new("ditto")
+                    .args(["-c", "-k", "--sequesterRsrc", "--keepParent"])
+                    .arg(&path)
+                    .arg(&dest)
+                    .status();
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                if pane < this.panes.len() {
+                    this.refresh_pane(pane, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// "Extract Here" (context menu on archives): unpack into a folder named
+    /// after the archive, beside it. Runs off-thread; the listing refreshes
+    /// when it finishes.
+    fn extract_archive(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
+        let Some(parent) = path.parent() else { return };
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // "proj.tar.gz" extracts into "proj", not "proj.tar".
+        let stem = match archive_suffix(&path) {
+            Some(sfx) => name[..name.len() - sfx.len()].to_string(),
+            None => return,
+        };
+        let dest = unique_child(parent, &stem);
+        cx.spawn(async move |this, cx| {
+            cx.background_spawn(async move {
+                if fs::create_dir_all(&dest).is_err() {
+                    return;
+                }
+                if let Some(mut c) = archive_extract_command(&path) {
+                    let _ = c.arg(&dest).stdout(Stdio::null()).stderr(Stdio::null()).status();
+                }
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                if pane < this.panes.len() {
+                    this.refresh_pane(pane, cx);
+                }
+            });
+        })
+        .detach();
     }
 
     /// Open `path` with a specific application.
@@ -3561,6 +3618,31 @@ impl Shuffle {
                 }))
                 .into_any_element(),
             );
+            // Type-specific actions, Finder-style: archives extract in place,
+            // app bundles reveal their contents.
+            if archive_suffix(&path).is_some() {
+                let p = path.clone();
+                items.push(
+                    ctx_item("Extract Here", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_context_menu(cx);
+                        this.extract_archive(pane, p.clone(), cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
+            if is_dir && path.extension().is_some_and(|e| e == "app") {
+                let p = path.clone();
+                items.push(
+                    ctx_item(
+                        "Show Package Contents",
+                        cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.close_context_menu(cx);
+                            this.navigate_in(pane, p.clone(), cx);
+                        }),
+                    )
+                    .into_any_element(),
+                );
+            }
             items.push(ctx_separator().into_any_element());
             let p = path.clone();
             items.push(
@@ -6261,6 +6343,7 @@ impl Shuffle {
     /// Move a dragged tab to a destination pane at `to_index`. `to_pane ==
     /// panes.len()` means "create a new pane on the right" (the drag-to-split).
     fn move_tab(&mut self, from: TabDrag, to_pane: usize, to_index: usize, cx: &mut Context<Self>) {
+        TAB_DRAG_LIVE.store(false, Ordering::Relaxed);
         if from.pane >= self.panes.len() || from.tab >= self.panes[from.pane].tabs.len() {
             return;
         }
@@ -6525,6 +6608,98 @@ impl Shuffle {
             }
             cx.notify();
         }
+    }
+
+    /// Recompute [`Self::drop_hover`] from the drag position. Runs on every
+    /// (synthesized) mouse move while a drag is in flight; notifies only when
+    /// the target actually changes.
+    fn update_drop_hover(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        if !cx.has_active_drag() {
+            TAB_DRAG_LIVE.store(false, Ordering::Relaxed);
+        }
+        let next = if cx.has_active_drag() && !TAB_DRAG_LIVE.load(Ordering::Relaxed) {
+            self.compute_drop_hover(x, y)
+        } else {
+            None
+        };
+        if self.drop_hover != next {
+            self.drop_hover = next;
+            cx.notify();
+        }
+    }
+
+    /// Which drop target is under (x, y): a folder row's name cell → that
+    /// folder, anywhere else in a pane → the pane's directory. Mirrors the
+    /// actual drop hitboxes (name cell = 12px row padding + name column).
+    fn compute_drop_hover(&self, x: f32, y: f32) -> Option<(usize, Option<usize>)> {
+        for pane in 0..self.panes.len() {
+            let tab = self.tab(pane);
+            let (origin, size, scrolled) = {
+                let st = tab.scroll_handle.0.borrow();
+                let b = st.base_handle.bounds();
+                let scr = (-(f64::from(st.base_handle.offset().y) as f32)).max(0.0);
+                (b.origin, b.size, scr)
+            };
+            let (y0, h) = (f64::from(origin.y) as f32, f64::from(size.height) as f32);
+            // The pane's horizontal extent must come from the VIEWPORT (the
+            // hscroll wrapper) — the list's own bounds grow to the full column
+            // width, which can silently extend underneath the neighbor pane
+            // when the columns are wider than a split pane.
+            let vp = tab.h_scroll.bounds();
+            let (mut x0, mut w) = (
+                f64::from(vp.origin.x) as f32,
+                f64::from(vp.size.width) as f32,
+            );
+            if w <= 1.0 {
+                // Views that don't track the hscroll wrapper (Icons, …) use
+                // the list bounds, which don't overflow there.
+                x0 = f64::from(origin.x) as f32;
+                w = f64::from(size.width) as f32;
+            }
+            if w <= 1.0 || x < x0 || x >= x0 + w {
+                continue;
+            }
+            // Fine-grained folder targeting only in the List view.
+            if tab.view != ViewMode::List || y < y0 || y >= y0 + h {
+                return Some((pane, None));
+            }
+            let row = ((y - y0 + scrolled) / ROW_H).floor();
+            if row < 0.0 {
+                return Some((pane, None));
+            }
+            let row = row as usize;
+            let find_active = tab.find_query.is_some();
+            let has_parent =
+                !find_active && prefs().show_parent && tab.current_dir.parent().is_some();
+            let count = if find_active {
+                tab.find_results.len()
+            } else {
+                tab.entries.len() + usize::from(has_parent)
+            };
+            if row >= count {
+                return Some((pane, None));
+            }
+            // Inside the name cell horizontally? (Row padding is px_3 = 12,
+            // shifted by any horizontal column scroll.)
+            let hx = f64::from(tab.h_scroll.offset().x) as f32;
+            let name_x0 = x0 + hx + 12.0;
+            if x < name_x0 || x >= name_x0 + self.widths.name {
+                return Some((pane, None));
+            }
+            // ".." row targets the parent; entries target real folders only.
+            let is_folder = if has_parent && row == 0 {
+                true
+            } else {
+                let ix = if find_active {
+                    tab.find_results[row]
+                } else {
+                    row - usize::from(has_parent)
+                };
+                tab.entries.get(ix).is_some_and(|e| e.is_dir)
+            };
+            return Some((pane, is_folder.then_some(row)));
+        }
+        None
     }
 
     /// If a left-press on a row has moved past the drag threshold, hand the
@@ -8243,9 +8418,10 @@ impl Shuffle {
                 );
         }
 
-        // Right-edge split target — only present while a tab is being dragged,
-        // so it never blocks normal interaction.
-        if cx.has_active_drag() {
+        // Right-edge split target — only present while a *tab* is being
+        // dragged, so it never blocks normal interaction and its border never
+        // shows up as a stray line during file drags.
+        if cx.has_active_drag() && TAB_DRAG_LIVE.load(Ordering::Relaxed) {
             let new_pane = self.panes.len();
             row = row.child(
                 div()
@@ -8353,6 +8529,7 @@ impl Shuffle {
                     .active(|s| s.bg(rgb(t.selected)))
                     // Drag this tab (live floating preview).
                     .on_drag(drag, move |_, _, _, cx| {
+                        TAB_DRAG_LIVE.store(true, Ordering::Relaxed);
                         cx.new(|_| TabDragPreview {
                             label: label.clone(),
                         })
@@ -8506,8 +8683,14 @@ impl Shuffle {
                     .relative()
                     .flex_1()
                     .min_h_0()
-                    // Dropping file(s) on empty pane space moves them here.
-                    .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(Theme::alpha(theme().accent, 0x22)))
+                    // Dropping file(s) on empty pane space moves them here. The
+                    // tint comes from our tracked drop target rather than
+                    // gpui's per-element drag hover, so it can't flicker
+                    // between the source and destination panes.
+                    .when(
+                        cx.has_active_drag() && self.drop_hover == Some((pane, None)),
+                        |s| s.bg(Theme::alpha(theme().accent, 0x22)),
+                    )
                     .on_drop(cx.listener(move |this, drag: &ExternalPaths, _, cx| {
                         for p in drag.paths() {
                             this.move_into(pane_dir.clone(), p.clone(), cx);
@@ -8590,6 +8773,7 @@ impl Shuffle {
                                         widths,
                                         icon,
                                         true,        // accepts drops (move into parent)
+                                        this.drop_hover == Some((pane, Some(ix))),
                                         None,        // never renamed
                                         cx.listener({
                                             let parent = parent.clone();
@@ -8667,6 +8851,7 @@ impl Shuffle {
                                     widths,
                                     icon,
                                     is_dir,            // folders accept drops
+                                    this.drop_hover == Some((pane, Some(ix))),
                                     rename_text,       // editable name when renaming
                                     cx.listener(move |this, ev: &ClickEvent, _, cx| {
                                         // Cmd/Shift extend the selection; otherwise
@@ -8759,7 +8944,11 @@ impl Shuffle {
             .relative()
             .flex_1()
             .min_h_0()
-            .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(Theme::alpha(theme().accent, 0x22)))
+            // Tracked drop target (see render_list_body) — no flicker.
+            .when(
+                cx.has_active_drag() && self.drop_hover == Some((pane, None)),
+                |s| s.bg(Theme::alpha(theme().accent, 0x22)),
+            )
             .on_drop(cx.listener(move |this, drag: &ExternalPaths, _, cx| {
                 for p in drag.paths() {
                     this.move_into(pane_dir.clone(), p.clone(), cx);
@@ -9122,6 +9311,7 @@ impl Render for Shuffle {
                 this.update_scroll_drag(y, cx);
                 this.update_divider(x, cx);
                 this.update_marquee(x, y, cx);
+                this.update_drop_hover(x, y, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
@@ -9131,6 +9321,10 @@ impl Render for Shuffle {
                     this.end_scroll_drag(cx);
                     this.divider_drag = None;
                     this.end_marquee(cx);
+                    // A native file drag ends as a synthesized mouse-up.
+                    if this.drop_hover.take().is_some() {
+                        cx.notify();
+                    }
                 }),
             )
             // A slim titlebar strip in the app's own background color. With the
@@ -9606,6 +9800,33 @@ fn is_pdf(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()).map(|e| e.to_lowercase()).as_deref() == Some("pdf")
 }
 
+/// Archive suffixes "Extract Here" can unpack with built-in tools, longest
+/// first so `foo.tar.gz` strips as a tarball rather than a ".gz".
+const ARCHIVE_SUFFIXES: &[&str] = &[
+    ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz", ".txz", ".tar", ".zip",
+];
+
+/// The matched archive suffix of `path`, if it's an extractable archive.
+fn archive_suffix(path: &Path) -> Option<&'static str> {
+    let name = path.file_name()?.to_string_lossy().to_lowercase();
+    ARCHIVE_SUFFIXES.iter().find(|s| name.ends_with(*s)).copied()
+}
+
+/// The extraction command for `path`, ready for the destination directory to
+/// be appended as its final argument (`ditto -xk src DEST` / `tar -xf src -C DEST`).
+fn archive_extract_command(path: &Path) -> Option<Command> {
+    let suffix = archive_suffix(path)?;
+    let mut c;
+    if suffix == ".zip" {
+        c = Command::new("ditto");
+        c.arg("-xk").arg(path);
+    } else {
+        c = Command::new("tar");
+        c.arg("-xf").arg(path).arg("-C");
+    }
+    Some(c)
+}
+
 /// Path to the bundled `removebg` Swift helper, if it was compiled in.
 fn removebg_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
@@ -9748,6 +9969,9 @@ fn file_row(
     // Drag-and-drop: `accept_drop` true => it's a drop target (a folder or the
     // ".." row) that runs `on_drop_file` when files are dropped on it.
     accept_drop: bool,
+    // True while the tracked drag target is this row's folder: highlights the
+    // name cell (driven by Shuffle::drop_hover, not gpui's drag hover).
+    drop_hilite: bool,
     // When Some, this row is being renamed: the name shows as an editable field
     // with (text, cursor char-index, selection-anchor char-index, invalid).
     // Invalid names render the field in red (the pane shows the reason).
@@ -9833,12 +10057,10 @@ fn file_row(
         // Press records a drag candidate (promoted to a native OS drag on move)
         // and stops a marquee from starting on the list behind it.
         .on_mouse_down(MouseButton::Left, on_press)
-        // Folders / ".." accept dropped files (from within Shuffle or Finder).
-        .when(accept_drop, |row| {
-            row.drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme().selected)))
-                .on_drop(on_drop_file)
-        })
-        // Name (icon + label). Long names truncate with an ellipsis.
+        // Name (icon + label). Long names truncate with an ellipsis. Only this
+        // cell is the "drop into this folder" target — dropping further along
+        // the row (Kind/Date/Size) falls through to the pane and lands in the
+        // current directory instead, like Finder.
         .child(
             div()
                 .flex_none()
@@ -9847,6 +10069,8 @@ fn file_row(
                 .items_center()
                 .gap_2()
                 .pr_2()
+                .when(accept_drop, |c| c.rounded_sm().on_drop(on_drop_file))
+                .when(drop_hilite, |c| c.bg(rgb(theme().selected)))
                 .child(
                     div()
                         .flex_none()
