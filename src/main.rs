@@ -2300,9 +2300,24 @@ const FOLDER_KEY: &str = "\u{0}folder";
 const FILE_KEY: &str = "\u{0}file";
 
 /// What activating a command-palette item does.
+/// One entry in the palette's ⌘K actions panel.
+#[derive(Clone, Copy, PartialEq)]
+enum PaletteAction {
+    /// Open the item (navigate into a dir / launch a file's default app).
+    Open,
+    /// Navigate to the file's enclosing folder and select it.
+    RevealShuffle,
+    /// Open the folder (or the file's folder) in a new tab.
+    OpenNewTab,
+    /// Reveal in Finder.
+    RevealFinder,
+    /// Copy the full path to the clipboard.
+    CopyPath,
+}
+
 #[derive(Clone)]
 enum Action {
-    /// Open a path (navigate into it if a dir, else reveal its parent).
+    /// Open a path (navigate into it if a dir, else open the file).
     Open(PathBuf, bool),
     /// Copy the current directory's path to the clipboard.
     CopyDir,
@@ -2632,6 +2647,8 @@ struct Shuffle {
     palette_hist_pos: Option<usize>,
     palette_items: Vec<PaletteItem>,
     selected: usize,
+    /// The palette's ⌘K actions panel: selected action index (None = closed).
+    palette_actions: Option<usize>,
     search_gen: u64,
     palette_scroll: ScrollHandle,
     /// In-memory fuzzy index of ~/ (None until the background build finishes).
@@ -2841,6 +2858,7 @@ impl Shuffle {
             palette_hist_pos: None,
             palette_items: Vec::new(),
             selected: 0,
+            palette_actions: None,
             search_gen: 0,
             palette_scroll: ScrollHandle::new(),
             index: None,
@@ -3024,16 +3042,9 @@ impl Shuffle {
         }
     }
 
-    /// Scroll a freshly-created item into view, select it, and open the name
-    /// editor so the user can type the real name immediately. Enter with
-    /// nothing typed, Escape, or clicking elsewhere keeps the default name.
-    fn reveal_and_rename(
-        &mut self,
-        pane: usize,
-        path: PathBuf,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    /// Scroll an item into view in `pane`, select it, and make it the focused
+    /// entry (inspector target / rename target).
+    fn reveal_in_pane(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
         let paths = self.display_paths(pane);
         if let Some(ix) = paths.iter().position(|p| p == &path) {
             let (view, off) = {
@@ -3053,7 +3064,20 @@ impl Shuffle {
             self.mark_scrolled(pane, cx);
         }
         self.tab_mut(pane).selection = std::iter::once(path.clone()).collect();
-        self.focus_entry(pane, path.clone(), cx);
+        self.focus_entry(pane, path, cx);
+    }
+
+    /// Scroll a freshly-created item into view, select it, and open the name
+    /// editor so the user can type the real name immediately. Enter with
+    /// nothing typed, Escape, or clicking elsewhere keeps the default name.
+    fn reveal_and_rename(
+        &mut self,
+        pane: usize,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.reveal_in_pane(pane, path.clone(), cx);
         self.begin_rename(pane, path, window, cx);
     }
 
@@ -4817,6 +4841,7 @@ impl Shuffle {
 
     fn close_palette(&mut self, cx: &mut Context<Self>) {
         self.palette_open = false;
+        self.palette_actions = None;
         cx.notify();
     }
 
@@ -4836,6 +4861,7 @@ impl Shuffle {
         self.search_gen = self.search_gen.wrapping_add(1);
         let gen = self.search_gen;
         self.selected = 0;
+        self.palette_actions = None;
         self.palette_scroll.set_offset(point(px(0.0), px(0.0)));
         let q = self.query.trim().to_string();
 
@@ -4998,13 +5024,14 @@ impl Shuffle {
         self.record_palette_history();
         match action {
             Action::Open(path, is_dir) => {
-                let target = if is_dir {
-                    path
-                } else {
-                    path.parent().map(Path::to_path_buf).unwrap_or(path)
-                };
                 self.close_palette(cx);
-                self.navigate_to(target, cx);
+                if is_dir {
+                    self.navigate_to(path, cx);
+                } else {
+                    // Enter opens the file itself (Spotlight-style); ⌘K offers
+                    // "Show in enclosing folder" for the old navigate behavior.
+                    let _ = Command::new("open").arg(&path).spawn();
+                }
             }
             Action::CopyDir => {
                 let text = self.active_tab().current_dir.to_string_lossy().into_owned();
@@ -5016,6 +5043,74 @@ impl Shuffle {
                 open_settings_window(cx);
             }
             Action::None => {}
+        }
+    }
+
+    /// The ⌘K actions available for the palette's selected item, with labels.
+    fn palette_action_list(&self) -> Vec<(PaletteAction, &'static str)> {
+        match self.palette_items.get(self.selected).map(|i| &i.action) {
+            Some(Action::Open(_, true)) => vec![
+                (PaletteAction::Open, "Open folder"),
+                (PaletteAction::OpenNewTab, "Open in new tab"),
+                (PaletteAction::RevealFinder, "Reveal in Finder"),
+                (PaletteAction::CopyPath, "Copy path"),
+            ],
+            Some(Action::Open(_, false)) => vec![
+                (PaletteAction::Open, "Open file"),
+                (PaletteAction::RevealShuffle, "Show in enclosing folder"),
+                (PaletteAction::OpenNewTab, "Open folder in new tab"),
+                (PaletteAction::RevealFinder, "Reveal in Finder"),
+                (PaletteAction::CopyPath, "Copy path"),
+            ],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Run one of the ⌘K actions on the palette's selected item.
+    fn run_palette_action(&mut self, act: PaletteAction, cx: &mut Context<Self>) {
+        let Some(item) = self.palette_items.get(self.selected) else {
+            return;
+        };
+        let Action::Open(path, is_dir) = item.action.clone() else {
+            return;
+        };
+        self.record_palette_history();
+        let parent = || path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone());
+        match act {
+            PaletteAction::Open => {
+                self.close_palette(cx);
+                if is_dir {
+                    self.navigate_to(path, cx);
+                } else {
+                    let _ = Command::new("open").arg(&path).spawn();
+                }
+            }
+            PaletteAction::RevealShuffle => {
+                self.close_palette(cx);
+                self.navigate_to(parent(), cx);
+                let pane = self.active_pane;
+                self.reveal_in_pane(pane, path, cx);
+            }
+            PaletteAction::OpenNewTab => {
+                self.close_palette(cx);
+                let pane = self.active_pane;
+                self.new_tab_in(pane, cx);
+                let dir = if is_dir { path.clone() } else { parent() };
+                self.navigate_in(pane, dir, cx);
+                if !is_dir {
+                    self.reveal_in_pane(pane, path, cx);
+                }
+            }
+            PaletteAction::RevealFinder => {
+                let _ = Command::new("open").arg("-R").arg(&path).spawn();
+                self.close_palette(cx);
+            }
+            PaletteAction::CopyPath => {
+                cx.write_to_clipboard(ClipboardItem::new_string(
+                    path.to_string_lossy().into_owned(),
+                ));
+                self.close_palette(cx);
+            }
         }
     }
 
@@ -5236,6 +5331,52 @@ impl Shuffle {
             }
             if km.get(KeyAction::PaletteHistoryNext) == Some(kc.as_str()) {
                 self.palette_history_next(cx);
+                return;
+            }
+        }
+
+        // ⌘K toggles the actions panel for the selected file/folder.
+        if cmd && key == "k" {
+            if self.palette_actions.is_some() {
+                self.palette_actions = None;
+            } else if !self.palette_action_list().is_empty() {
+                self.palette_actions = Some(0);
+            }
+            cx.notify();
+            return;
+        }
+        // While the actions panel is open, arrows/Enter drive it; anything
+        // else closes it and falls through to normal palette handling.
+        if let Some(sel) = self.palette_actions {
+            let acts = self.palette_action_list();
+            let handled = match key {
+                "escape" => {
+                    self.palette_actions = None;
+                    true
+                }
+                "up" => {
+                    self.palette_actions = Some(sel.saturating_sub(1));
+                    true
+                }
+                "down" => {
+                    self.palette_actions =
+                        Some((sel + 1).min(acts.len().saturating_sub(1)));
+                    true
+                }
+                "enter" => {
+                    self.palette_actions = None;
+                    if let Some(&(act, _)) = acts.get(sel) {
+                        self.run_palette_action(act, cx);
+                    }
+                    true
+                }
+                _ => {
+                    self.palette_actions = None;
+                    false
+                }
+            };
+            cx.notify();
+            if handled {
                 return;
             }
         }
@@ -5529,6 +5670,123 @@ impl Shuffle {
                 .child(format!("{before}\u{2502}{after}"))
         };
 
+        // What Enter would do to the current selection (footer hint).
+        let enter_label = match self.palette_items.get(self.selected).map(|i| &i.action) {
+            Some(Action::Open(_, true)) => "Open folder",
+            Some(Action::Open(_, false)) => "Open file",
+            Some(_) => "Run",
+            None => "Open",
+        };
+        let has_actions = !self.palette_action_list().is_empty();
+
+        let panel = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .overflow_hidden()
+            // ~75% opaque so the explorer shows faintly through the menu.
+            .bg(Theme::alpha(t.surface, 0xbf))
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(t.border_strong))
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_b_1()
+                    .border_color(rgb(t.border_strong))
+                    .child(div().flex_none().text_color(rgb(t.accent)).child("›"))
+                    .child(input),
+            )
+            // Scrollable, height-capped results with a scroll indicator.
+            .child(
+                div()
+                    .relative()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .id("palette-results")
+                            .h(px(list_h))
+                            .overflow_y_scroll()
+                            .track_scroll(&self.palette_scroll)
+                            .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| {
+                                cx.notify()
+                            }))
+                            .flex()
+                            .flex_col()
+                            .children(rows),
+                    )
+                    .children(self.palette_scrollbar_thumb()),
+            )
+            // Footer: what you can do with the selection.
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_3()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(rgb(t.border_strong))
+                    .text_xs()
+                    .text_color(rgb(t.text_dim))
+                    .child(palette_hint("↩", enter_label))
+                    .when(has_actions, |f| f.child(palette_hint("⌘K", "Actions")))
+                    .child(palette_hint("↑↓", "Navigate"))
+                    .child(palette_hint("esc", "Close")),
+            );
+
+        // Wrapper: positions the palette and hosts the ⌘K dropdown OUTSIDE the
+        // panel's overflow_hidden, so the menu is never clipped.
+        let mut wrap = div().relative().mt(px(90.0)).w(px(680.0)).child(panel);
+
+        // The ⌘K actions panel: drops down from the palette's bottom-right
+        // corner (there's always window space below — the palette hugs the top).
+        if let Some(sel) = self.palette_actions {
+            let acts = self.palette_action_list();
+            if !acts.is_empty() {
+                let sel = sel.min(acts.len() - 1);
+                wrap = wrap.child(
+                    div()
+                        .absolute()
+                        .top(relative(1.0))
+                        .right(px(10.0))
+                        .mt(px(6.0))
+                        .w(px(240.0))
+                        .flex()
+                        .flex_col()
+                        .py_1()
+                        .bg(Theme::alpha(t.surface, 0xf7))
+                        .rounded_md()
+                        .border_1()
+                        .border_color(rgb(t.border_strong))
+                        .shadow_lg()
+                        .children(acts.into_iter().enumerate().map(|(i, (act, label))| {
+                            let selected = i == sel;
+                            div()
+                                .id(("pal-act", i))
+                                .px_3()
+                                .py_1()
+                                .cursor_pointer()
+                                .text_color(rgb(t.text))
+                                .when(selected, |s| s.bg(rgb(t.selected)))
+                                .when(!selected, |s| s.hover(|s| s.bg(rgb(t.hover))))
+                                .child(label)
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.palette_actions = None;
+                                    this.run_palette_action(act, cx);
+                                }))
+                                .into_any_element()
+                        })),
+                );
+            }
+        }
+
         // Backdrop covering the window, with the panel near the top.
         div()
             .absolute()
@@ -5544,53 +5802,7 @@ impl Shuffle {
             .bg(rgba(0x00000033))
             // Block scroll/click from reaching the file list behind the palette.
             .occlude()
-            .child(
-                div()
-                    .mt(px(90.0))
-                    .w(px(680.0))
-                    .flex()
-                    .flex_col()
-                    .overflow_hidden()
-                    // ~75% opaque so the explorer shows faintly through the menu.
-                    .bg(Theme::alpha(t.surface, 0xbf))
-                    .rounded_lg()
-                    .border_1()
-                    .border_color(rgb(t.border_strong))
-                    .shadow_lg()
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .px_3()
-                            .py_2()
-                            .border_b_1()
-                            .border_color(rgb(t.border_strong))
-                            .child(div().flex_none().text_color(rgb(t.accent)).child("›"))
-                            .child(input),
-                    )
-                    // Scrollable, height-capped results with a scroll indicator.
-                    .child(
-                        div()
-                            .relative()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .id("palette-results")
-                                    .h(px(list_h))
-                                    .overflow_y_scroll()
-                                    .track_scroll(&self.palette_scroll)
-                                    .on_scroll_wheel(cx.listener(|_, _: &ScrollWheelEvent, _, cx| {
-                                        cx.notify()
-                                    }))
-                                    .flex()
-                                    .flex_col()
-                                    .children(rows),
-                            )
-                            .children(self.palette_scrollbar_thumb()),
-                    ),
-            )
+            .child(wrap)
     }
 
     /// A floating, draggable scrollbar thumb sized/positioned from the list's
@@ -9943,6 +10155,24 @@ fn nav_item(
         .on_mouse_down(MouseButton::Right, on_right)
 }
 
+/// A "key chip + label" pair for the palette's footer hints ("↩ Open file").
+fn palette_hint(key: &'static str, label: &'static str) -> impl IntoElement {
+    let t = theme();
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .child(
+            div()
+                .px_1()
+                .rounded_sm()
+                .bg(Theme::alpha(t.text_dim, 0x22))
+                .text_color(rgb(t.text_muted))
+                .child(key),
+        )
+        .child(label)
+}
+
 fn empty_hint(text: &str) -> impl IntoElement {
     div()
         .px_3()
@@ -12075,13 +12305,41 @@ fn launch_swap_and_relaunch(bundle: &Path, ready: &PreparedUpdate) -> Result<(),
     let pid = std::process::id();
     let script = std::env::temp_dir().join("shuffle-selfupdate.sh");
     // $1 DEST bundle  $2 SRC app  $3 MOUNT  $4 DMG  $5 PID  $6 fallback URL
+    // The swap NEVER deletes the old bundle — it renames it into the Trash
+    // (Sparkle-style). Hard-deleting an app reads as an uninstall to macOS,
+    // which revokes its TCC privacy grants and makes the updated app re-ask
+    // for every folder permission. A rename keeps the identity alive, so
+    // grants carry over. Both renames are atomic on the same volume.
     let body = r#"#!/bin/bash
 DEST="$1"; SRC="$2"; MOUNT="$3"; DMG="$4"; PID="$5"; URL="$6"
 # Wait (up to ~20s) for the old app to exit before touching its bundle.
 for _ in $(seq 1 200); do kill -0 "$PID" 2>/dev/null || break; sleep 0.1; done
-if ditto "$SRC" "$DEST.updnew" 2>/dev/null && rm -rf "$DEST" 2>/dev/null && mv "$DEST.updnew" "$DEST" 2>/dev/null; then
+TRASH="$HOME/.Trash"
+OLD="$TRASH/Shuffle-old-$$.app"
+ok=""
+if ditto "$SRC" "$DEST.updnew" 2>/dev/null; then
+  # Defensive: a quarantined copy would launch translocated (and re-prompt).
+  xattr -dr com.apple.quarantine "$DEST.updnew" 2>/dev/null
+  # Move the old app aside (Trash first, sibling rename as fallback)…
+  if ! mv "$DEST" "$OLD" 2>/dev/null; then
+    OLD="${DEST%.app}.updold.app"
+    mv "$DEST" "$OLD" 2>/dev/null
+  fi
+  # …then the new one into place; roll the old back if that fails.
+  if [ ! -e "$DEST" ] && mv "$DEST.updnew" "$DEST" 2>/dev/null; then
+    ok=1
+  else
+    [ -d "$OLD" ] && [ ! -e "$DEST" ] && mv "$OLD" "$DEST" 2>/dev/null
+  fi
+fi
+if [ -n "$ok" ]; then
   hdiutil detach "$MOUNT" -quiet 2>/dev/null
   rm -f "$DMG" 2>/dev/null
+  # If the Trash move had failed, try once more now; never hard-delete it.
+  case "$OLD" in
+    "$TRASH"/*) : ;;
+    *) mv "$OLD" "$TRASH/Shuffle-old-$$.app" 2>/dev/null ;;
+  esac
   open "$DEST"
 else
   rm -rf "$DEST.updnew" 2>/dev/null
