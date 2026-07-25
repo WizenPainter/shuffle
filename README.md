@@ -75,6 +75,14 @@ cargo build --release     # optimized
 | `Cmd+W`  | Close tab                    |
 | `Cmd+,`  | Settings                     |
 
+## Roadmap — you pick what's next
+
+The [roadmap](ROADMAP.md) is prioritized by community votes. Every planned
+item has a thread in
+[Ideas](https://github.com/WizenPainter/shuffle/discussions/categories/ideas) —
+open one and hit **⬆ upvote** to push it up the queue, or start a new thread
+to propose something.
+
 ## Status
 
 Early but usable, under active development. Contributions and ideas welcome.
