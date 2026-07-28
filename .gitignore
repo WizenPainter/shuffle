@@ -1,3 +1,7 @@
 /target
 **/*.rs.bk
 .DS_Store
+
+# Distributable installer binaries — published as GitHub Release assets,
+# never committed to Git (they bloat history and every clone).
+*.dmg
