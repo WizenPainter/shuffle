@@ -5,3 +5,7 @@
 # Distributable installer binaries — published as GitHub Release assets,
 # never committed to Git (they bloat history and every clone).
 *.dmg
+
+# The built app bundle is a generated artifact (make_app.sh rebuilds it);
+# it ships as a Release asset, never committed.
+/Shuffle.app/

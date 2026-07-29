@@ -18,6 +18,8 @@ Format rules the website parser expects:
 - [x] In-app self-updater - updates now keep your permissions
 - [x] Tabs and split panes with precise drag & drop
 - [x] Live folder refresh - new downloads appear instantly
+- [x] Search upgrades - content search + kind/ext/size/date filters in filter & palette
+- [x] Script actions - run your own shell scripts from the right-click menu
 - [ ] Smoother, more premium feel everywhere - vote: github.com/WizenPainter/shuffle/discussions/1
 
 ## Next
@@ -31,7 +33,6 @@ Format rules the website parser expects:
 
 - [ ] Discover Macs & servers on the local network - Bonjour/SMB - vote: github.com/WizenPainter/shuffle/discussions/5
 - [ ] Preview more file types & archive browsing - vote: github.com/WizenPainter/shuffle/discussions/7
-- [ ] Search upgrades - content search, kind/date/size filters - vote: github.com/WizenPainter/shuffle/discussions/8
-- [ ] Plugin / scripting API
+- [ ] Richer plugin runtime - embedded Lua or WASM, evaluated as a follow-up to script actions
 - [ ] Localization
 - [ ] Maybe: a one-time Pro purchase - never a subscription

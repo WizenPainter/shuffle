@@ -22,7 +22,7 @@ use chrono::{DateTime, Local};
 use gpui::{
     actions, anchored, div, ease_out_quint, img, point, prelude::*, px, relative, rgb, rgba, size,
     uniform_list, Animation, AnimationExt, AnyElement, App,
-    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ExternalPaths, FocusHandle, ImageSource,
+    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ExternalPaths, FocusHandle, FontWeight, ImageSource,
     KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
     PathPromptOptions, Rgba,
     RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, TitlebarOptions,
@@ -304,6 +304,14 @@ fn apply_theme(t: Theme, cx: &mut App) {
     set_active_theme(t);
     save_theme(&t);
     cx.set_global(ThemeGlobal(t));
+    // Keep menus following the theme unless the user chose menu colors.
+    let mut m = menu_style();
+    if !m.custom {
+        m.follow_theme(&t);
+        set_active_menu(m);
+        save_menu_style(&m);
+        cx.set_global(MenuStyleGlobal(m));
+    }
     cx.refresh_windows();
 }
 
@@ -336,6 +344,8 @@ struct Prefs {
     show_filter_button: bool,
     /// Show a live frame-rate meter in the top-right (debug; costs some CPU).
     show_fps: bool,
+    /// Run user shell-script actions from the Scripts folder in menus.
+    script_actions: bool,
 }
 
 impl Default for Prefs {
@@ -353,6 +363,7 @@ impl Default for Prefs {
             groups_enabled: false,
             show_filter_button: true,
             show_fps: false,
+            script_actions: false,
         }
     }
 }
@@ -375,6 +386,7 @@ thread_local! {
         groups_enabled: false,
         show_filter_button: true,
         show_fps: false,
+        script_actions: false,
     }) };
 }
 
@@ -437,12 +449,26 @@ struct MenuStyle {
     opacity: u8,
     /// Menu font size in pixels.
     font_px: f32,
+    /// True once the user picks explicit menu colors. While false, `bg`/`text`
+    /// follow the active theme (so switching to a light theme lightens menus
+    /// too); opacity and size are always user-controlled.
+    custom: bool,
 }
 
 impl Default for MenuStyle {
     fn default() -> Self {
         let d = Theme::default();
-        MenuStyle { bg: d.surface, text: d.text, opacity: 100, font_px: 14.0 }
+        MenuStyle { bg: d.surface, text: d.text, opacity: 100, font_px: 14.0, custom: false }
+    }
+}
+
+impl MenuStyle {
+    /// Re-derive `bg`/`text` from the theme unless the user set explicit colors.
+    fn follow_theme(&mut self, t: &Theme) {
+        if !self.custom {
+            self.bg = t.surface;
+            self.text = t.text;
+        }
     }
 }
 
@@ -933,11 +959,34 @@ enum ColorTarget {
 /// The Settings window: a tabbed customization surface.
 struct Settings {
     tab: usize,
+    /// The section within the active tab the rail last jumped to (highlighted
+    /// in the nested sidebar list).
+    section: usize,
+    /// Scrolls the content pane so a rail sub-item can jump to its section.
+    content_scroll: ScrollHandle,
     focus: FocusHandle,
     /// The action whose keystroke is currently being recorded, if any.
     recording: Option<KeyAction>,
     /// In-progress hex color entry: (which color, typed hex digits).
     color_edit: Option<(ColorTarget, String)>,
+}
+
+/// Section names shown as nested rail items for a settings tab (and the order
+/// they appear in the content pane, after the page header at child index 0).
+fn tab_sections(tab: usize) -> &'static [&'static str] {
+    match tab {
+        0 => &[
+            "Explorer",
+            "Inspector",
+            "Command Palette",
+            "Sidebar",
+            "Script Actions",
+            "Software Update",
+            "Developer",
+        ],
+        2 => &["Theme", "Colors", "Menu", "App Icon", "Icon Pack"],
+        _ => &[],
+    }
 }
 
 impl Settings {
@@ -947,6 +996,8 @@ impl Settings {
         cx.observe_global::<UpdateCheckGlobal>(|_, cx| cx.notify()).detach();
         Settings {
             tab: 0,
+            section: 0,
+            content_scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
             recording: None,
             color_edit: None,
@@ -1020,11 +1071,13 @@ impl Settings {
                             ColorTarget::MenuBg => {
                                 let mut nm = menu_style();
                                 nm.bg = c;
+                                nm.custom = true;
                                 apply_menu_style(nm, cx);
                             }
                             ColorTarget::MenuText => {
                                 let mut nm = menu_style();
                                 nm.text = c;
+                                nm.custom = true;
                                 apply_menu_style(nm, cx);
                             }
                         }
@@ -1079,15 +1132,18 @@ impl Settings {
 impl Render for Settings {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
-        let tabs = ["General", "Keybinds", "Customization"];
+        let tabs = [("General", "\u{2699}"), ("Keybinds", "\u{2318}"), ("Customization", "\u{25d0}")];
 
         // Left tab rail.
         let mut tab_items: Vec<AnyElement> = Vec::new();
-        for (i, name) in tabs.iter().enumerate() {
+        for (i, (name, glyph)) in tabs.iter().enumerate() {
             let active = i == self.tab;
             tab_items.push(
                 div()
                     .id(("tab", i))
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .px_3()
                     .py_2()
                     .mx_2()
@@ -1096,32 +1152,81 @@ impl Render for Settings {
                     .text_color(if active { rgb(t.text) } else { rgb(t.text_muted) })
                     .when(active, |s| s.bg(rgb(t.surface)))
                     .when(!active, |s| s.hover(|s| s.bg(rgb(t.hover))))
+                    .child(
+                        div()
+                            .w(px(16.0))
+                            .flex()
+                            .justify_center()
+                            .text_color(if active { rgb(t.accent) } else { rgb(t.text_dim) })
+                            .child(glyph.to_string()),
+                    )
                     .child(name.to_string())
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.tab = i;
+                        this.section = 0;
+                        this.content_scroll.set_offset(point(px(0.0), px(0.0)));
                         cx.notify();
                     }))
                     .into_any_element(),
             );
+
+            // Nested section links under the active tab — click to jump.
+            if i == self.tab {
+                for (si, sname) in tab_sections(i).iter().enumerate() {
+                    let active_sec = si == self.section;
+                    tab_items.push(
+                        div()
+                            .id(("sec", i * 100 + si))
+                            .flex()
+                            .items_center()
+                            .py_1()
+                            .mx_2()
+                            .pl(px(34.0))
+                            .pr_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .text_xs()
+                            .text_color(if active_sec { rgb(t.text) } else { rgb(t.text_muted) })
+                            .when(active_sec, |s| s.bg(rgb(t.hover)))
+                            .when(!active_sec, |s| s.hover(|s| s.bg(rgb(t.hover))))
+                            .child(sname.to_string())
+                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.section = si;
+                                this.content_scroll.scroll_to_top_of_item(si + 1);
+                                cx.notify();
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
         }
 
         let rail = div()
             .flex_none()
-            .w(px(170.0))
+            .w(px(184.0))
             .h_full()
-            .pt_4()
+            .pt_3()
             .flex()
             .flex_col()
             .gap_1()
             .bg(rgb(t.sidebar))
             .border_r_1()
             .border_color(rgb(t.border))
+            .child(
+                div()
+                    .px_4()
+                    .pb_2()
+                    .text_base()
+                    .font_weight(FontWeight::BOLD)
+                    .text_color(rgb(t.text))
+                    .child("Settings"),
+            )
             .children(tab_items);
 
-        let content = match self.tab {
-            0 => self.render_general(cx).into_any_element(),
-            1 => self.render_keybinds(cx).into_any_element(),
-            _ => self.render_customization(cx).into_any_element(),
+        let children = match self.tab {
+            0 => self.render_general(cx),
+            1 => self.render_keybinds(cx),
+            _ => self.render_customization(cx),
         };
 
         div()
@@ -1136,279 +1241,386 @@ impl Render for Settings {
             }))
             .child(rail)
             .child(
+                // The section blocks are direct children so a rail link can
+                // scroll_to_top_of_item(section_index + 1) to jump to one.
                 div()
                     .id("settings-content")
                     .flex_1()
                     .min_w_0()
                     .h_full()
                     .overflow_y_scroll()
+                    .track_scroll(&self.content_scroll)
+                    .flex()
+                    .flex_col()
+                    .gap_4()
                     .p_5()
-                    .child(content),
+                    .children(children),
             )
     }
 }
 
 impl Settings {
-    fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// The General tab as an ordered list of blocks: page header, then one card
+    /// per section (matching `tab_sections(0)`), then the reset button. Returned
+    /// as separate children so the rail can scroll to any section.
+    fn render_general(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let p = prefs();
+        let t = theme();
+        let script_count = discover_script_actions().len();
+
+        let scripts_folder_row = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_color(rgb(t.text)).child("Scripts folder"))
+                    .child(div().text_xs().text_color(rgb(t.text_muted)).child(format!(
+                        "{} script{} loaded — the README there explains the format.",
+                        script_count,
+                        if script_count == 1 { "" } else { "s" }
+                    ))),
+            )
+            .child(
+                div()
+                    .id("open-scripts")
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(t.surface))
+                    .text_color(rgb(t.text))
+                    .hover(|s| s.bg(rgb(t.hover)))
+                    .active(|s| s.bg(rgb(t.selected)))
+                    .child("Open Scripts Folder")
+                    .on_click(cx.listener(|_, _: &ClickEvent, _, _| {
+                        if let Some(dir) = ensure_scripts_dir() {
+                            let _ = Command::new("open").arg(&dir).spawn();
+                        }
+                    })),
+            )
+            .into_any_element();
+
+        vec![
+            settings_header(
+                "General",
+                "How the explorer behaves and what the side panels show.",
+            )
+            .into_any_element(),
+            settings_section(
+                "Explorer",
+                Some("Navigation and the file list."),
+                vec![
+                    toggle_row(
+                        "tg-show-parent",
+                        "Show \u{201c}..\u{201d} (up one level)",
+                        "Show the leading \u{201c}..\u{201d} entry in list view that navigates to the parent folder.",
+                        p.show_parent,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.show_parent = !np.show_parent;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    toggle_row(
+                        "tg-filter-button",
+                        "Filter button",
+                        "Show the always-on \u{201c}Filter\u{201d} button in the bottom-right corner. Pressing / still opens the filter either way.",
+                        p.show_filter_button,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.show_filter_button = !np.show_filter_button;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    toggle_row(
+                        "tg-terminal",
+                        "Terminal mode",
+                        "Show a command input at the bottom to move through the explorer like a terminal (with path/command autocomplete).",
+                        p.terminal,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.terminal = !np.terminal;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    toggle_row(
+                        "tg-term-history",
+                        "Terminal history",
+                        "Show a scrollback of what you've typed and command output above the input (otherwise it's just the input line).",
+                        p.term_history,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.term_history = !np.term_history;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                ],
+            ),
+            settings_section(
+                "Inspector",
+                Some("The side panel shown when you click a file."),
+                vec![
+                    toggle_row(
+                        "tg-preview",
+                        "Preview",
+                        "Click a file once to preview it (images, PDFs, documents, \u{2026}) in the inspector panel.",
+                        p.preview,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.preview = !np.preview;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    toggle_row(
+                        "tg-preview-pages",
+                        "Preview page controls",
+                        "Show \u{2039} \u{203a} arrows under multi-page PDF previews to flip through the pages without opening the file.",
+                        p.preview_pages,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.preview_pages = !np.preview_pages;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    toggle_row(
+                        "tg-info",
+                        "Information",
+                        "Click a file once to see its details (kind, size, dates, dimensions, color space, and more) in the inspector panel.",
+                        p.info,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.info = !np.info;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                ],
+            ),
+            settings_section(
+                "Command Palette",
+                Some("The Cmd+P search and actions."),
+                vec![toggle_row(
+                    "tg-palette-history",
+                    "Command palette history",
+                    "Give Cmd+P its own query history: press Up/Down in the palette to cycle through your previous searches.",
+                    p.palette_history,
+                    cx.listener(|_, _: &ClickEvent, _, cx| {
+                        let mut np = prefs();
+                        np.palette_history = !np.palette_history;
+                        apply_prefs(np, cx);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()],
+            ),
+            settings_section(
+                "Sidebar",
+                None,
+                vec![
+                    toggle_row(
+                        "tg-groups",
+                        "Sidebar groups",
+                        "Create custom groups of files/folders in the sidebar. Right-click the sidebar to make a group, then right-click any item to add it.",
+                        p.groups_enabled,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.groups_enabled = !np.groups_enabled;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    stepper_row(
+                        "st-recents",
+                        "Recent folders",
+                        "How many recently-visited folders to show in the sidebar (0 hides the Recents section).",
+                        if p.recent_limit == 0 {
+                            "Off".to_string()
+                        } else {
+                            p.recent_limit.to_string()
+                        },
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.recent_limit = np.recent_limit.saturating_sub(1);
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.recent_limit = (np.recent_limit + 1).min(RECENTS_CAP);
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                ],
+            ),
+            settings_section(
+                "Script Actions",
+                Some("Run your own shell scripts from the right-click menu."),
+                vec![
+                    toggle_row(
+                        "tg-script-actions",
+                        "Run script actions",
+                        "Show your own shell scripts (from the Scripts folder) in the right-click menu for matching files, and run them with the selected paths. Only scripts you put there run \u{2014} treat it like your ~/bin.",
+                        p.script_actions,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.script_actions = !np.script_actions;
+                            if np.script_actions {
+                                ensure_scripts_dir();
+                            }
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    scripts_folder_row,
+                ],
+            ),
+            settings_section(
+                "Software Update",
+                None,
+                vec![self.render_update_row(cx)],
+            ),
+            settings_section(
+                "Developer",
+                Some("Diagnostics for checking performance."),
+                vec![toggle_row(
+                    "tg-show-fps",
+                    "Frame rate meter",
+                    "Show a live FPS readout in the top-right of the explorer window. Forces continuous redraws to measure them, so it uses some CPU while on \u{2014} meant for checking smoothness, not everyday use.",
+                    p.show_fps,
+                    cx.listener(|_, _: &ClickEvent, _, cx| {
+                        let mut np = prefs();
+                        np.show_fps = !np.show_fps;
+                        apply_prefs(np, cx);
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()],
+            ),
+            div()
+                .pt_1()
+                .child(reset_button(
+                    "reset-general",
+                    "Reset General to Default",
+                    cx.listener(|_, _: &ClickEvent, _, cx| {
+                        apply_prefs(Prefs::default(), cx);
+                        cx.notify();
+                    }),
+                ))
+                .into_any_element(),
+        ]
+    }
+
+    /// The Software-Update row: current version plus a Check / Install &
+    /// Relaunch button, driven by the shared UpdateCheck state.
+    fn render_update_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = theme();
+        let state = cx.global::<UpdateCheckGlobal>().0.clone();
+        let status: Option<String> = match &state {
+            UpdateCheck::Idle => None,
+            UpdateCheck::Checking => Some("Checking\u{2026}".into()),
+            UpdateCheck::UpToDate => Some("You\u{2019}re up to date.".into()),
+            UpdateCheck::Available(v) => Some(format!("{v} is available.")),
+            UpdateCheck::Failed => Some("Couldn\u{2019}t reach GitHub \u{2014} try again.".into()),
+            UpdateCheck::Install(v) => Some(format!("Installing {v}\u{2026} the app will relaunch.")),
+        };
+        let button: Option<&'static str> = match &state {
+            UpdateCheck::Idle => Some("Check for Updates"),
+            UpdateCheck::UpToDate => Some("Check Again"),
+            UpdateCheck::Failed => Some("Try Again"),
+            UpdateCheck::Available(_) => Some("Install & Relaunch"),
+            UpdateCheck::Checking | UpdateCheck::Install(_) => None,
+        };
+        let avail = matches!(state, UpdateCheck::Available(_));
+        let avail_tag = match &state {
+            UpdateCheck::Available(v) => Some(v.clone()),
+            _ => None,
+        };
+        let mut right = div().flex_none().flex().items_center().gap_2();
+        if let Some(s) = status {
+            right = right.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(if avail { t.accent } else { t.text_muted }))
+                    .child(s),
+            );
+        }
+        if let Some(label) = button {
+            right = right.child(
+                div()
+                    .id("update-check-btn")
+                    .flex_none()
+                    .px_3()
+                    .py_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(if avail { rgb(t.accent) } else { rgb(t.surface) })
+                    .text_color(if avail { rgb(0xffffff) } else { rgb(t.text) })
+                    .hover(|s| s.bg(rgb(t.hover)))
+                    .active(|s| s.bg(rgb(t.selected)))
+                    .child(label)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if let Some(v) = avail_tag.clone() {
+                            cx.set_global(UpdateCheckGlobal(UpdateCheck::Install(v)));
+                        } else {
+                            this.start_update_check(cx);
+                        }
+                        cx.notify();
+                    })),
+            );
+        }
         div()
             .w_full()
             .flex()
-            .flex_col()
-            .gap_5()
-            .child(settings_title("Features"))
-            .child(toggle_row(
-                "tg-terminal",
-                "Terminal mode",
-                "Show a command input at the bottom to move through the explorer \
-                 like a terminal (with path/command autocomplete).",
-                p.terminal,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.terminal = !np.terminal;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-term-history",
-                "Terminal history",
-                "Show a scrollback of what you've typed and command output above \
-                 the input (otherwise it's just the input line).",
-                p.term_history,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.term_history = !np.term_history;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-preview",
-                "Preview",
-                "Click a file once to preview it (images, PDFs, documents, …) in \
-                 the inspector panel.",
-                p.preview,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.preview = !np.preview;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-preview-pages",
-                "Preview page controls",
-                "Show ‹ › arrows under multi-page PDF previews to flip through \
-                 the pages without opening the file.",
-                p.preview_pages,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.preview_pages = !np.preview_pages;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-info",
-                "Information",
-                "Click a file once to see its details (kind, size, dates, \
-                 dimensions, color space, and more) in the inspector panel.",
-                p.info,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.info = !np.info;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-show-parent",
-                "Show “..” (up one level)",
-                "Show the leading “..” entry in list view that navigates to the \
-                 parent folder.",
-                p.show_parent,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.show_parent = !np.show_parent;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-palette-history",
-                "Command palette history",
-                "Give Cmd+P its own query history: press Up/Down in the palette to \
-                 cycle through your previous searches.",
-                p.palette_history,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.palette_history = !np.palette_history;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-groups",
-                "Sidebar groups",
-                "Create custom groups of files/folders in the sidebar. Right-click \
-                 the sidebar to make a group, then right-click any item to add it.",
-                p.groups_enabled,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.groups_enabled = !np.groups_enabled;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-filter-button",
-                "Filter button",
-                "Show the always-on \"Filter\" button in the bottom-right corner. \
-                 Pressing / still opens the filter either way.",
-                p.show_filter_button,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.show_filter_button = !np.show_filter_button;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(toggle_row(
-                "tg-show-fps",
-                "Frame rate meter",
-                "Show a live FPS readout in the top-right of the explorer window. \
-                 Forces continuous redraws to measure them, so it uses some CPU \
-                 while on — meant for checking smoothness, not everyday use.",
-                p.show_fps,
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.show_fps = !np.show_fps;
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(settings_title("Sidebar"))
-            .child(stepper_row(
-                "st-recents",
-                "Recent folders",
-                "How many recently-visited folders to show in the sidebar (0 hides \
-                 the Recents section).",
-                if p.recent_limit == 0 {
-                    "Off".to_string()
-                } else {
-                    p.recent_limit.to_string()
-                },
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.recent_limit = np.recent_limit.saturating_sub(1);
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut np = prefs();
-                    np.recent_limit = (np.recent_limit + 1).min(RECENTS_CAP);
-                    apply_prefs(np, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(settings_title("Updates"))
-            .child({
-                let t = theme();
-                let state = cx.global::<UpdateCheckGlobal>().0.clone();
-                let status: Option<String> = match &state {
-                    UpdateCheck::Idle => None,
-                    UpdateCheck::Checking => Some("Checking…".into()),
-                    UpdateCheck::UpToDate => Some("You’re up to date.".into()),
-                    UpdateCheck::Available(v) => Some(format!("{v} is available.")),
-                    UpdateCheck::Failed => Some("Couldn’t reach GitHub — try again.".into()),
-                    UpdateCheck::Install(v) => {
-                        Some(format!("Installing {v}… the app will relaunch."))
-                    }
-                };
-                let button: Option<&'static str> = match &state {
-                    UpdateCheck::Idle => Some("Check for Updates"),
-                    UpdateCheck::UpToDate => Some("Check Again"),
-                    UpdateCheck::Failed => Some("Try Again"),
-                    UpdateCheck::Available(_) => Some("Install & Relaunch"),
-                    UpdateCheck::Checking | UpdateCheck::Install(_) => None,
-                };
-                let avail = matches!(state, UpdateCheck::Available(_));
-                let avail_tag = match &state {
-                    UpdateCheck::Available(v) => Some(v.clone()),
-                    _ => None,
-                };
-                let mut right = div().flex_none().flex().items_center().gap_2();
-                if let Some(s) = status {
-                    right = right.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(if avail { t.accent } else { t.text_muted }))
-                            .child(s),
-                    );
-                }
-                if let Some(label) = button {
-                    right = right.child(
-                        div()
-                            .id("update-check-btn")
-                            .flex_none()
-                            .px_3()
-                            .py_1()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .bg(if avail { rgb(t.accent) } else { rgb(t.surface) })
-                            .text_color(if avail { rgb(0xffffff) } else { rgb(t.text) })
-                            .hover(|s| s.bg(rgb(t.hover)))
-                            .active(|s| s.bg(rgb(t.selected)))
-                            .child(label)
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                if let Some(v) = avail_tag.clone() {
-                                    // Hand the install to the main window (it
-                                    // owns the banner + swap-and-relaunch).
-                                    cx.set_global(UpdateCheckGlobal(UpdateCheck::Install(v)));
-                                } else {
-                                    this.start_update_check(cx);
-                                }
-                                cx.notify();
-                            })),
-                    );
-                }
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
                 div()
-                    .w_full()
+                    .flex_1()
+                    .min_w_0()
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
+                    .flex_col()
+                    .gap_1()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_1()
-                            .child(
-                                div()
-                                    .text_color(rgb(t.text))
-                                    .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
-                            )
-                            .child(div().text_xs().text_color(rgb(t.text_muted)).child(
-                                "Check GitHub for a newer release and install it in \
-                                 place — the app swaps itself and relaunches.",
-                            )),
+                            .text_color(rgb(t.text))
+                            .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
                     )
-                    .child(right)
-            })
-            .child(reset_button(
-                "reset-general",
-                "Reset General to Default",
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    apply_prefs(Prefs::default(), cx);
-                    cx.notify();
-                }),
-            ))
+                    .child(div().text_xs().text_color(rgb(t.text_muted)).child(
+                        "Check GitHub for a newer release and install it in place \u{2014} the app swaps itself and relaunches.",
+                    )),
+            )
+            .child(right)
+            .into_any_element()
     }
 
-    fn render_keybinds(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_keybinds(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = theme();
         let km = keymap();
         let mut rows: Vec<AnyElement> = Vec::new();
@@ -1457,31 +1669,29 @@ impl Settings {
                     .into_any_element(),
             );
         }
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(settings_title("Keyboard shortcuts"))
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(rgb(t.text_muted))
-                    .pb_2()
-                    .child("Click a shortcut, then press the keys. ⌫ clears it; Esc cancels."),
+        vec![
+            settings_header(
+                "Keybinds",
+                "Click a shortcut, then press the keys. \u{232b} clears it; Esc cancels.",
             )
-            .children(rows)
-            .child(reset_button(
-                "reset-keybinds",
-                "Reset Shortcuts to Default",
-                cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.recording = None;
-                    apply_keymap(Keymap::defaults(), cx);
-                    cx.notify();
-                }),
-            ))
+            .into_any_element(),
+            settings_section("Shortcuts", None, rows),
+            div()
+                .pt_1()
+                .child(reset_button(
+                    "reset-keybinds",
+                    "Reset Shortcuts to Default",
+                    cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.recording = None;
+                        apply_keymap(Keymap::defaults(), cx);
+                        cx.notify();
+                    }),
+                ))
+                .into_any_element(),
+        ]
     }
 
-    fn render_customization(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_customization(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let t = theme();
 
         // Preset palette cards.
@@ -1504,7 +1714,6 @@ impl Settings {
                     .bg(rgb(preset.bg))
                     .hover(|s| s.border_color(rgb(t.accent)))
                     .child(
-                        // Mini preview: a few swatches from the preset.
                         div()
                             .flex()
                             .gap_1()
@@ -1521,190 +1730,150 @@ impl Settings {
                     .into_any_element(),
             );
         }
-
-        div()
+        let presets_grid = div()
             .flex()
-            .flex_col()
-            .gap_5()
-            .child(settings_title("Preset Palettes"))
-            .child(div().flex().flex_wrap().gap_3().children(presets))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(settings_title("Background"))
-                    .child(self.hex_field(ColorTarget::Bg, t.bg, cx)),
-            )
-            .child(self.color_row("bg", t.bg, |t, c| t.bg = c, cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(settings_title("Text"))
-                    .child(self.hex_field(ColorTarget::Text, t.text, cx)),
-            )
-            .child(self.color_row("text", t.text, |t, c| t.text = c, cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(settings_title("Mouseover"))
-                    .child(self.hex_field(ColorTarget::Hover, t.hover, cx)),
-            )
-            .child(self.color_row("hover", t.hover, |t, c| t.hover = c, cx))
-            // ----- Menu (right-click / dropdown) appearance -----
-            .child(settings_title("Menu"))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .child(self.menu_preview())
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(t.text_muted))
-                            .child("Live preview of the right-click menu."),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(menu_label("Menu color"))
-                    .child(self.hex_field(ColorTarget::MenuBg, menu_style().bg, cx)),
-            )
-            .child(self.menu_color_row("menubg", menu_style().bg, |m, c| m.bg = c, cx))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(menu_label("Letter color"))
-                    .child(self.hex_field(ColorTarget::MenuText, menu_style().text, cx)),
-            )
-            .child(self.menu_color_row("menutext", menu_style().text, |m, c| m.text = c, cx))
-            .child(stepper_row(
-                "st-menu-opacity",
-                "Opacity",
-                "Menu background opacity (lower is more see-through).",
-                format!("{}%", menu_style().opacity),
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut m = menu_style();
-                    m.opacity = m.opacity.saturating_sub(10);
-                    apply_menu_style(m, cx);
-                    cx.notify();
-                }),
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut m = menu_style();
-                    m.opacity = (m.opacity + 10).min(100);
-                    apply_menu_style(m, cx);
-                    cx.notify();
-                }),
-            ))
-            .child(stepper_row(
-                "st-menu-size",
-                "Text size",
-                "Menu font size in pixels.",
-                format!("{}px", menu_style().font_px as i32),
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut m = menu_style();
-                    m.font_px = (m.font_px - 1.0).max(9.0);
-                    apply_menu_style(m, cx);
-                    cx.notify();
-                }),
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    let mut m = menu_style();
-                    m.font_px = (m.font_px + 1.0).min(24.0);
-                    apply_menu_style(m, cx);
-                    cx.notify();
-                }),
-            ))
-            // ----- App icon background -----
-            .child(settings_title("App Icon"))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_4()
-                    .child(self.app_icon_preview())
-                    .child(
-                        div()
-                            .flex()
-                            .flex_col()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(t.text_muted))
-                                    .child("Change the icon background: pick a color or upload an image (PNG or JPG; square looks best)."),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .gap_2()
-                                    .child(
-                                        div()
-                                            .id("icon-bg-upload")
-                                            .px_3()
-                                            .py_1()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .bg(rgb(t.surface))
-                                            .border_1()
-                                            .border_color(rgb(t.border))
-                                            .hover(|s| s.border_color(rgb(t.accent)))
-                                            .child("Upload Background…")
-                                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                                let rx = cx.prompt_for_paths(PathPromptOptions {
-                                                    files: true,
-                                                    directories: false,
-                                                    multiple: false,
-                                                    prompt: Some("Choose Background Image".into()),
-                                                });
-                                                cx.spawn(async move |_, cx| {
-                                                    if let Ok(Ok(Some(paths))) = rx.await {
-                                                        if let Some(p) = paths.into_iter().next() {
-                                                            if let Some(dest) = store_icon_bg_image(&p) {
-                                                                let _ = cx.update(|cx| {
-                                                                    apply_icon_bg(IconBg::Image(dest), cx)
-                                                                });
-                                                            }
-                                                        }
-                                                    }
-                                                })
-                                                .detach();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("icon-bg-reset")
-                                            .px_3()
-                                            .py_1()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .bg(rgb(t.hover))
-                                            .hover(|s| s.bg(rgb(t.selected)))
-                                            .child("Reset")
-                                            .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
-                                                apply_icon_bg(IconBg::Default, cx);
-                                            })),
-                                    ),
-                            ),
-                    ),
-            )
-            .child(self.icon_color_row(cx))
-            .child(settings_title("Icon Pack"))
+            .flex_wrap()
+            .gap_3()
+            .children(presets)
+            .into_any_element();
+
+        // A color control: name + description on the left, hex field on the
+        // right, and the swatch spectrum below.
+        let color_block = |title: &str,
+                           desc: &str,
+                           target: ColorTarget,
+                           current: u32,
+                           spectrum: AnyElement,
+                           hex: AnyElement| {
+            let t = theme();
+            let _ = (target, current);
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_color(rgb(t.text)).child(title.to_string()))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(t.text_muted))
+                                        .child(desc.to_string()),
+                                ),
+                        )
+                        .child(hex),
+                )
+                .child(spectrum)
+                .into_any_element()
+        };
+
+        // Menu preview + caption.
+        let menu_preview_row = div()
+            .flex()
+            .items_center()
+            .gap_4()
+            .child(self.menu_preview())
             .child(
                 div()
                     .text_xs()
                     .text_color(rgb(t.text_muted))
+                    .child("Live preview of the right-click menu."),
+            )
+            .into_any_element();
+
+        // App-icon preview + upload/reset controls.
+        let app_icon_row = div()
+            .flex()
+            .items_center()
+            .gap_4()
+            .child(self.app_icon_preview())
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(t.text_muted))
+                            .child("Pick a color below or upload an image (PNG or JPG; square looks best)."),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .id("icon-bg-upload")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(rgb(t.surface))
+                                    .border_1()
+                                    .border_color(rgb(t.border))
+                                    .hover(|s| s.border_color(rgb(t.accent)))
+                                    .child("Upload Background\u{2026}")
+                                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                        let rx = cx.prompt_for_paths(PathPromptOptions {
+                                            files: true,
+                                            directories: false,
+                                            multiple: false,
+                                            prompt: Some("Choose Background Image".into()),
+                                        });
+                                        cx.spawn(async move |_, cx| {
+                                            if let Ok(Ok(Some(paths))) = rx.await {
+                                                if let Some(p) = paths.into_iter().next() {
+                                                    if let Some(dest) = store_icon_bg_image(&p) {
+                                                        let _ = cx.update(|cx| {
+                                                            apply_icon_bg(IconBg::Image(dest), cx)
+                                                        });
+                                                    }
+                                                }
+                                            }
+                                        })
+                                        .detach();
+                                    })),
+                            )
+                            .child(
+                                div()
+                                    .id("icon-bg-reset")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .bg(rgb(t.hover))
+                                    .hover(|s| s.bg(rgb(t.selected)))
+                                    .child("Reset")
+                                    .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
+                                        apply_icon_bg(IconBg::Default, cx);
+                                    })),
+                            ),
+                    ),
+            )
+            .into_any_element();
+
+        // Icon-pack status + choose/reset + note.
+        let icon_pack_row = div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .text_color(rgb(t.text))
                     .child(match icon_pack() {
-                        Some(p) => format!("Current: {}", path_label(&p)),
+                        Some(p) => format!("Current pack: {}", path_label(&p)),
                         None => "Using macOS icons".to_string(),
                     }),
             )
@@ -1723,7 +1892,7 @@ impl Settings {
                             .border_1()
                             .border_color(rgb(t.border))
                             .hover(|s| s.border_color(rgb(t.accent)))
-                            .child("Choose Folder…")
+                            .child("Choose Folder\u{2026}")
                             .on_click(cx.listener(|_, _: &ClickEvent, _, cx| {
                                 let rx = cx.prompt_for_paths(PathPromptOptions {
                                     files: false,
@@ -1734,9 +1903,8 @@ impl Settings {
                                 cx.spawn(async move |this, cx| {
                                     if let Ok(Ok(Some(paths))) = rx.await {
                                         if let Some(p) = paths.into_iter().next() {
-                                            let _ = this.update(cx, |_, cx| {
-                                                apply_icon_pack(Some(p), cx)
-                                            });
+                                            let _ = this
+                                                .update(cx, |_, cx| apply_icon_pack(Some(p), cx));
                                         }
                                     }
                                 })
@@ -1767,18 +1935,138 @@ impl Settings {
                          (e.g. pdf.png, png.png). PNG with transparency works best.",
                     ),
             )
-            .child(reset_button(
-                "reset-customization",
-                "Reset Customization to Default",
-                cx.listener(|_, _: &ClickEvent, _, cx| {
-                    // Theme, menu style, app icon, and icon pack all back to stock.
-                    apply_theme(Theme::default(), cx);
-                    apply_menu_style(MenuStyle::default(), cx);
-                    apply_icon_bg(IconBg::Default, cx);
-                    apply_icon_pack(None, cx);
-                    cx.notify();
-                }),
-            ))
+            .into_any_element();
+
+        vec![
+            settings_header(
+                "Customization",
+                "Make Shuffle yours \u{2014} palette, menus, and app icon.",
+            )
+            .into_any_element(),
+            settings_section(
+                "Theme",
+                Some("Pick a starting palette, then fine-tune the colors below."),
+                vec![presets_grid],
+            ),
+            settings_section(
+                "Colors",
+                Some("Core interface colors. Type a hex value or pick from the swatches."),
+                vec![
+                    color_block(
+                        "Background",
+                        "The main window and file list.",
+                        ColorTarget::Bg,
+                        t.bg,
+                        self.color_row("bg", t.bg, |t, c| t.bg = c, cx).into_any_element(),
+                        self.hex_field(ColorTarget::Bg, t.bg, cx).into_any_element(),
+                    ),
+                    color_block(
+                        "Text",
+                        "Primary text throughout the app.",
+                        ColorTarget::Text,
+                        t.text,
+                        self.color_row("text", t.text, |t, c| t.text = c, cx).into_any_element(),
+                        self.hex_field(ColorTarget::Text, t.text, cx).into_any_element(),
+                    ),
+                    color_block(
+                        "Mouseover",
+                        "The highlight behind hovered rows and buttons.",
+                        ColorTarget::Hover,
+                        t.hover,
+                        self.color_row("hover", t.hover, |t, c| t.hover = c, cx).into_any_element(),
+                        self.hex_field(ColorTarget::Hover, t.hover, cx).into_any_element(),
+                    ),
+                ],
+            ),
+            settings_section(
+                "Menu",
+                Some("The right-click / dropdown menu appearance."),
+                vec![
+                    menu_preview_row,
+                    color_block(
+                        "Menu color",
+                        "The menu background.",
+                        ColorTarget::MenuBg,
+                        menu_style().bg,
+                        self.menu_color_row("menubg", menu_style().bg, |m, c| m.bg = c, cx)
+                            .into_any_element(),
+                        self.hex_field(ColorTarget::MenuBg, menu_style().bg, cx).into_any_element(),
+                    ),
+                    color_block(
+                        "Letter color",
+                        "The menu text.",
+                        ColorTarget::MenuText,
+                        menu_style().text,
+                        self.menu_color_row("menutext", menu_style().text, |m, c| m.text = c, cx)
+                            .into_any_element(),
+                        self.hex_field(ColorTarget::MenuText, menu_style().text, cx)
+                            .into_any_element(),
+                    ),
+                    stepper_row(
+                        "st-menu-opacity",
+                        "Opacity",
+                        "Menu background opacity (lower is more see-through).",
+                        format!("{}%", menu_style().opacity),
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut m = menu_style();
+                            m.opacity = m.opacity.saturating_sub(10);
+                            apply_menu_style(m, cx);
+                            cx.notify();
+                        }),
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut m = menu_style();
+                            m.opacity = (m.opacity + 10).min(100);
+                            apply_menu_style(m, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    stepper_row(
+                        "st-menu-size",
+                        "Text size",
+                        "Menu font size in pixels.",
+                        format!("{}px", menu_style().font_px as i32),
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut m = menu_style();
+                            m.font_px = (m.font_px - 1.0).max(9.0);
+                            apply_menu_style(m, cx);
+                            cx.notify();
+                        }),
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut m = menu_style();
+                            m.font_px = (m.font_px + 1.0).min(24.0);
+                            apply_menu_style(m, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                ],
+            ),
+            settings_section(
+                "App Icon",
+                Some("The Dock and Finder icon."),
+                vec![app_icon_row, self.icon_color_row(cx).into_any_element()],
+            ),
+            settings_section(
+                "Icon Pack",
+                Some("Replace macOS file icons with your own image set."),
+                vec![icon_pack_row],
+            ),
+            div()
+                .pt_1()
+                .child(reset_button(
+                    "reset-customization",
+                    "Reset Customization to Default",
+                    cx.listener(|_, _: &ClickEvent, _, cx| {
+                        apply_theme(Theme::default(), cx);
+                        apply_menu_style(MenuStyle::default(), cx);
+                        apply_icon_bg(IconBg::Default, cx);
+                        apply_icon_pack(None, cx);
+                        cx.notify();
+                    }),
+                ))
+                .into_any_element(),
+        ]
     }
 
     /// A grid of color swatches; clicking one sets a single theme field via
@@ -1843,6 +2131,7 @@ impl Settings {
                     .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
                         let mut nm = menu_style();
                         set(&mut nm, c);
+                        nm.custom = true;
                         apply_menu_style(nm, cx);
                         cx.notify();
                     }))
@@ -2032,9 +2321,79 @@ fn settings_title(text: &str) -> impl IntoElement {
         .child(text.to_uppercase())
 }
 
-/// A small settings sub-label (normal case, not uppercased).
-fn menu_label(text: &str) -> impl IntoElement {
-    div().text_color(rgb(theme().text)).child(text.to_string())
+/// The large title + one-line description shown at the top of a settings tab.
+fn settings_header(title: &str, subtitle: &str) -> impl IntoElement {
+    let t = theme();
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .pb_1()
+        .child(
+            div()
+                .text_base()
+                .font_weight(FontWeight::BOLD)
+                .text_color(rgb(t.text))
+                .child(title.to_string()),
+        )
+        .child(
+            div()
+                .text_xs()
+                .text_color(rgb(t.text_muted))
+                .child(subtitle.to_string()),
+        )
+}
+
+/// A hairline divider used inside settings cards.
+fn settings_divider() -> impl IntoElement {
+    div().h(px(1.0)).bg(rgb(theme().border))
+}
+
+/// A settings "card": a titled, bordered container grouping related rows, each
+/// row padded and separated by a hairline. This is the core of the settings
+/// look — related controls read as one unit instead of a flat list.
+fn settings_section(title: &str, subtitle: Option<&str>, rows: Vec<AnyElement>) -> AnyElement {
+    let t = theme();
+    let mut header = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .px_4()
+        .pt_3()
+        .pb_3()
+        .child(
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(rgb(t.text))
+                .child(title.to_string()),
+        );
+    if let Some(s) = subtitle {
+        header = header.child(
+            div()
+                .text_xs()
+                .text_color(rgb(t.text_dim))
+                .child(s.to_string()),
+        );
+    }
+
+    let mut card = div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(t.border))
+        .bg(Theme::alpha(t.surface, 0x33))
+        .child(header)
+        .child(settings_divider());
+
+    for (i, row) in rows.into_iter().enumerate() {
+        if i > 0 {
+            card = card.child(settings_divider());
+        }
+        card = card.child(div().px_4().py_3().child(row));
+    }
+    card.into_any_element()
 }
 
 /// A "Reset to Default" button (used once per settings tab).
@@ -2464,6 +2823,14 @@ struct Tab {
     /// Selection anchor (char index) within `find_query`; `Some` and different
     /// from `find_cursor` means a range is selected (Option+Shift+Arrow, Cmd+A).
     find_anchor: Option<usize>,
+    /// Result set of the active `content:` Spotlight search (absolute paths in
+    /// this folder), and the term it corresponds to. `None` = no content
+    /// search resolved yet.
+    content_hits: Option<HashSet<PathBuf>>,
+    content_for: Option<String>,
+    /// Bumps each time a content search is kicked off, so a stale mdfind result
+    /// is discarded.
+    content_gen: u64,
     scroll_handle: UniformListScrollHandle,
     /// Horizontal scroll of the columns (when they're wider than the pane).
     h_scroll: ScrollHandle,
@@ -2509,6 +2876,9 @@ impl Tab {
             find_results: Vec::new(),
             find_cursor: 0,
             find_anchor: None,
+            content_hits: None,
+            content_for: None,
+            content_gen: 0,
             scroll_handle: UniformListScrollHandle::new(),
             h_scroll: ScrollHandle::new(),
             selection: HashSet::new(),
@@ -3526,6 +3896,45 @@ impl Shuffle {
         .detach();
     }
 
+    /// Run a user script action on `targets`, off the UI thread. The paths are
+    /// passed as arguments and as `$SHUFFLE_PATHS`; `$SHUFFLE_DIR` is the pane's
+    /// folder (also the working directory). Refreshes the pane when it finishes
+    /// (the script may have created/renamed/deleted files).
+    fn run_script_action(
+        &mut self,
+        pane: usize,
+        script: PathBuf,
+        targets: Vec<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = self.tab(pane).current_dir.clone();
+        let paths_env = targets
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.spawn(async move |this, cx| {
+            let d = dir.clone();
+            cx.background_spawn(async move {
+                let _ = Command::new(&script)
+                    .args(&targets)
+                    .current_dir(&d)
+                    .env("SHUFFLE_DIR", &d)
+                    .env("SHUFFLE_PATHS", &paths_env)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status();
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                if pane < this.panes.len() {
+                    this.refresh_pane(pane, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Open `path` with a specific application.
     fn open_with(&mut self, app: &Path, path: &Path, cx: &mut Context<Self>) {
         let _ = Command::new("open").arg("-a").arg(app).arg(path).spawn();
@@ -3666,6 +4075,35 @@ impl Shuffle {
                     )
                     .into_any_element(),
                 );
+            }
+            // User script actions that apply to this item (Scripts folder).
+            if prefs().script_actions {
+                let fname = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                let acts: Vec<ScriptAction> = discover_script_actions()
+                    .into_iter()
+                    .filter(|a| script_action_applies(a, &fname, is_dir))
+                    .collect();
+                if !acts.is_empty() {
+                    items.push(ctx_separator().into_any_element());
+                    for (i, a) in acts.into_iter().take(12).enumerate() {
+                        let script = a.path.clone();
+                        let tgt = path.clone();
+                        items.push(
+                            ctx_item_owned(
+                                ("script-action", i),
+                                a.name,
+                                cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.close_context_menu(cx);
+                                    this.run_script_action(pane, script.clone(), vec![tgt.clone()], cx);
+                                }),
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                }
             }
             items.push(ctx_separator().into_any_element());
             let p = path.clone();
@@ -4932,6 +5370,42 @@ impl Shuffle {
             return;
         }
 
+        // Operator-driven search: content:/kind:/ext:/size:/date: run a
+        // dedicated global search (Spotlight for content, the index otherwise)
+        // instead of the plain fuzzy name lookup below.
+        let fq = FilterQuery::parse(&q);
+        if fq.content.is_some() || fq.has_local_filters() {
+            self.palette_items = Vec::new();
+            self.selected = 0;
+            cx.notify();
+            let index = self.index.clone();
+            let home = home_dir();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+                if !this.update(cx, |this, _| this.search_gen == gen).unwrap_or(false) {
+                    return;
+                }
+                let results = cx
+                    .background_spawn(async move {
+                        palette_operator_search(&fq, index.as_deref(), &home)
+                    })
+                    .await;
+                this.update(cx, |this, cx| {
+                    if this.search_gen != gen {
+                        return;
+                    }
+                    this.palette_items = results;
+                    this.selected = 0;
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+            return;
+        }
+
         // Search from the very first character (the in-memory index is fast
         // enough). Empty queries were already handled above.
 
@@ -5011,7 +5485,7 @@ impl Shuffle {
                 .w(px(6.0))
                 .h(px(thumb_h))
                 .rounded_full()
-                .bg(rgba(0xffffff44))
+                .bg(Theme::alpha(theme().text, 0x44))
                 .into_any_element(),
         )
     }
@@ -5829,10 +6303,12 @@ impl Shuffle {
         if !dragging && idle > SCROLLBAR_LINGER + SCROLLBAR_FADE {
             return None;
         }
+        // Derive the thumb from the theme's text color so it stays visible on
+        // light themes (a hardcoded white thumb vanished on light backgrounds).
         let color = if dragging {
-            rgba(0xffffff66)
+            Theme::alpha(theme().text, 0x66)
         } else {
-            rgba(0xffffff33)
+            Theme::alpha(theme().text, 0x33)
         };
 
         let thumb = div()
@@ -5845,7 +6321,7 @@ impl Shuffle {
             .rounded_full()
             .bg(color)
             .cursor(CursorStyle::PointingHand)
-            .hover(|s| s.bg(rgba(0xffffff55)))
+            .hover(|s| s.bg(Theme::alpha(theme().text, 0x55)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
@@ -5909,6 +6385,8 @@ impl Shuffle {
             tab.editing_path = None;
             tab.find_query = None;
             tab.find_results.clear();
+            tab.content_hits = None;
+            tab.content_for = None;
             tab.selection.clear();
             tab.anchor = None;
             tab.col_chain.clear();
@@ -6284,36 +6762,112 @@ impl Shuffle {
             tab.find_results = (0..tab.entries.len()).collect();
             return;
         }
-        // With a column sort active, the filtered rows follow the list's sort
-        // order (entries are already sorted), so clicking Date/Size/Name
-        // re-orders the search results too. No sort → best match first.
-        if tab.sort_key != SortKey::None {
-            tab.find_results = tab
-                .entries
-                .iter()
-                .enumerate()
-                .filter_map(|(i, e)| find_score(q, &e.name).map(|_| i))
-                .collect();
+        let fq = FilterQuery::parse(q);
+        let has_text = !fq.text.is_empty();
+        // Content search resolves asynchronously; until its hits for THIS term
+        // land, a content: query matches nothing (the spinner-free "searching"
+        // state). update_content_search() recomputes when mdfind returns.
+        let content_ready = match &fq.content {
+            None => None,
+            Some(term) => {
+                if tab.content_for.as_deref() == Some(term.as_str()) {
+                    tab.content_hits.as_ref()
+                } else {
+                    tab.find_results.clear();
+                    return;
+                }
+            }
+        };
+        let dir = tab.current_dir.clone();
+        let plain = fq.text.clone();
+
+        // Sort order: when a column sort is active OR there's no free text to
+        // rank by, keep the list's existing order; otherwise rank by match.
+        let keep_order = tab.sort_key != SortKey::None || !has_text;
+
+        let mut scored: Vec<(i32, usize)> = Vec::new();
+        for (i, e) in tab.entries.iter().enumerate() {
+            if !fq.matches_entry(&e.name, e.is_dir, e.size, e.modified) {
+                continue;
+            }
+            if let Some(hits) = content_ready {
+                if !hits.contains(&dir.join(&e.name)) {
+                    continue;
+                }
+            }
+            let score = if has_text {
+                match find_score(&plain, &e.name) {
+                    Some(s) => s,
+                    None => continue,
+                }
+            } else {
+                0
+            };
+            scored.push((score, i));
+        }
+
+        if !keep_order {
+            // Best score first; ties → dirs first, then alphabetical.
+            let entries = &tab.entries;
+            scored.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| entries[b.1].is_dir.cmp(&entries[a.1].is_dir))
+                    .then_with(|| {
+                        entries[a.1].name.to_lowercase().cmp(&entries[b.1].name.to_lowercase())
+                    })
+            });
+        }
+        tab.find_results = scored.into_iter().map(|(_, i)| i).collect();
+    }
+
+    /// Kick off (or clear) the Spotlight content search for a pane's filter.
+    /// Called whenever the filter text changes. Runs `mdfind` scoped to the
+    /// folder off-thread, then recomputes the filtered list.
+    fn update_content_search(&mut self, pane: usize, cx: &mut Context<Self>) {
+        let term = self
+            .tab(pane)
+            .find_query
+            .as_deref()
+            .map(|q| FilterQuery::parse(q).content)
+            .unwrap_or(None);
+
+        let Some(term) = term else {
+            // No content: operator — drop any stale hits.
+            let tab = self.tab_mut(pane);
+            if tab.content_for.is_some() {
+                tab.content_hits = None;
+                tab.content_for = None;
+            }
+            return;
+        };
+        // Already resolved for this exact term → nothing to do.
+        if self.tab(pane).content_for.as_deref() == Some(term.as_str()) {
             return;
         }
-        let mut scored: Vec<(i32, usize)> = tab
-            .entries
-            .iter()
-            .enumerate()
-            .filter_map(|(i, e)| find_score(q, &e.name).map(|s| (s, i)))
-            .collect();
-        // Best score first; ties → dirs first, then alphabetical.
-        scored.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| tab.entries[b.1].is_dir.cmp(&tab.entries[a.1].is_dir))
-                .then_with(|| {
-                    tab.entries[a.1]
-                        .name
-                        .to_lowercase()
-                        .cmp(&tab.entries[b.1].name.to_lowercase())
-                })
-        });
-        tab.find_results = scored.into_iter().map(|(_, i)| i).collect();
+        let dir = self.tab(pane).current_dir.clone();
+        let gen = {
+            let tab = self.tab_mut(pane);
+            tab.content_gen += 1;
+            tab.content_gen
+        };
+        cx.spawn(async move |this, cx| {
+            let d = dir.clone();
+            let t = term.clone();
+            let hits = cx
+                .background_spawn(async move { mdfind_content(&d, &t) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if pane >= this.panes.len() || this.tab(pane).content_gen != gen {
+                    return;
+                }
+                let tab = this.tab_mut(pane);
+                tab.content_hits = Some(hits);
+                tab.content_for = Some(term);
+                this.recompute_find(pane);
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     /// Keystrokes while the find bar is open (acts on the active pane).
@@ -6328,6 +6882,8 @@ impl Shuffle {
                 let tab = self.tab_mut(pane);
                 tab.find_query = None;
                 tab.find_results.clear();
+                tab.content_hits = None;
+                tab.content_for = None;
                 cx.notify();
             }
             "enter" => {
@@ -6410,6 +6966,7 @@ impl Shuffle {
                     }
                 }
                 self.recompute_find(pane);
+                self.update_content_search(pane, cx);
                 cx.notify();
             }
             "c" if cmd => {
@@ -6427,6 +6984,7 @@ impl Shuffle {
                 if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
                     self.find_insert(pane, t.trim());
                     self.recompute_find(pane);
+                    self.update_content_search(pane, cx);
                     cx.notify();
                 }
             }
@@ -6438,6 +6996,7 @@ impl Shuffle {
                     if !ch.is_empty() && !ch.chars().any(char::is_control) {
                         self.find_insert(pane, ch);
                         self.recompute_find(pane);
+                        self.update_content_search(pane, cx);
                         cx.notify();
                     }
                 }
@@ -7668,13 +8227,21 @@ impl Shuffle {
         let t = theme();
         let tab = self.tab(pane);
         let count = tab.find_results.len();
+        // Operator awareness: colour the label when filters are active, and show
+        // a "searching…" state while a content: query resolves via Spotlight.
+        let fq = FilterQuery::parse(query);
+        let filtered = fq.has_local_filters() || fq.content.is_some();
+        let content_pending = fq
+            .content
+            .as_deref()
+            .is_some_and(|term| tab.content_for.as_deref() != Some(term));
         // The editable text: placeholder, a highlighted selection span, or the
         // text split around a static caret at the cursor.
         let field = if query.is_empty() {
             div()
                 .min_w(px(80.0))
                 .text_color(rgb(t.text_dim))
-                .child("type to filter…")
+                .child("filter…  kind: ext: size: date: content:")
         } else if let Some((lo, hi)) = self.find_sel(pane) {
             let (bl, bh) = (char_byte(query, lo), char_byte(query, hi));
             div()
@@ -7716,14 +8283,23 @@ impl Shuffle {
             .border_color(rgb(t.accent))
             .shadow_lg()
             .text_color(rgb(t.text))
-            .child(div().flex_none().text_color(rgb(t.text_muted)).child("Filter"))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(if filtered { t.accent } else { t.text_muted }))
+                    .child("Filter"),
+            )
             .child(field)
             .child(
                 div()
                     .flex_none()
                     .text_color(rgb(t.text_muted))
                     .text_xs()
-                    .child(format!("{count}")),
+                    .child(if content_pending {
+                        "searching…".to_string()
+                    } else {
+                        format!("{count}")
+                    }),
             )
     }
 
@@ -9388,7 +9964,7 @@ impl Shuffle {
                 .h(px(8.0))
                 .w(px(thumb_w))
                 .rounded_full()
-                .bg(rgba(0xffffff33))
+                .bg(Theme::alpha(theme().text, 0x33))
                 .into_any_element(),
         )
     }
@@ -9915,6 +10491,28 @@ fn ctx_item(
         .on_click(on_click)
 }
 
+/// Like [`ctx_item`] but with a runtime label (e.g. a user script's name).
+/// `id` is a stable element id; `label` is the shown text.
+fn ctx_item_owned(
+    id: impl Into<ElementId>,
+    label: String,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .mx_1()
+        .px_3()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .text_color(rgb(menu_style().text))
+        .hover(|s| s.bg(rgb(theme().selected)))
+        .child(label)
+        .on_click(on_click)
+}
+
 fn ctx_separator() -> impl IntoElement {
     div().my_1().mx_2().h(px(1.0)).bg(rgb(theme().border_strong))
 }
@@ -10037,6 +10635,162 @@ fn archive_extract_command(path: &Path) -> Option<Command> {
         c.arg("-xf").arg(path).arg("-C");
     }
     Some(c)
+}
+
+// ----- user shell-script actions (the "Scripts" extension point) -----
+
+/// A user-provided shell-script action discovered in the Scripts folder. The
+/// user drops an executable script there; Shuffle offers it in the right-click
+/// menu for matching items and runs it with the selected paths as arguments.
+struct ScriptAction {
+    name: String,
+    path: PathBuf,
+    /// Type matchers (OR'd): `any`, `folder`/`file`, a kind word (image/video/
+    /// pdf/…), or a bare extension (`png`).
+    types: Vec<String>,
+}
+
+/// The folder scripts live in: `…/Application Support/Shuffle/actions`.
+fn script_actions_dir() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("actions"))
+}
+
+/// A regular file the current user can execute (a runnable script).
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    match fs::metadata(path) {
+        Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
+
+/// Match a `@shuffle.KEY: value` metadata line (case-insensitive key).
+fn script_header_value(line: &str, key: &str) -> Option<String> {
+    let prefix = format!("@shuffle.{key}:");
+    line.to_lowercase()
+        .starts_with(&prefix)
+        .then(|| line[prefix.len()..].trim().to_string())
+}
+
+/// Read a script's leading metadata: display name (defaults to the file stem)
+/// and the item types it applies to (defaults to `any`).
+fn parse_script_header(path: &Path, fname: &str) -> (String, Vec<String>) {
+    let mut name = fname.rsplit_once('.').map(|(s, _)| s).unwrap_or(fname).to_string();
+    let mut types = vec!["any".to_string()];
+    if let Ok(f) = fs::File::open(path) {
+        for line in BufReader::new(f).lines().take(40).map_while(Result::ok) {
+            let Some(rest) = line.trim().strip_prefix('#') else {
+                continue;
+            };
+            let rest = rest.trim();
+            if let Some(v) = script_header_value(rest, "name") {
+                if !v.is_empty() {
+                    name = v;
+                }
+            } else if let Some(v) = script_header_value(rest, "types") {
+                let parsed: Vec<String> = v
+                    .split(',')
+                    .map(|s| s.trim().to_lowercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if !parsed.is_empty() {
+                    types = parsed;
+                }
+            }
+        }
+    }
+    (name, types)
+}
+
+/// Scan the Scripts folder for executable actions. Cheap (small folder), called
+/// when a context menu opens. Skips dotfiles, the README, and non-executables.
+fn discover_script_actions() -> Vec<ScriptAction> {
+    let Some(dir) = script_actions_dir() else {
+        return Vec::new();
+    };
+    let Ok(rd) = fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        let path = e.path();
+        let fname = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        if fname.starts_with('.') || fname.eq_ignore_ascii_case("readme.md") {
+            continue;
+        }
+        if !is_executable_file(&path) {
+            continue;
+        }
+        let (name, types) = parse_script_header(&path, &fname);
+        out.push(ScriptAction { name, path, types });
+    }
+    out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
+    out
+}
+
+/// Whether a script action applies to an item of this name/kind.
+fn script_action_applies(a: &ScriptAction, name: &str, is_dir: bool) -> bool {
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+    a.types.iter().any(|t| match t.as_str() {
+        "any" | "*" | "all" => true,
+        "folder" | "dir" | "directory" => is_dir,
+        "file" => !is_dir,
+        other => match KindClass::from_word(other) {
+            Some(k) => k.matches(name, is_dir),
+            None => ext.as_deref() == Some(other),
+        },
+    })
+}
+
+/// Create the Scripts folder (and, on first creation, a README + a couple of
+/// safe example scripts) and return its path. Idempotent.
+fn ensure_scripts_dir() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = script_actions_dir()?;
+    let fresh = !dir.exists();
+    fs::create_dir_all(&dir).ok()?;
+    if fresh {
+        let readme = r#"# Shuffle — Script Actions
+
+Drop an **executable** script in this folder and Shuffle shows it in the
+right-click menu for matching items. The selected paths are passed as arguments
+(`"$@"`), and also as `$SHUFFLE_PATHS` (newline-separated) with `$SHUFFLE_DIR`
+set to the current folder.
+
+Add an optional metadata header (any comment style) to control how it appears:
+
+    # @shuffle.name: Optimize Image
+    # @shuffle.types: png,jpg,jpeg      # extensions, or: image video audio pdf
+    #                                   # doc archive code app folder file any
+
+- No `name` → the file's name is used.
+- No `types` → shows for everything (`any`).
+- The file must be executable: `chmod +x "your script"`.
+
+Turn the feature on in Settings → Script Actions.
+"#;
+        let _ = fs::write(dir.join("README.md"), readme);
+
+        let copy_path = "#!/bin/bash\n# @shuffle.name: Copy Path\n# @shuffle.types: any\nprintf '%s' \"$1\" | pbcopy\n";
+        let open_term = "#!/bin/bash\n# @shuffle.name: Open in Terminal\n# @shuffle.types: folder\nopen -a Terminal \"$1\"\n";
+        for (fname, body) in [("Copy Path.sh", copy_path), ("Open in Terminal.sh", open_term)] {
+            let p = dir.join(fname);
+            if fs::write(&p, body).is_ok() {
+                if let Ok(md) = fs::metadata(&p) {
+                    let mut perm = md.permissions();
+                    perm.set_mode(0o755);
+                    let _ = fs::set_permissions(&p, perm);
+                }
+            }
+        }
+    }
+    Some(dir)
 }
 
 /// Path to the bundled `removebg` Swift helper, if it was compiled in.
@@ -11570,6 +12324,296 @@ fn dice(a: &str, b: &str) -> f32 {
 /// `None` for non-matches so they're filtered out. Subsequence matches rank
 /// highest; close typos (Sørensen–Dice ≥ 0.5) still match so "dcouments"
 /// finds "Documents".
+// ----- filter query operators (kind: / ext: / size: / date: / content:) -----
+
+/// Broad file-type categories for `kind:` filters.
+#[derive(Clone, Copy, PartialEq)]
+enum KindClass {
+    Folder,
+    Image,
+    Video,
+    Audio,
+    Pdf,
+    Doc,
+    Archive,
+    Code,
+    App,
+}
+
+impl KindClass {
+    fn from_word(w: &str) -> Option<KindClass> {
+        Some(match w {
+            "folder" | "dir" | "directory" | "folders" => KindClass::Folder,
+            "image" | "img" | "images" | "picture" | "photo" | "pic" => KindClass::Image,
+            "video" | "videos" | "movie" | "movies" | "film" => KindClass::Video,
+            "audio" | "music" | "sound" | "song" => KindClass::Audio,
+            "pdf" | "pdfs" => KindClass::Pdf,
+            "doc" | "docs" | "document" | "documents" | "text" => KindClass::Doc,
+            "archive" | "archives" | "zip" | "compressed" => KindClass::Archive,
+            "code" | "source" | "src" => KindClass::Code,
+            "app" | "apps" | "application" => KindClass::App,
+            _ => return None,
+        })
+    }
+
+    fn matches(self, name: &str, is_dir: bool) -> bool {
+        let ext = Path::new(name)
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_lowercase());
+        let ext = ext.as_deref();
+        match self {
+            KindClass::Folder => is_dir,
+            KindClass::App => ext == Some("app"),
+            // Every remaining category is file-only.
+            _ if is_dir => false,
+            KindClass::Image => matches!(
+                ext,
+                Some("jpg" | "jpeg" | "png" | "gif" | "heic" | "heif" | "tiff" | "tif" | "bmp"
+                    | "webp" | "svg" | "ico" | "raw")
+            ),
+            KindClass::Video => matches!(
+                ext,
+                Some("mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "mpg" | "mpeg" | "wmv" | "flv")
+            ),
+            KindClass::Audio => matches!(
+                ext,
+                Some("mp3" | "wav" | "flac" | "aac" | "m4a" | "ogg" | "aiff" | "aif" | "opus")
+            ),
+            KindClass::Pdf => ext == Some("pdf"),
+            KindClass::Doc => matches!(
+                ext,
+                Some("doc" | "docx" | "txt" | "md" | "rtf" | "pages" | "key" | "numbers" | "xls"
+                    | "xlsx" | "ppt" | "pptx" | "odt" | "csv" | "tsv" | "log")
+            ),
+            KindClass::Archive => matches!(
+                ext,
+                Some("zip" | "tar" | "gz" | "tgz" | "bz2" | "tbz" | "xz" | "txz" | "7z" | "rar")
+            ),
+            KindClass::Code => matches!(
+                ext,
+                Some("rs" | "go" | "py" | "js" | "ts" | "tsx" | "jsx" | "c" | "cpp" | "cc" | "h"
+                    | "hpp" | "java" | "swift" | "zig" | "rb" | "php" | "sh" | "json" | "toml"
+                    | "yaml" | "yml" | "html" | "css" | "sql" | "lua" | "kt" | "scala")
+            ),
+        }
+    }
+}
+
+/// A parsed size constraint in bytes.
+#[derive(Clone, Copy)]
+enum SizeBound {
+    Gt(u64),
+    Lt(u64),
+    Range(u64, u64),
+}
+
+impl SizeBound {
+    fn matches(self, size: u64) -> bool {
+        match self {
+            SizeBound::Gt(n) => size >= n,
+            SizeBound::Lt(n) => size <= n,
+            SizeBound::Range(a, b) => size >= a && size <= b,
+        }
+    }
+}
+
+/// Parse a byte count with an optional unit: `500`, `10k`, `2mb`, `1.5g`.
+fn parse_bytes(s: &str) -> Option<u64> {
+    let s = s.trim().to_lowercase();
+    if s.is_empty() {
+        return None;
+    }
+    let (num, mult) = if let Some(n) = s.strip_suffix("gb").or_else(|| s.strip_suffix('g')) {
+        (n, 1024u64 * 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("mb").or_else(|| s.strip_suffix('m')) {
+        (n, 1024 * 1024)
+    } else if let Some(n) = s.strip_suffix("kb").or_else(|| s.strip_suffix('k')) {
+        (n, 1024)
+    } else if let Some(n) = s.strip_suffix('b') {
+        (n, 1)
+    } else {
+        (s.as_str(), 1)
+    };
+    let val: f64 = num.trim().parse().ok()?;
+    if val < 0.0 {
+        return None;
+    }
+    Some((val * mult as f64) as u64)
+}
+
+/// Parse a `size:` value: `>1mb`, `<100k`, `1mb..5mb`, or a bare `2gb` (exact-ish
+/// → treated as "at least").
+fn parse_size(s: &str) -> Option<SizeBound> {
+    let s = s.trim();
+    if let Some((a, b)) = s.split_once("..") {
+        return Some(SizeBound::Range(parse_bytes(a)?, parse_bytes(b)?));
+    }
+    if let Some(rest) = s.strip_prefix(">=").or_else(|| s.strip_prefix('>')) {
+        return Some(SizeBound::Gt(parse_bytes(rest)?));
+    }
+    if let Some(rest) = s.strip_prefix("<=").or_else(|| s.strip_prefix('<')) {
+        return Some(SizeBound::Lt(parse_bytes(rest)?));
+    }
+    Some(SizeBound::Gt(parse_bytes(s)?))
+}
+
+/// Local midnight `days` days ago, as a `SystemTime`.
+fn day_start_ago(days: i64) -> Option<SystemTime> {
+    use chrono::TimeZone;
+    let day = (chrono::Local::now() - chrono::Duration::days(days)).date_naive();
+    let naive = day.and_hms_opt(0, 0, 0)?;
+    let local = chrono::Local.from_local_datetime(&naive).single()?;
+    let ts = local.timestamp();
+    (ts >= 0).then(|| std::time::UNIX_EPOCH + Duration::from_secs(ts as u64))
+}
+
+/// Midnight of an explicit `YYYY-MM-DD`, as a `SystemTime`.
+fn date_start(ymd: &str) -> Option<SystemTime> {
+    use chrono::TimeZone;
+    let day = chrono::NaiveDate::parse_from_str(ymd.trim(), "%Y-%m-%d").ok()?;
+    let naive = day.and_hms_opt(0, 0, 0)?;
+    let local = chrono::Local.from_local_datetime(&naive).single()?;
+    let ts = local.timestamp();
+    (ts >= 0).then(|| std::time::UNIX_EPOCH + Duration::from_secs(ts as u64))
+}
+
+/// A parsed search query: free text plus any filter operators.
+#[derive(Default, Clone)]
+struct FilterQuery {
+    /// Free text for name matching (operators stripped out).
+    text: String,
+    kinds: Vec<KindClass>,
+    exts: Vec<String>,
+    size: Option<SizeBound>,
+    after: Option<SystemTime>,
+    before: Option<SystemTime>,
+    /// `content:`/`text:` term, searched via Spotlight (mdfind).
+    content: Option<String>,
+}
+
+impl FilterQuery {
+    /// Split a raw query into free text + `key:value` operators. Unknown keys
+    /// are treated as plain text so a stray colon never eats the query.
+    fn parse(q: &str) -> FilterQuery {
+        let mut fq = FilterQuery::default();
+        let mut text_parts: Vec<&str> = Vec::new();
+        for tok in q.split_whitespace() {
+            let Some((key, val)) = tok.split_once(':') else {
+                text_parts.push(tok);
+                continue;
+            };
+            if val.is_empty() {
+                text_parts.push(tok);
+                continue;
+            }
+            match key.to_lowercase().as_str() {
+                "kind" | "type" => match KindClass::from_word(&val.to_lowercase()) {
+                    Some(k) => fq.kinds.push(k),
+                    None => text_parts.push(tok),
+                },
+                "ext" | "extension" => fq.exts.push(val.trim_start_matches('.').to_lowercase()),
+                "size" => match parse_size(val) {
+                    Some(s) => fq.size = Some(s),
+                    None => text_parts.push(tok),
+                },
+                "date" | "modified" | "mtime" => {
+                    let v = val.to_lowercase();
+                    let applied = match v.as_str() {
+                        "today" => {
+                            fq.after = day_start_ago(0);
+                            fq.after.is_some()
+                        }
+                        "yesterday" => {
+                            fq.after = day_start_ago(1);
+                            fq.before = day_start_ago(0);
+                            fq.after.is_some()
+                        }
+                        "week" | "thisweek" | "7d" => {
+                            fq.after = day_start_ago(7);
+                            fq.after.is_some()
+                        }
+                        "month" | "thismonth" | "30d" => {
+                            fq.after = day_start_ago(30);
+                            fq.after.is_some()
+                        }
+                        "year" | "365d" => {
+                            fq.after = day_start_ago(365);
+                            fq.after.is_some()
+                        }
+                        _ => {
+                            if let Some(d) = v.strip_prefix(">=").or_else(|| v.strip_prefix('>')) {
+                                fq.after = date_start(d);
+                                fq.after.is_some()
+                            } else if let Some(d) =
+                                v.strip_prefix("<=").or_else(|| v.strip_prefix('<'))
+                            {
+                                fq.before = date_start(d);
+                                fq.before.is_some()
+                            } else {
+                                false
+                            }
+                        }
+                    };
+                    if !applied {
+                        text_parts.push(tok);
+                    }
+                }
+                "content" | "text" | "contains" => fq.content = Some(val.to_string()),
+                _ => text_parts.push(tok),
+            }
+        }
+        fq.text = text_parts.join(" ");
+        fq
+    }
+
+    /// True when any local (non-content) operator is present.
+    fn has_local_filters(&self) -> bool {
+        !self.kinds.is_empty()
+            || !self.exts.is_empty()
+            || self.size.is_some()
+            || self.after.is_some()
+            || self.before.is_some()
+    }
+
+    /// Whether an entry passes the local operators (kind/ext/size/date). Content
+    /// is handled separately (async, via Spotlight).
+    fn matches_entry(&self, name: &str, is_dir: bool, size: u64, modified: Option<SystemTime>) -> bool {
+        if !self.kinds.is_empty() && !self.kinds.iter().any(|k| k.matches(name, is_dir)) {
+            return false;
+        }
+        if !self.exts.is_empty() {
+            let ext = Path::new(name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase());
+            match ext {
+                Some(e) if self.exts.iter().any(|x| x == &e) => {}
+                _ => return false,
+            }
+        }
+        if let Some(sb) = self.size {
+            if is_dir || !sb.matches(size) {
+                return false;
+            }
+        }
+        if self.after.is_some() || self.before.is_some() {
+            let Some(m) = modified else { return false };
+            if let Some(a) = self.after {
+                if m < a {
+                    return false;
+                }
+            }
+            if let Some(b) = self.before {
+                if m >= b {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+}
+
 fn find_score(q: &str, name: &str) -> Option<i32> {
     let ql = q.to_lowercase();
     let nl = name.to_lowercase();
@@ -11934,6 +12978,125 @@ fn index_score(query: &[char], name: &str) -> Option<i32> {
 
 /// Spotlight-backed name search: gather candidates with `mdfind`, then fuzzy
 /// rank by filename. Used as a fallback while the in-memory index is building.
+/// Full-text search inside `dir` via Spotlight: paths whose content matches
+/// `term`. Scoped with `-onlyin` so it's fast and folder-local. Returns the
+/// absolute paths (the in-folder filter keeps only direct children of these).
+fn mdfind_content(dir: &Path, term: &str) -> HashSet<PathBuf> {
+    let term = term.trim();
+    let mut out = HashSet::new();
+    if term.is_empty() {
+        return out;
+    }
+    // Case- and diacritic-insensitive substring match on indexed text content.
+    let query = format!("kMDItemTextContent == \"*{}*\"cd", term.replace('"', ""));
+    let output = Command::new("mdfind")
+        .arg("-onlyin")
+        .arg(dir)
+        .arg(query)
+        .stderr(Stdio::null())
+        .output();
+    if let Ok(o) = output {
+        if o.status.success() {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                if !line.is_empty() {
+                    out.insert(PathBuf::from(line));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Operator-driven global search for the command palette: content:/kind:/ext:/
+/// size:/date: over the home index (or Spotlight for content), returning up to
+/// 40 palette items. Runs off the UI thread.
+///
+/// Staged to keep metadata I/O bounded: cheap predicates (kind/ext + name)
+/// narrow the candidate set first; only the surviving top slice is `stat`ed for
+/// size/date, so a `kind:pdf` over a 100k-entry index never stats everything.
+fn palette_operator_search(
+    fq: &FilterQuery,
+    index: Option<&FileIndex>,
+    home: &Path,
+) -> Vec<PaletteItem> {
+    // 1. Raw candidates: Spotlight content hits, else the whole name index.
+    let mut cands: Vec<(String, PathBuf, bool)> = Vec::new();
+    if let Some(term) = &fq.content {
+        for p in mdfind_content(home, term).into_iter().take(4000) {
+            let Some(name) = p.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                continue;
+            };
+            let is_dir = p.is_dir();
+            cands.push((name, p, is_dir));
+        }
+    } else if let Some(idx) = index {
+        cands.reserve(idx.entries.len());
+        for e in &idx.entries {
+            cands.push((e.name.clone(), e.path.clone(), e.is_dir));
+        }
+    }
+
+    // 2. Cheap filter (kind/ext) + optional name ranking — no disk I/O.
+    let has_text = !fq.text.is_empty();
+    let mut scored: Vec<(i32, String, PathBuf, bool)> = Vec::new();
+    for (name, path, is_dir) in cands {
+        if !fq.kinds.is_empty() && !fq.kinds.iter().any(|k| k.matches(&name, is_dir)) {
+            continue;
+        }
+        if !fq.exts.is_empty() {
+            let ext = Path::new(&name)
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.to_lowercase());
+            match ext {
+                Some(e) if fq.exts.iter().any(|x| x == &e) => {}
+                _ => continue,
+            }
+        }
+        let score = if has_text {
+            match find_score(&fq.text, &name) {
+                Some(s) => s,
+                None => continue,
+            }
+        } else {
+            0
+        };
+        scored.push((score, name, path, is_dir));
+    }
+
+    // 3. Rank, then cap before the (potentially) stat-heavy stage.
+    if has_text {
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.len().cmp(&b.1.len())));
+    } else {
+        scored.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+    }
+    scored.truncate(400);
+
+    // 4. Apply size/date (needs metadata) only to the survivors.
+    let need_meta = fq.size.is_some() || fq.after.is_some() || fq.before.is_some();
+    let mut out = Vec::new();
+    for (_, name, path, is_dir) in scored {
+        if need_meta {
+            let md = fs::metadata(&path).ok();
+            let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
+            let mtime = md.as_ref().and_then(|m| m.modified().ok());
+            if !fq.matches_entry(&name, is_dir, size, mtime) {
+                continue;
+            }
+        }
+        out.push(PaletteItem {
+            title: name,
+            subtitle: display_path(&path),
+            action: Action::Open(path, is_dir),
+            is_dir,
+        });
+        if out.len() >= 40 {
+            break;
+        }
+    }
+    out
+}
+
 fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
     let mut child = match Command::new("mdfind")
         .arg("-name")
@@ -12465,8 +13628,8 @@ fn save_menu_style(m: &MenuStyle) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "bg={:06x}\ntext={:06x}\nopacity={}\nfont_px={}\n",
-            m.bg, m.text, m.opacity, m.font_px
+            "bg={:06x}\ntext={:06x}\nopacity={}\nfont_px={}\ncustom={}\n",
+            m.bg, m.text, m.opacity, m.font_px, m.custom
         );
         let _ = fs::write(&file, body);
     }
@@ -12503,6 +13666,7 @@ fn load_menu_style() -> MenuStyle {
                             m.font_px = n.clamp(9.0, 24.0);
                         }
                     }
+                    "custom" => m.custom = v == "true",
                     _ => {}
                 }
             }
@@ -12518,8 +13682,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps
+            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\n",
+            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions
         );
         let _ = fs::write(&file, body);
     }
@@ -12657,6 +13821,7 @@ fn load_prefs() -> Prefs {
                     "groups_enabled" => p.groups_enabled = on,
                     "show_filter_button" => p.show_filter_button = on,
                     "show_fps" => p.show_fps = on,
+                    "script_actions" => p.script_actions = on,
                     _ => {}
                 }
             }
@@ -12709,6 +13874,55 @@ fn main() {
                 t0.elapsed().as_millis()
             ),
             None => eprintln!("failed to render {}", path.display()),
+        }
+        return;
+    }
+
+    // Scaffold + discover script actions, and test matching/execution.
+    if args.len() >= 2 && args[1] == "--script-test" {
+        let dir = ensure_scripts_dir();
+        eprintln!("scripts dir: {:?}", dir);
+        let acts = discover_script_actions();
+        eprintln!("discovered {} action(s):", acts.len());
+        for a in &acts {
+            eprintln!(
+                "  {:<20} types={:?}  applies(png={}, folder={})",
+                a.name,
+                a.types,
+                script_action_applies(a, "photo.png", false),
+                script_action_applies(a, "MyFolder", true),
+            );
+        }
+        // Execute "Copy Path" (if present) on a sample path to confirm it runs.
+        if let Some(cp) = acts.iter().find(|a| a.name == "Copy Path") {
+            let out = Command::new(&cp.path)
+                .arg("/tmp/shuffle-script-test.txt")
+                .output();
+            eprintln!("ran Copy Path -> exit {:?}", out.map(|o| o.status.code()));
+        }
+        return;
+    }
+
+    // Parse a filter query and print the operators + a few match checks.
+    if args.len() >= 3 && args[1] == "--filter-test" {
+        let fq = FilterQuery::parse(&args[2]);
+        eprintln!("text={:?}", fq.text);
+        eprintln!("kinds={}", fq.kinds.len());
+        eprintln!("exts={:?}", fq.exts);
+        eprintln!("size={}", fq.size.is_some());
+        eprintln!("after={} before={}", fq.after.is_some(), fq.before.is_some());
+        eprintln!("content={:?}", fq.content);
+        // Match a few synthetic entries (name, is_dir, size, mtime=now).
+        let now = Some(SystemTime::now());
+        let cases: &[(&str, bool, u64)] = &[
+            ("report.pdf", false, 2_000_000),
+            ("photo.png", false, 500_000),
+            ("notes.txt", false, 1_000),
+            ("Projects", true, 0),
+            ("archive.zip", false, 50_000_000),
+        ];
+        for (n, d, s) in cases {
+            eprintln!("  {:>16}  match={}", n, fq.matches_entry(n, *d, *s, now));
         }
         return;
     }
@@ -12850,8 +14064,10 @@ fn main() {
         set_active_icon_pack(saved_pack.clone());
         cx.set_global(IconPackGlobal(saved_pack));
 
-        // Load the menu style.
-        let saved_menu = load_menu_style();
+        // Load the menu style; unless the user chose menu colors, derive them
+        // from the active theme so menus match (incl. light themes).
+        let mut saved_menu = load_menu_style();
+        saved_menu.follow_theme(&saved_theme);
         set_active_menu(saved_menu);
         cx.set_global(MenuStyleGlobal(saved_menu));
 
