@@ -346,6 +346,13 @@ struct Prefs {
     show_fps: bool,
     /// Run user shell-script actions from the Scripts folder in menus.
     script_actions: bool,
+    /// SFTP auth: true = delegate to the user's ~/.ssh (config/keys/known_hosts);
+    /// false = use the explicit key path saved per server.
+    ssh_use_system: bool,
+    /// Whether the user has made the first-run SFTP auth choice yet.
+    ssh_configured: bool,
+    /// Show the expandable "waterfall" folder tree at the bottom of the sidebar.
+    waterfall: bool,
 }
 
 impl Default for Prefs {
@@ -364,6 +371,9 @@ impl Default for Prefs {
             show_filter_button: true,
             show_fps: false,
             script_actions: false,
+            ssh_use_system: true,
+            ssh_configured: false,
+            waterfall: false,
         }
     }
 }
@@ -387,6 +397,9 @@ thread_local! {
         show_filter_button: true,
         show_fps: false,
         script_actions: false,
+        ssh_use_system: true,
+        ssh_configured: false,
+        waterfall: false,
     }) };
 }
 
@@ -980,6 +993,7 @@ fn tab_sections(tab: usize) -> &'static [&'static str] {
             "Inspector",
             "Command Palette",
             "Sidebar",
+            "Connections",
             "Script Actions",
             "Software Update",
             "Developer",
@@ -1309,6 +1323,95 @@ impl Settings {
             )
             .into_any_element();
 
+        // Connections (SFTP) section rows: the auth-mode choice, then the saved
+        // servers with a Remove button each, then how to add more.
+        let mut connection_rows: Vec<AnyElement> = Vec::new();
+        connection_rows.push(
+            toggle_row(
+                "tg-ssh-system",
+                "Use my ~/.ssh configuration",
+                "On: connect using your existing SSH keys, ~/.ssh/config aliases, and \
+                 known_hosts — nothing is stored in the app. Off: use the private-key \
+                 path you set per server.",
+                p.ssh_use_system,
+                cx.listener(|_, _: &ClickEvent, _, cx| {
+                    let mut np = prefs();
+                    np.ssh_use_system = !np.ssh_use_system;
+                    np.ssh_configured = true;
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }),
+            )
+            .into_any_element(),
+        );
+        let servers = sftp_servers();
+        if servers.is_empty() {
+            connection_rows.push(
+                div()
+                    .text_xs()
+                    .text_color(rgb(t.text_dim))
+                    .child(
+                        "No saved servers yet. Add one from the sidebar: Connect to \
+                         Server\u{2026} then enter sftp://user@host (or an ~/.ssh alias).",
+                    )
+                    .into_any_element(),
+            );
+        } else {
+            for (i, s) in servers.iter().enumerate() {
+                let srv = s.clone();
+                connection_rows.push(
+                    div()
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .child(div().text_color(rgb(t.text)).child(s.name.clone()))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(t.text_muted))
+                                        .child(format!("sftp://{}", s.display())),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id(("sftp-remove", i))
+                                .flex_none()
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .bg(rgb(t.hover))
+                                .text_color(rgb(t.text))
+                                .hover(|s| s.border_color(rgb(0xd9544f)).text_color(rgb(0xd9544f)))
+                                .border_1()
+                                .border_color(rgb(t.border))
+                                .child("Remove")
+                                .on_click(cx.listener(move |_, _: &ClickEvent, _, cx| {
+                                    if srv.use_password {
+                                        keychain_delete_password(&srv);
+                                    }
+                                    let list: Vec<SftpServer> = sftp_servers()
+                                        .into_iter()
+                                        .filter(|x| x.display() != srv.display())
+                                        .collect();
+                                    apply_sftp_servers(list, cx);
+                                    cx.notify();
+                                })),
+                        )
+                        .into_any_element(),
+                );
+            }
+        }
+
         vec![
             settings_header(
                 "General",
@@ -1452,6 +1555,19 @@ impl Settings {
                         }),
                     )
                     .into_any_element(),
+                    toggle_row(
+                        "tg-waterfall",
+                        "Waterfall folder tree",
+                        "Show an expandable tree of the current folder's subfolders at the bottom of the sidebar. Click a triangle to drill in, click a name to open it in the pane.",
+                        p.waterfall,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.waterfall = !np.waterfall;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
                     stepper_row(
                         "st-recents",
                         "Recent folders",
@@ -1476,6 +1592,11 @@ impl Settings {
                     )
                     .into_any_element(),
                 ],
+            ),
+            settings_section(
+                "Connections",
+                Some("SFTP servers — browse remote hosts over SSH from the sidebar."),
+                connection_rows,
             ),
             settings_section(
                 "Script Actions",
@@ -2739,6 +2860,8 @@ enum SidebarTarget {
     GroupHeader(usize),
     /// A member of a group: (group index, path) → offer "Remove from Group".
     GroupMember(usize, PathBuf),
+    /// A saved SFTP server → offer "Edit…" / "Remove".
+    Sftp(SftpServer),
 }
 
 /// One row in the command palette: a title, a gray subtitle (full path), and
@@ -2857,6 +2980,9 @@ struct Tab {
     /// The directory's mtime as of the last load; the watcher reloads the tab
     /// when the folder changes underneath us (new download, deletion, …).
     dir_mtime: Option<SystemTime>,
+    /// When `Some`, this tab browses a remote SFTP server; `current_dir` is a
+    /// remote absolute path on that host. `None` = a normal local tab.
+    remote: Option<SftpServer>,
 }
 
 impl Tab {
@@ -2892,6 +3018,7 @@ impl Tab {
             last_scroll: Instant::now(),
             scroll_epoch: 0,
             dir_mtime: None,
+            remote: None,
         }
     }
 }
@@ -3038,7 +3165,9 @@ struct Shuffle {
     /// a native OS drag once the cursor moves past a small threshold.
     drag_candidate: Option<(usize, PathBuf, (f32, f32))>,
     /// Open "Connect to Server" dialog: the URL being typed (None = closed).
-    server_dialog: Option<String>,
+    server_dialog: Option<ServerForm>,
+    /// First-run SSH prompt (choose ~/.ssh vs. credentials) — shown once.
+    ssh_ask: bool,
     /// Recently-connected server URLs (most recent first).
     server_history: Vec<String>,
     // Terminal mode (the bottom command bar).
@@ -3059,6 +3188,16 @@ struct Shuffle {
     /// the drag position on every synthesized drag-move — one source of truth,
     /// so the highlight can't flicker between panes.
     drop_hover: Option<(usize, Option<usize>)>,
+    /// Last SFTP error (connection/listing), shown as a banner until cleared.
+    remote_error: Option<String>,
+    /// Waterfall sidebar tree: which folders are expanded, their cached child
+    /// subfolders, and which are being loaded (to avoid duplicate reads).
+    waterfall_expanded: HashSet<PathBuf>,
+    waterfall_children: HashMap<PathBuf, Vec<PathBuf>>,
+    waterfall_pending: HashSet<PathBuf>,
+    /// Each cached waterfall folder's mtime, so the folder watcher can spot an
+    /// outside change and invalidate just that folder for a live refresh.
+    waterfall_mtime: HashMap<PathBuf, SystemTime>,
 }
 
 /// Update-check state shared between the Settings window (which drives the
@@ -3107,6 +3246,12 @@ impl Shuffle {
         // Sync + repaint whenever feature prefs change.
         cx.observe_global::<PrefsGlobal>(|_, cx| {
             set_active_prefs(cx.global::<PrefsGlobal>().0);
+            cx.notify();
+        })
+        .detach();
+        // Sync + repaint whenever the saved SFTP servers change (from Settings).
+        cx.observe_global::<SftpServersGlobal>(|_, cx| {
+            set_active_sftp_servers(cx.global::<SftpServersGlobal>().0.clone());
             cx.notify();
         })
         .detach();
@@ -3176,6 +3321,11 @@ impl Shuffle {
                         if pane >= this.panes.len() || this.tab(pane).current_dir != dir {
                             continue;
                         }
+                        // Remote tabs aren't on the local filesystem — the mtime
+                        // stat is meaningless (and would reload constantly).
+                        if this.tab(pane).remote.is_some() {
+                            continue;
+                        }
                         match (this.tab(pane).dir_mtime, cur) {
                             (Some(prev), Some(now)) if prev != now => {
                                 this.reload_pane(pane, cx);
@@ -3184,6 +3334,8 @@ impl Shuffle {
                             _ => {}
                         }
                     }
+                    // Same tick: live-refresh the waterfall tree's folders.
+                    this.refresh_waterfall(cx);
                 });
                 if alive.is_err() {
                     break;
@@ -3240,6 +3392,7 @@ impl Shuffle {
             marquee: None,
             drag_candidate: None,
             server_dialog: None,
+            ssh_ask: false,
             server_history: read_string_list("servers.txt"),
             term_input: String::new(),
             term_output: Vec::new(),
@@ -3249,6 +3402,11 @@ impl Shuffle {
             preview_page: 0,
             hovered: None,
             drop_hover: None,
+            remote_error: None,
+            waterfall_expanded: HashSet::new(),
+            waterfall_children: HashMap::new(),
+            waterfall_pending: HashSet::new(),
+            waterfall_mtime: HashMap::new(),
         }
     }
 
@@ -3312,6 +3470,11 @@ impl Shuffle {
     /// Load (or reload) a pane's directory: a near-instant cheap pass for first
     /// paint, then a background pass that fills in sizes/dates without blocking.
     fn reload_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
+        // Remote (SFTP) tabs load over the network on a background thread.
+        if self.tab(pane).remote.is_some() {
+            self.reload_remote_pane(pane, cx);
+            return;
+        }
         let dir = self.tab(pane).current_dir.clone();
         ensure_dynamic_sidebar_icons(); // pick up newly-mounted volumes/cloud
         // Stamp the mtime *before* reading so a change racing the read bumps
@@ -3348,6 +3511,159 @@ impl Shuffle {
             });
         })
         .detach();
+    }
+
+    /// Load a remote SFTP directory listing on a background thread, then swap
+    /// it in if the tab is still on that path.
+    fn reload_remote_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
+        let Some(server) = self.tab(pane).remote.clone() else {
+            return;
+        };
+        let dir = self.tab(pane).current_dir.clone();
+        let path = dir.to_string_lossy().into_owned();
+        self.next_load_gen += 1;
+        let gen = self.next_load_gen;
+        self.tab_mut(pane).load_gen = gen;
+        // Show a placeholder (empty) immediately; the listing arrives async.
+        self.tab_mut(pane).entries.clear();
+        cx.notify();
+        let use_system = prefs().ssh_use_system;
+        cx.spawn(async move |this, cx| {
+            let s = server.clone();
+            let p = path.clone();
+            let result = cx
+                .background_spawn(async move { sftp_list(&s, &p, use_system) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if pane >= this.panes.len()
+                    || this.tab(pane).load_gen != gen
+                    || this.tab(pane).current_dir != dir
+                {
+                    return;
+                }
+                match result {
+                    Ok(entries) => {
+                        this.tab_mut(pane).entries = entries;
+                        this.remote_error = None;
+                        this.sort_tab(pane);
+                        if this.tab(pane).find_query.is_some() {
+                            this.recompute_find(pane);
+                        }
+                        this.prewarm_icons(cx);
+                    }
+                    Err(e) => {
+                        this.tab_mut(pane).entries.clear();
+                        this.remote_error = Some(e);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Run a remote operation off-thread, then reload the pane (or show the
+    /// error). The closure captures the server + parameters it needs.
+    fn run_remote<F>(&mut self, pane: usize, op: F, cx: &mut Context<Self>)
+    where
+        F: FnOnce() -> Result<(), String> + Send + 'static,
+    {
+        cx.spawn(async move |this, cx| {
+            let result = cx.background_spawn(async move { op() }).await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(()) => {
+                        this.remote_error = None;
+                        if pane < this.panes.len() {
+                            this.reload_pane(pane, cx);
+                        }
+                    }
+                    Err(e) => {
+                        this.remote_error = Some(e);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// A unique child name in a remote dir, computed from the current listing.
+    fn unique_remote_name(&self, pane: usize, base: &str) -> String {
+        let names: Vec<String> = self.tab(pane).entries.iter().map(|e| e.name.clone()).collect();
+        if !names.iter().any(|n| n == base) {
+            return base.to_string();
+        }
+        for i in 2..1000 {
+            let cand = format!("{base} {i}");
+            if !names.iter().any(|n| n == &cand) {
+                return cand;
+            }
+        }
+        base.to_string()
+    }
+
+    /// Make a new folder (or empty file) on the remote server; the new item is
+    /// selected when the listing refreshes (press Enter to rename it).
+    fn new_remote_item(&mut self, pane: usize, is_dir: bool, cx: &mut Context<Self>) {
+        let Some(server) = self.tab(pane).remote.clone() else {
+            return;
+        };
+        let base = if is_dir { "untitled folder" } else { "untitled file" };
+        let name = self.unique_remote_name(pane, base);
+        let path = self.tab(pane).current_dir.join(&name);
+        let remote_path = path.to_string_lossy().into_owned();
+        let use_system = prefs().ssh_use_system;
+        cx.spawn(async move |this, cx| {
+            let s = server.clone();
+            let rp = remote_path.clone();
+            let r = cx
+                .background_spawn(async move {
+                    if is_dir {
+                        sftp_mkdir(&s, &rp, use_system)
+                    } else {
+                        sftp_touch(&s, &rp, use_system)
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if pane >= this.panes.len() {
+                    return;
+                }
+                match r {
+                    Ok(()) => {
+                        this.remote_error = None;
+                        this.tab_mut(pane).selection = std::iter::once(path.clone()).collect();
+                        this.tab_mut(pane).anchor = Some(path);
+                        this.reload_pane(pane, cx);
+                    }
+                    Err(e) => {
+                        this.remote_error = Some(e);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Upload local file(s) into a remote directory on `pane`.
+    fn upload_to_remote(&mut self, pane: usize, remote_dir: PathBuf, locals: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let Some(server) = self.tab(pane).remote.clone() else {
+            return;
+        };
+        let dir = remote_dir.to_string_lossy().into_owned();
+        let use_system = prefs().ssh_use_system;
+        self.run_remote(
+            pane,
+            move || {
+                for local in &locals {
+                    sftp_upload(&server, local, &dir, use_system)?;
+                }
+                Ok(())
+            },
+            cx,
+        );
     }
 
     /// Re-apply this tab's sort criterion to its entries.
@@ -3397,6 +3713,10 @@ impl Shuffle {
     }
 
     fn new_folder(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab(pane).remote.is_some() {
+            self.new_remote_item(pane, true, cx);
+            return;
+        }
         let path = unique_child(&self.tab(pane).current_dir, "untitled folder");
         if fs::create_dir(&path).is_ok() {
             self.refresh_pane(pane, cx);
@@ -3405,6 +3725,10 @@ impl Shuffle {
     }
 
     fn new_file(&mut self, pane: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab(pane).remote.is_some() {
+            self.new_remote_item(pane, false, cx);
+            return;
+        }
         let path = unique_child(&self.tab(pane).current_dir, "untitled file");
         if fs::File::create(&path).is_ok() {
             self.refresh_pane(pane, cx);
@@ -3454,9 +3778,65 @@ impl Shuffle {
     fn open_path(&mut self, pane: usize, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
         if is_dir {
             self.navigate_in(pane, path, cx);
+        } else if self.tab(pane).remote.is_some() {
+            // Remote file → download to ~/Downloads, then open it.
+            self.download_remote(pane, path, None, true, cx);
         } else {
             let _ = Command::new("open").arg(&path).spawn();
         }
+    }
+
+    /// Download a remote file to a local directory (default: ~/Downloads) on a
+    /// background thread; optionally `open` it when finished.
+    fn download_remote(
+        &mut self,
+        pane: usize,
+        remote_path: PathBuf,
+        dest_dir: Option<PathBuf>,
+        open_after: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(server) = self.tab(pane).remote.clone() else {
+            return;
+        };
+        let name = remote_path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "download".into());
+        let dest_dir = dest_dir.unwrap_or_else(|| home_dir().join("Downloads"));
+        let local = unique_child(&dest_dir, &name);
+        let remote = remote_path.to_string_lossy().into_owned();
+        let use_system = prefs().ssh_use_system;
+        cx.spawn(async move |this, cx| {
+            let s = server.clone();
+            let r = remote.clone();
+            let l = local.clone();
+            let result = cx
+                .background_spawn(async move {
+                    let _ = fs::create_dir_all(l.parent().unwrap_or(&l));
+                    // sftp `get "remote" "local"`.
+                    let script = format!(
+                        "get \"{}\" \"{}\"",
+                        r.replace('"', ""),
+                        l.to_string_lossy().replace('"', "")
+                    );
+                    sftp_batch(&s, &script, use_system).map(|_| l)
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(local) => {
+                        this.remote_error = None;
+                        if open_after {
+                            let _ = Command::new("open").arg(&local).spawn();
+                        }
+                    }
+                    Err(e) => this.remote_error = Some(format!("Download failed: {e}")),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
     }
 
     fn move_to_trash(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
@@ -3481,16 +3861,35 @@ impl Shuffle {
         cx.notify();
     }
 
-    /// Carry out a confirmed delete: move every path to Trash.
+    /// Carry out a confirmed delete: Trash locally, or permanently remove on a
+    /// remote server (no Trash exists there).
     fn perform_delete(&mut self, cx: &mut Context<Self>) {
         if let Some((pane, paths)) = self.confirm_delete.take() {
-            for p in &paths {
-                trash_path(p);
+            {
+                let tab = self.tab_mut(pane);
+                tab.selection.clear();
+                tab.anchor = None;
             }
-            let tab = self.tab_mut(pane);
-            tab.selection.clear();
-            tab.anchor = None;
-            self.refresh_pane(pane, cx);
+            if let Some(server) = self.tab(pane).remote.clone() {
+                let use_system = prefs().ssh_use_system;
+                let remote_paths: Vec<String> =
+                    paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                self.run_remote(
+                    pane,
+                    move || {
+                        for rp in &remote_paths {
+                            sftp_delete(&server, rp, use_system)?;
+                        }
+                        Ok(())
+                    },
+                    cx,
+                );
+            } else {
+                for p in &paths {
+                    trash_path(p);
+                }
+                self.refresh_pane(pane, cx);
+            }
         }
         cx.notify();
     }
@@ -3524,6 +3923,22 @@ impl Shuffle {
         // `mv` handles cross-volume moves (copy + delete) too.
         let _ = Command::new("mv").arg(&src).arg(&dest).status();
         self.refresh_all_panes(cx);
+    }
+
+    /// Handle files dropped onto `dest_dir` in `pane`: upload to the server when
+    /// the pane is remote, otherwise move locally. Dropped `ExternalPaths` are
+    /// always local (from Finder or another pane), so remote = upload.
+    fn drop_files(&mut self, pane: usize, dest_dir: PathBuf, srcs: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if self.tab(pane).remote.is_some() {
+            let locals: Vec<PathBuf> = srcs.into_iter().filter(|p| p.exists()).collect();
+            if !locals.is_empty() {
+                self.upload_to_remote(pane, dest_dir, locals, cx);
+            }
+        } else {
+            for s in srcs {
+                self.move_into(dest_dir.clone(), s, cx);
+            }
+        }
     }
 
     // ----- inline rename -----
@@ -3593,16 +4008,31 @@ impl Shuffle {
             if !new.is_empty() {
                 if let Some(parent) = r.path.parent() {
                     let dest = parent.join(new);
+                    if dest == r.path {
+                        cx.notify();
+                        return;
+                    }
+                    // Remote rename runs over SFTP on a background thread.
+                    if let Some(server) = self.tab(r.pane).remote.clone() {
+                        let use_system = prefs().ssh_use_system;
+                        let from = r.path.to_string_lossy().into_owned();
+                        let to = dest.to_string_lossy().into_owned();
+                        let pane = r.pane;
+                        self.run_remote(
+                            pane,
+                            move || sftp_rename(&server, &from, &to, use_system),
+                            cx,
+                        );
+                        cx.notify();
+                        return;
+                    }
                     // Case-only renames are legal even though the destination
                     // "exists" on APFS's case-insensitive default.
                     let case_only = r
                         .path
                         .file_name()
                         .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(new));
-                    if dest != r.path
-                        && (case_only || !dest.exists())
-                        && fs::rename(&r.path, &dest).is_ok()
-                    {
+                    if (case_only || !dest.exists()) && fs::rename(&r.path, &dest).is_ok() {
                         let tab = self.tab_mut(r.pane);
                         if tab.selection.remove(&r.path) {
                             tab.selection.insert(dest.clone());
@@ -4035,6 +4465,12 @@ impl Shuffle {
         target: Option<(PathBuf, bool)>,
         cx: &Context<Self>,
     ) -> Vec<AnyElement> {
+        // Remote (SFTP) tabs get a reduced menu — the local-only actions
+        // (Quick Actions, Compress, Tags, aliases, Reveal in Finder…) don't
+        // apply to a remote path.
+        if self.tab(pane).remote.is_some() {
+            return self.menu_remote(pane, target, cx);
+        }
         let mut items: Vec<AnyElement> = Vec::new();
         if let Some((path, is_dir)) = target {
             let p = path.clone();
@@ -4205,6 +4641,83 @@ impl Shuffle {
             items.push(
                 ctx_parent("Services", cx.listener(|this, _: &ClickEvent, _, cx| {
                     this.set_menu_view(MenuView::Services, cx);
+                }))
+                .into_any_element(),
+            );
+            items.push(ctx_separator().into_any_element());
+        }
+        items.push(
+            ctx_item("New Folder", cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.close_context_menu(cx);
+                this.new_folder(pane, window, cx);
+            }))
+            .into_any_element(),
+        );
+        items.push(
+            ctx_item("New File", cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.close_context_menu(cx);
+                this.new_file(pane, window, cx);
+            }))
+            .into_any_element(),
+        );
+        items
+    }
+
+    /// The right-click menu for a remote (SFTP) tab: only actions that work
+    /// over the network.
+    fn menu_remote(
+        &self,
+        pane: usize,
+        target: Option<(PathBuf, bool)>,
+        cx: &Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut items: Vec<AnyElement> = Vec::new();
+        if let Some((path, is_dir)) = target {
+            let p = path.clone();
+            items.push(
+                ctx_item(
+                    if is_dir { "Open" } else { "Open (Download)" },
+                    cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_context_menu(cx);
+                        this.open_path(pane, p.clone(), is_dir, cx);
+                    }),
+                )
+                .into_any_element(),
+            );
+            if !is_dir {
+                let p = path.clone();
+                items.push(
+                    ctx_item("Download to Downloads", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_context_menu(cx);
+                        this.download_remote(pane, p.clone(), None, false, cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
+            items.push(ctx_separator().into_any_element());
+            let p = path.clone();
+            items.push(
+                ctx_item("Rename", cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    this.close_context_menu(cx);
+                    this.begin_rename(pane, p.clone(), window, cx);
+                }))
+                .into_any_element(),
+            );
+            let p = path.clone();
+            items.push(
+                ctx_item("Copy Path", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()));
+                    this.close_context_menu(cx);
+                }))
+                .into_any_element(),
+            );
+            items.push(ctx_separator().into_any_element());
+            let p = path.clone();
+            items.push(
+                ctx_item("Delete from Server", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.close_context_menu(cx);
+                    this.confirm_delete = Some((pane, vec![p.clone()]));
+                    cx.notify();
                 }))
                 .into_any_element(),
             );
@@ -4646,16 +5159,136 @@ impl Shuffle {
     // ----- Connect to Server -----
 
     fn open_server_dialog(&mut self, cx: &mut Context<Self>) {
-        self.server_dialog = Some(String::new());
+        // First run: ask how to authenticate over SSH (a permission-style
+        // prompt), then open the connect dialog. Afterwards, go straight in.
+        if !prefs().ssh_configured {
+            self.ssh_ask = true;
+        } else {
+            let mut form = ServerForm::default();
+            form.mode = if prefs().ssh_use_system {
+                ServerMode::Quick
+            } else {
+                ServerMode::Credentials
+            };
+            self.server_dialog = Some(form);
+        }
+        cx.notify();
+    }
+
+    /// Answer the first-run SSH prompt, remember the default, and open the
+    /// connect dialog on the matching tab.
+    fn choose_ssh_mode(&mut self, use_system: bool, cx: &mut Context<Self>) {
+        let mut np = prefs();
+        np.ssh_use_system = use_system;
+        np.ssh_configured = true;
+        apply_prefs(np, cx);
+        self.ssh_ask = false;
+        let mut form = ServerForm::default();
+        form.mode = if use_system {
+            ServerMode::Quick
+        } else {
+            ServerMode::Credentials
+        };
+        self.server_dialog = Some(form);
+        cx.notify();
+    }
+
+    /// Submit whichever connect tab is active.
+    fn submit_server_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.server_dialog.clone() else {
+            return;
+        };
+        match form.mode {
+            ServerMode::Quick => self.connect_to_server(&form.addr, cx),
+            ServerMode::Credentials => self.submit_credentials(cx),
+        }
+    }
+
+    /// Save an SFTP server from the Credentials tab (password → Keychain) and
+    /// connect to it.
+    fn submit_credentials(&mut self, cx: &mut Context<Self>) {
+        let Some(form) = self.server_dialog.clone() else {
+            return;
+        };
+        let host = form.host.trim().to_string();
+        if host.is_empty() {
+            return;
+        }
+        let name = if form.name.trim().is_empty() {
+            host.clone()
+        } else {
+            form.name.trim().to_string()
+        };
+        let server = SftpServer {
+            name,
+            host,
+            user: form.user.trim().to_string(),
+            port: form.port.trim().parse().unwrap_or(0),
+            key: String::new(),
+            use_password: true,
+            auto_reopen: form.auto_reopen,
+        };
+        // Only overwrite the Keychain when a password was entered (editing an
+        // existing server without retyping keeps the stored one).
+        if !form.password.is_empty() {
+            keychain_set_password(&server, &form.password);
+        }
+        let mut list = sftp_servers();
+        // When editing, drop the original entry (its target may have changed).
+        if let Some(old) = &form.editing {
+            if *old != server.display() {
+                if let Some(prev) = list.iter().find(|s| &s.display() == old).cloned() {
+                    keychain_delete_password(&prev);
+                }
+            }
+            list.retain(|s| &s.display() != old);
+        }
+        if let Some(existing) = list.iter_mut().find(|s| s.display() == server.display()) {
+            *existing = server.clone();
+        } else {
+            list.push(server.clone());
+        }
+        apply_sftp_servers(list, cx);
+        self.server_dialog = None;
+        self.connect_sftp(server, cx);
+    }
+
+    /// Open the connect dialog pre-filled to edit an existing server.
+    fn edit_server(&mut self, server: &SftpServer, cx: &mut Context<Self>) {
+        self.sidebar_menu = None;
+        self.server_dialog = Some(ServerForm::editing_server(server));
         cx.notify();
     }
 
     /// Hand a server URL off to macOS (`open smb://…`), which shows the native
     /// auth prompt and mounts the share under /Volumes. Records it in history.
+    /// `sftp://[user@]host[:port]` instead saves an SFTP server and connects to
+    /// it in-app (browsing over SSH, no mount).
     fn connect_to_server(&mut self, raw: &str, cx: &mut Context<Self>) {
         let mut url = raw.trim().to_string();
         if url.is_empty() {
             return;
+        }
+        // sftp:// / ssh:// → an in-app SFTP server (saved + connected).
+        if let Some(rest) = url
+            .strip_prefix("sftp://")
+            .or_else(|| url.strip_prefix("ssh://"))
+        {
+            if let Some(mut server) = parse_sftp_url(rest) {
+                // Carry the dialog's "reconnect on launch" toggle onto the server.
+                server.auto_reopen =
+                    self.server_dialog.as_ref().map(|f| f.auto_reopen).unwrap_or(false);
+                let mut list = sftp_servers();
+                if let Some(existing) = list.iter_mut().find(|s| s.display() == server.display()) {
+                    existing.auto_reopen = server.auto_reopen;
+                } else {
+                    list.push(server.clone());
+                }
+                apply_sftp_servers(list, cx);
+                self.server_dialog = None;
+                self.connect_sftp(server, cx);
+                return;
+            }
         }
         // Default to SMB when no scheme is given.
         if !url.contains("://") {
@@ -4681,21 +5314,26 @@ impl Shuffle {
                 self.server_dialog = None;
                 cx.notify();
             }
-            "enter" => {
-                if let Some(url) = self.server_dialog.clone() {
-                    self.connect_to_server(&url, cx);
+            "enter" => self.submit_server_dialog(cx),
+            "tab" => {
+                if let Some(f) = self.server_dialog.as_mut() {
+                    if f.mode == ServerMode::Credentials {
+                        f.next_field();
+                    }
                 }
+                cx.notify();
             }
             "backspace" => {
-                if let Some(s) = self.server_dialog.as_mut() {
-                    s.pop();
+                if let Some(f) = self.server_dialog.as_mut() {
+                    f.active_field().pop();
                 }
                 cx.notify();
             }
             "v" if cmd => {
                 if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
-                    if let Some(s) = self.server_dialog.as_mut() {
-                        s.push_str(t.trim());
+                    if let Some(f) = self.server_dialog.as_mut() {
+                        let s = t.trim().to_string();
+                        f.active_field().push_str(&s);
                     }
                     cx.notify();
                 }
@@ -4706,8 +5344,8 @@ impl Shuffle {
                 }
                 if let Some(ch) = ks.key_char.as_ref() {
                     if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        if let Some(s) = self.server_dialog.as_mut() {
-                            s.push_str(ch);
+                        if let Some(f) = self.server_dialog.as_mut() {
+                            f.active_field().push_str(ch);
                         }
                         cx.notify();
                     }
@@ -4718,33 +5356,154 @@ impl Shuffle {
 
     fn render_server_dialog(&self, cx: &Context<Self>) -> impl IntoElement {
         let t = theme();
-        let url = self.server_dialog.clone().unwrap_or_default();
-        let placeholder = url.is_empty();
-        let shown = if placeholder { "smb://server/share".to_string() } else { url.clone() };
+        let form = self.server_dialog.clone().unwrap_or_default();
+        let mode = form.mode;
 
-        let mut recent = div().flex().flex_col().gap_1();
-        if !self.server_history.is_empty() {
-            recent = recent.child(
-                div().text_xs().text_color(rgb(t.text_dim)).child("Recent Servers"),
-            );
-            for u in self.server_history.iter().take(6) {
-                let target = u.clone();
-                recent = recent.child(
+        // Mode tabs (Quick Connect | Credentials).
+        let mode_tab = |label: &'static str, m: ServerMode| {
+            let active = mode == m;
+            div()
+                .id(label)
+                .flex_1()
+                .flex()
+                .justify_center()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(if active { rgb(t.text) } else { rgb(t.text_muted) })
+                .bg(if active { rgb(t.surface) } else { rgba(0x00000000) })
+                .hover(|s| s.bg(rgb(t.hover)))
+                .child(label)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(f) = this.server_dialog.as_mut() {
+                        f.mode = m;
+                    }
+                    cx.notify();
+                }))
+        };
+        let tabs = div()
+            .flex()
+            .gap_1()
+            .p_1()
+            .rounded_md()
+            .bg(rgb(t.bg))
+            .child(mode_tab("Quick Connect", ServerMode::Quick))
+            .child(mode_tab("Credentials", ServerMode::Credentials));
+
+        // A labeled input row for the Credentials tab.
+        let field_row = |label: &'static str, cf: CredField, value: &str, secret: bool| {
+            let focused = mode == ServerMode::Credentials && form.field == cf;
+            let empty = value.is_empty();
+            let shown = if empty {
+                label.to_string()
+            } else if secret {
+                "\u{2022}".repeat(value.chars().count())
+            } else {
+                value.to_string()
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(div().text_xs().text_color(rgb(t.text_muted)).child(label))
+                .child(
                     div()
-                        .id(SharedString::from(format!("srv-{u}")))
-                        .px_2()
-                        .py_1()
+                        .id(label)
+                        .flex()
+                        .items_center()
+                        .px_3()
+                        .py_2()
                         .rounded_md()
+                        .bg(rgb(t.bg))
+                        .border_1()
+                        .border_color(if focused { rgb(t.accent) } else { rgb(t.border) })
+                        .text_color(rgb(if empty { t.text_dim } else { t.text }))
                         .cursor_pointer()
-                        .text_color(rgb(t.text_muted))
-                        .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
-                        .child(u.clone())
+                        .child(shown)
+                        .when(focused, |d| {
+                            d.child(div().w(px(1.5)).h(px(15.0)).ml(px(1.0)).bg(rgb(t.text)))
+                        })
                         .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.connect_to_server(&target, cx);
+                            if let Some(f) = this.server_dialog.as_mut() {
+                                f.field = cf;
+                            }
+                            cx.notify();
                         })),
-                );
+                )
+        };
+
+        let body: AnyElement = match mode {
+            ServerMode::Quick => {
+                let empty = form.addr.is_empty();
+                let shown = if empty {
+                    "smb://host/share  or  sftp://user@host".to_string()
+                } else {
+                    form.addr.clone()
+                };
+                let mut recent = div().flex().flex_col().gap_1();
+                if !self.server_history.is_empty() {
+                    recent = recent
+                        .child(div().text_xs().text_color(rgb(t.text_dim)).child("Recent"));
+                    for u in self.server_history.iter().take(5) {
+                        let target = u.clone();
+                        recent = recent.child(
+                            div()
+                                .id(SharedString::from(format!("srv-{u}")))
+                                .px_2()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_color(rgb(t.text_muted))
+                                .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+                                .child(u.clone())
+                                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                    this.connect_to_server(&target, cx);
+                                })),
+                        );
+                    }
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .child(div().text_xs().text_color(rgb(t.text_muted)).child(
+                        "Address — smb://, afp://, ftp://, or sftp://user@host to browse over SSH.",
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(rgb(t.bg))
+                            .border_1()
+                            .border_color(rgb(t.accent))
+                            .text_color(rgb(if empty { t.text_dim } else { t.text }))
+                            .child(shown)
+                            .child(div().w(px(1.5)).h(px(15.0)).ml(px(1.0)).bg(rgb(t.text))),
+                    )
+                    .child(recent)
+                    .into_any_element()
             }
-        }
+            ServerMode::Credentials => div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(field_row("Name (optional)", CredField::Name, &form.name, false))
+                .child(field_row("Host", CredField::Host, &form.host, false))
+                .child(field_row("Username", CredField::User, &form.user, false))
+                .child(field_row("Port (optional)", CredField::Port, &form.port, false))
+                .child(field_row("Password", CredField::Password, &form.password, true))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(t.text_dim))
+                        .child("Password is stored in your macOS Keychain — Tab moves between fields."),
+                )
+                .into_any_element(),
+        };
 
         div()
             .absolute()
@@ -4757,13 +5516,16 @@ impl Shuffle {
             .justify_center()
             .bg(rgba(0x00000066))
             .occlude()
-            .on_mouse_down(MouseButton::Left, cx.listener(|this, _, _, cx| {
-                this.server_dialog = None;
-                cx.notify();
-            }))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.server_dialog = None;
+                    cx.notify();
+                }),
+            )
             .child(
                 div()
-                    .w(px(420.0))
+                    .w(px(440.0))
                     .flex()
                     .flex_col()
                     .gap_3()
@@ -4774,27 +5536,50 @@ impl Shuffle {
                     .border_color(rgb(t.border_strong))
                     .shadow_lg()
                     .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
-                    .child(div().text_color(rgb(t.text)).child("Connect to Server"))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(rgb(t.text_muted))
-                            .child("Enter an address, e.g. smb://host/share, afp://…, or ftp://…"),
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(t.text))
+                            .child("Connect to Server"),
                     )
+                    .child(tabs)
+                    .child(body)
                     .child(
+                        // "Reconnect on launch" toggle for this server.
                         div()
                             .flex()
                             .items_center()
-                            .px_3()
-                            .py_2()
-                            .rounded_md()
-                            .bg(rgb(t.bg))
-                            .border_1()
-                            .border_color(rgb(t.accent))
-                            .text_color(rgb(if placeholder { t.text_dim } else { t.text }))
-                            .child(shown),
+                            .gap_2()
+                            .cursor_pointer()
+                            .id("srv-autoreopen")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Some(f) = this.server_dialog.as_mut() {
+                                    f.auto_reopen = !f.auto_reopen;
+                                }
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .w(px(16.0))
+                                    .h(px(16.0))
+                                    .rounded_sm()
+                                    .border_1()
+                                    .border_color(rgb(t.border_strong))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .when(form.auto_reopen, |s| {
+                                        s.bg(rgb(t.accent)).text_color(rgb(0xffffff))
+                                    })
+                                    .child(if form.auto_reopen { "✓" } else { "" }),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(t.text_muted))
+                                    .child("Reconnect on launch"),
+                            ),
                     )
-                    .child(recent)
                     .child(
                         div()
                             .flex()
@@ -4828,12 +5613,93 @@ impl Shuffle {
                                     .hover(|s| s.bg(Theme::alpha(t.accent, 0xdd)))
                                     .child("Connect")
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
-                                        if let Some(url) = this.server_dialog.clone() {
-                                            this.connect_to_server(&url, cx);
-                                        }
+                                        this.submit_server_dialog(cx);
                                     })),
                             ),
                     ),
+            )
+    }
+
+    /// First-run SSH prompt: choose how Shuffle authenticates over SSH.
+    fn render_ssh_prompt(&self, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let choice =
+            |id: &'static str, title: &'static str, desc: &'static str, use_system: bool, primary: bool| {
+                div()
+                    .id(id)
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .p_3()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .bg(rgb(t.bg))
+                    .border_1()
+                    .border_color(if primary { rgb(t.accent) } else { rgb(t.border) })
+                    .hover(|s| s.border_color(rgb(t.accent)))
+                    .child(div().text_color(rgb(t.text)).child(title))
+                    .child(div().text_xs().text_color(rgb(t.text_muted)).child(desc))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.choose_ssh_mode(use_system, cx);
+                    }))
+            };
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(rgba(0x00000066))
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.ssh_ask = false;
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    .w(px(460.0))
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_5()
+                    .rounded_lg()
+                    .bg(rgb(t.surface))
+                    .border_1()
+                    .border_color(rgb(t.border_strong))
+                    .shadow_lg()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(t.text))
+                            .child("Connect over SSH"),
+                    )
+                    .child(div().text_xs().text_color(rgb(t.text_muted)).child(
+                        "How should Shuffle authenticate to SFTP servers? You can change this \
+                         anytime in Settings \u{2192} Connections.",
+                    ))
+                    .child(choice(
+                        "ssh-use-system",
+                        "Use my ~/.ssh configuration",
+                        "Connect with your existing SSH keys, config aliases, and known_hosts. \
+                         Nothing is stored in the app. Recommended.",
+                        true,
+                        true,
+                    ))
+                    .child(choice(
+                        "ssh-credentials",
+                        "Enter credentials per server",
+                        "Type a username and password for each server; passwords are saved in \
+                         your macOS Keychain.",
+                        false,
+                        false,
+                    )),
             )
     }
 
@@ -4978,6 +5844,38 @@ impl Shuffle {
                     ctx_item("Remove from Group", cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_sidebar_menu(cx);
                         this.remove_from_group(idx, &p, cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
+            SidebarTarget::Sftp(server) => {
+                let s = server.clone();
+                items.push(
+                    ctx_item("Connect", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.connect_sftp(s.clone(), cx);
+                    }))
+                    .into_any_element(),
+                );
+                let s = server.clone();
+                items.push(
+                    ctx_item("Edit\u{2026}", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.edit_server(&s, cx);
+                    }))
+                    .into_any_element(),
+                );
+                let s = server.clone();
+                items.push(
+                    ctx_item("Remove", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        if s.use_password {
+                            keychain_delete_password(&s);
+                        }
+                        let list: Vec<SftpServer> = sftp_servers()
+                            .into_iter()
+                            .filter(|x| x.display() != s.display())
+                            .collect();
+                        apply_sftp_servers(list, cx);
                     }))
                     .into_any_element(),
                 );
@@ -5660,6 +6558,14 @@ impl Shuffle {
         let cmd = ks.modifiers.platform;
         let key = ks.key.as_str();
 
+        // The first-run SSH prompt: Escape dismisses; clicks pick a mode.
+        if self.ssh_ask {
+            if key == "escape" {
+                self.ssh_ask = false;
+                cx.notify();
+            }
+            return;
+        }
         // The Connect-to-Server dialog captures all typing while open.
         if self.server_dialog.is_some() {
             self.handle_server_key(ev, cx);
@@ -6392,12 +7298,15 @@ impl Shuffle {
             tab.col_chain.clear();
             tab.col_active = 0;
         }
-        save_last_dir(&dir);
-
-        self.recents.retain(|p| p != &dir);
-        self.recents.insert(0, dir);
-        self.recents.truncate(RECENTS_CAP);
-        write_path_list("recents.txt", &self.recents);
+        // Recents / last-dir are for local browsing only — a remote path would
+        // be treated as a (missing) local folder on next launch.
+        if self.tab(pane).remote.is_none() {
+            save_last_dir(&dir);
+            self.recents.retain(|p| p != &dir);
+            self.recents.insert(0, dir);
+            self.recents.truncate(RECENTS_CAP);
+            write_path_list("recents.txt", &self.recents);
+        }
 
         // Fast first paint + background metadata fill.
         self.reload_pane(pane, cx);
@@ -6406,7 +7315,12 @@ impl Shuffle {
     /// Navigate a pane into `dir` if it is a directory. New navigation truncates
     /// any forward history, then appends `dir` as the new tip.
     fn navigate_in(&mut self, pane: usize, dir: PathBuf, cx: &mut Context<Self>) {
-        if !dir.is_dir() || dir == self.tab(pane).current_dir {
+        if dir == self.tab(pane).current_dir {
+            return;
+        }
+        // Local dirs are validated with a stat; remote dirs come from a listing
+        // (we can't stat them locally), so trust the caller.
+        if self.tab(pane).remote.is_none() && !dir.is_dir() {
             return;
         }
         self.active_pane = pane;
@@ -7069,6 +7983,63 @@ impl Shuffle {
         self.reload_pane(pane, cx);
     }
 
+    /// Connect to a saved SFTP server: open a new tab, resolve the remote home
+    /// directory in the background, and browse it. Errors surface in the banner.
+    fn connect_sftp(&mut self, server: SftpServer, cx: &mut Context<Self>) {
+        // Open a placeholder remote tab in the active pane immediately.
+        let pane = self.active_pane;
+        let mut tab = Tab::new(home_dir()); // temporary local dir; replaced below
+        tab.remote = Some(server.clone());
+        tab.current_dir = PathBuf::from("/");
+        tab.history = vec![PathBuf::from("/")];
+        tab.hist_pos = 0;
+        tab.entries.clear();
+        let p = self.pane_mut(pane);
+        p.tabs.push(tab);
+        p.active = p.tabs.len() - 1;
+        let tab_ix = p.active;
+        self.active_pane = pane;
+        self.remote_error = None;
+        cx.notify();
+
+        let use_system = prefs().ssh_use_system;
+        cx.spawn(async move |this, cx| {
+            let s = server.clone();
+            let home = cx
+                .background_spawn(async move { sftp_home(&s, use_system) })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if pane >= this.panes.len() || tab_ix >= this.panes[pane].tabs.len() {
+                    return;
+                }
+                match home {
+                    Ok(home) => {
+                        let dir = PathBuf::from(&home);
+                        {
+                            let tab = &mut this.panes[pane].tabs[tab_ix];
+                            tab.current_dir = dir.clone();
+                            tab.deepest = Some(dir.clone());
+                            tab.history = vec![dir];
+                            tab.hist_pos = 0;
+                        }
+                        this.reload_pane(pane, cx);
+                    }
+                    Err(e) => {
+                        // Drop the failed placeholder tab and reopen the editor
+                        // pre-filled so the user can fix the settings and retry.
+                        if pane < this.panes.len() && tab_ix < this.panes[pane].tabs.len() {
+                            this.close_tab(pane, tab_ix, cx);
+                        }
+                        this.remote_error = Some(format!("{}: {e}", server.name));
+                        this.edit_server(&server, cx);
+                        cx.notify();
+                    }
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Select a tab in a pane.
     fn select_tab(&mut self, pane: usize, tab: usize, cx: &mut Context<Self>) {
         self.active_pane = pane;
@@ -7205,9 +8176,26 @@ impl Shuffle {
 
     /// Make `path` the inspector focus and load its preview/info.
     fn focus_entry(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
-        let gallery = self.tab(pane).view == ViewMode::Gallery;
         self.tab_mut(pane).anchor = Some(path.clone());
         self.preview_page = 0;
+        // Remote files aren't on the local disk, so QuickLook/PDF rendering
+        // can't read them directly. Fetch a copy to a temp cache and preview
+        // that (images & PDFs only, size-capped). Info (local stat) is skipped.
+        if self.tab(pane).remote.is_some() {
+            let size = {
+                let tab = self.tab(pane);
+                let dir = tab.current_dir.clone();
+                tab.entries
+                    .iter()
+                    .find(|e| dir.join(&e.name) == path)
+                    .map(|e| e.size)
+                    .unwrap_or(0)
+            };
+            self.ensure_remote_preview(path, size, cx);
+            cx.notify();
+            return;
+        }
+        let gallery = self.tab(pane).view == ViewMode::Gallery;
         self.ensure_preview(path.clone(), gallery, cx);
         if prefs().preview && prefs().preview_pages {
             self.ensure_pdf_page(path.clone(), 0, cx);
@@ -7750,8 +8738,15 @@ impl Shuffle {
         if !is_pdf(&path) || lookup_pdf_page(&path, page).is_some() {
             return;
         }
+        // Remote PDFs live in a downloaded temp copy; render pages from there
+        // but key the cache by the remote path (what the inspector looks up).
+        let src = if self.active_tab().remote.is_some() {
+            remote_preview_temp(&path)
+        } else {
+            path.clone()
+        };
         cx.spawn(async move |this, cx| {
-            let p = path.clone();
+            let p = src.clone();
             let out = cx.background_spawn(async move { render_pdf_page(&p, page) }).await;
             let _ = this.update(cx, |this, cx| {
                 match out {
@@ -7766,6 +8761,74 @@ impl Shuffle {
                         }
                     }
                     None => insert_pdf_page(path, page, None),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Preview a remote (SFTP) file: download it once to a temp cache, build the
+    /// preview from that local copy, and store the result under the *remote*
+    /// path so the inspector's cache lookups find it. Limited to images and
+    /// PDFs under a size cap so we never pull a huge binary just to preview it.
+    fn ensure_remote_preview(&self, remote_path: PathBuf, size: u64, cx: &mut Context<Self>) {
+        if !prefs().preview || lookup_preview(&remote_path).is_some() {
+            return;
+        }
+        let Some(server) = self.active_tab().remote.clone() else {
+            return;
+        };
+        // Only fetch types worth previewing.
+        if !is_image(&remote_path) && !is_pdf(&remote_path) {
+            return;
+        }
+        // Cap the download; mark oversized files unavailable so we don't retry.
+        const MAX_PREVIEW_BYTES: u64 = 40 * 1024 * 1024;
+        if size > MAX_PREVIEW_BYTES {
+            PREVIEW_CACHE.with(|c| c.borrow_mut().insert(remote_path, None));
+            cx.notify();
+            return;
+        }
+        let use_system = prefs().ssh_use_system;
+        let want_pdf = is_pdf(&remote_path);
+        cx.spawn(async move |this, cx| {
+            let s = server.clone();
+            let rp = remote_path.clone();
+            let built = cx
+                .background_spawn(async move {
+                    let local = remote_preview_temp(&rp);
+                    if let Some(parent) = local.parent() {
+                        let _ = fs::create_dir_all(parent);
+                    }
+                    // Fetch a fresh copy (the remote file may have changed).
+                    let r = rp.to_string_lossy().replace('"', "");
+                    let l = local.to_string_lossy().replace('"', "");
+                    let script = format!("get \"{r}\" \"{l}\"");
+                    match sftp_batch(&s, &script, use_system) {
+                        Ok(_) => {
+                            let img = build_preview(&local);
+                            let pdf = if want_pdf { render_pdf_page(&local, 0) } else { None };
+                            Some((img, pdf))
+                        }
+                        Err(_) => None,
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |_this, cx| {
+                match built {
+                    Some((img, pdf)) => {
+                        PREVIEW_CACHE.with(|c| c.borrow_mut().insert(remote_path.clone(), img));
+                        if let Some((pimg, count)) = pdf {
+                            insert_pdf_page(remote_path.clone(), 0, Some(pimg));
+                            PDF_COUNT_CACHE
+                                .with(|c| c.borrow_mut().insert(remote_path.clone(), count));
+                        }
+                    }
+                    // Download/build failed → cache "unavailable" (shows the icon).
+                    None => {
+                        PREVIEW_CACHE.with(|c| c.borrow_mut().insert(remote_path.clone(), None));
+                    }
                 }
                 cx.notify();
             });
@@ -8600,6 +9663,226 @@ impl Shuffle {
 
     /// Push a collapsible section header (expanded sidebar) or a divider
     /// (icon-only rail). Returns whether the section's items should be rendered.
+    /// Ensure a folder's subfolders are loaded into the waterfall cache. Reads
+    /// the directory off the main thread; when it lands, the tree re-renders.
+    fn ensure_waterfall_children(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if self.waterfall_children.contains_key(&dir) || self.waterfall_pending.contains(&dir) {
+            return;
+        }
+        self.waterfall_pending.insert(dir.clone());
+        cx.spawn(async move |this, cx| {
+            let d = dir.clone();
+            let (subs, mtime) = cx.background_spawn(async move { read_subdirs(&d) }).await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(m) = mtime {
+                    this.waterfall_mtime.insert(dir.clone(), m);
+                }
+                this.waterfall_children.insert(dir.clone(), subs);
+                this.waterfall_pending.remove(&dir);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Make sure every folder the tree will render has its children loading —
+    /// the root, each expanded folder's children, and one level beyond the
+    /// visible frontier so we know which rows get a disclosure triangle.
+    /// Called each render, before the tree is built (which only has `&self`).
+    fn ensure_waterfall_loaded(&mut self, cx: &mut Context<Self>) {
+        if !prefs().waterfall || prefs().sidebar_collapsed {
+            return;
+        }
+        // The waterfall is local-only; remote tabs have no cheap subdir listing.
+        if self.active_tab().remote.is_some() {
+            return;
+        }
+        let root = self.active_tab().current_dir.clone();
+        self.waterfall_prefetch(root, cx);
+    }
+
+    /// Load `dir`'s children, and — so every visible row knows whether to show a
+    /// triangle — each child's children too. Recurse only into expanded folders.
+    fn waterfall_prefetch(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        self.ensure_waterfall_children(dir.clone(), cx);
+        let Some(children) = self.waterfall_children.get(&dir).cloned() else {
+            return; // still loading; we'll prefetch its children next frame
+        };
+        for child in children {
+            if self.waterfall_expanded.contains(&child) {
+                self.waterfall_prefetch(child, cx);
+            } else {
+                // One level ahead: enough to know if it has subfolders.
+                self.ensure_waterfall_children(child, cx);
+            }
+        }
+    }
+
+    /// Expand or collapse a folder in the waterfall tree.
+    fn toggle_waterfall(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        if self.waterfall_expanded.contains(&dir) {
+            self.waterfall_expanded.remove(&dir);
+        } else {
+            self.waterfall_expanded.insert(dir.clone());
+            self.ensure_waterfall_children(dir, cx);
+        }
+        cx.notify();
+    }
+
+    /// Watcher hook: re-stat every cached waterfall folder and invalidate any
+    /// whose mtime changed, so the tree live-refreshes when files appear or
+    /// disappear. Runs off the main thread; returns true if anything changed.
+    fn refresh_waterfall(&mut self, cx: &mut Context<Self>) {
+        if !prefs().waterfall || self.waterfall_mtime.is_empty() {
+            return;
+        }
+        let paths: Vec<PathBuf> = self.waterfall_mtime.keys().cloned().collect();
+        cx.spawn(async move |this, cx| {
+            let sampled = paths.clone();
+            let stats = cx
+                .background_spawn(async move {
+                    sampled
+                        .iter()
+                        .map(|d| fs::metadata(d).ok().and_then(|m| m.modified().ok()))
+                        .collect::<Vec<Option<SystemTime>>>()
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let mut dirty = false;
+                for (dir, cur) in paths.into_iter().zip(stats) {
+                    match (this.waterfall_mtime.get(&dir).copied(), cur) {
+                        // Folder changed on disk: drop the cache so the next
+                        // render reloads it via `ensure_waterfall_children`.
+                        (Some(prev), Some(now)) if prev != now => {
+                            this.waterfall_children.remove(&dir);
+                            this.waterfall_mtime.remove(&dir);
+                            dirty = true;
+                        }
+                        // Folder vanished: forget it entirely.
+                        (Some(_), None) => {
+                            this.waterfall_children.remove(&dir);
+                            this.waterfall_mtime.remove(&dir);
+                            this.waterfall_expanded.remove(&dir);
+                            dirty = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if dirty {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Append the waterfall folder tree (rooted at the active dir) to `items`.
+    fn render_waterfall(
+        &self,
+        items: &mut Vec<AnyElement>,
+        key: &mut usize,
+        current: &Path,
+        cx: &Context<Self>,
+    ) {
+        let root = self.active_tab().current_dir.clone();
+        items.push(self.section_header_el("WATERFALL", None, cx));
+        if self.collapsed_sections.contains("WATERFALL") {
+            return;
+        }
+        let mut rows: Vec<AnyElement> = Vec::new();
+        self.waterfall_rows(&root, 0, key, current, &mut rows, cx);
+        if rows.is_empty() {
+            items.push(empty_hint("No subfolders").into_any_element());
+        } else {
+            items.append(&mut rows);
+        }
+    }
+
+    /// Depth-first: render each subfolder of `dir`, recursing into expanded ones
+    /// so children appear indented directly beneath their parent.
+    fn waterfall_rows(
+        &self,
+        dir: &Path,
+        depth: usize,
+        key: &mut usize,
+        current: &Path,
+        out: &mut Vec<AnyElement>,
+        cx: &Context<Self>,
+    ) {
+        let Some(children) = self.waterfall_children.get(dir) else {
+            return;
+        };
+        let t = theme();
+        for child in children {
+            *key += 1;
+            let expanded = self.waterfall_expanded.contains(child);
+            let active = child.as_path() == current;
+            let label = path_label(child);
+            let indent = 8.0 + depth as f32 * 12.0;
+            // Only folders with subfolders get a triangle. `None` means the
+            // child's listing hasn't loaded yet (prefetch fills it in shortly),
+            // so we show a spacer to avoid a triangle that flips to nothing.
+            let has_subdirs = self
+                .waterfall_children
+                .get(child)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false);
+
+            let toggle_target = child.clone();
+            let nav_target = child.clone();
+            let mut row = div()
+                .id(("wf", *key))
+                .flex()
+                .items_center()
+                .gap_1()
+                .mx_2()
+                .py_1()
+                .pr_2()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(rgb(if active { t.text } else { t.text_muted }));
+            row = if active {
+                row.bg(rgb(t.surface))
+            } else {
+                row.hover(|s| s.bg(rgb(t.hover))).active(|s| s.bg(rgb(t.selected)))
+            };
+            // Disclosure triangle (or a blank spacer of the same width so names
+            // stay aligned whether or not a folder can expand).
+            let tri = if has_subdirs {
+                let arrow = if expanded { "▾" } else { "▸" };
+                div()
+                    .id(("wf-tri", *key))
+                    .w(px(12.0))
+                    .flex()
+                    .justify_center()
+                    .text_color(rgb(t.text_dim))
+                    .hover(|s| s.text_color(rgb(t.text)))
+                    .child(arrow)
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.toggle_waterfall(toggle_target.clone(), cx);
+                        cx.stop_propagation();
+                    }))
+                    .into_any_element()
+            } else {
+                div().w(px(12.0)).into_any_element()
+            };
+            let row = row
+                .pl(px(indent))
+                .child(tri)
+                .child(icon_element(child, true))
+                .child(div().min_w_0().overflow_hidden().child(label))
+                // Clicking the row (name/icon) opens the folder in the pane.
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.navigate_to(nav_target.clone(), cx);
+                }));
+            out.push(row.into_any_element());
+
+            if expanded && has_subdirs {
+                self.waterfall_rows(child, depth + 1, key, current, out, cx);
+            }
+        }
+    }
+
     fn begin_section(
         &self,
         items: &mut Vec<AnyElement>,
@@ -8618,7 +9901,6 @@ impl Shuffle {
     fn render_sidebar(&self, cx: &Context<Self>) -> impl IntoElement {
         let current = self.active_tab().current_dir.clone();
         let current = current.as_path();
-        let home = home_dir();
         let collapsed = prefs().sidebar_collapsed;
         let mut items: Vec<AnyElement> = Vec::new();
         let mut key = 0usize;
@@ -8822,29 +10104,56 @@ impl Shuffle {
 
         // --- Servers (the Mac, mounted volumes/shares, Connect to Server) ---
         if self.begin_section(&mut items, "SERVERS", collapsed, cx) {
-            push_nav(
-                &mut items,
-                cx,
-                &mut key,
-                "Macintosh HD".to_string(),
-                fav_key("computer"),
-                PathBuf::from("/"),
-                current,
-                collapsed,
-            );
-            push_nav(
-                &mut items,
-                cx,
-                &mut key,
-                username(),
-                fav_key("home"),
-                home,
-                current,
-                collapsed,
-            );
+            // Servers holds real servers/shares: mounted (browseable) volumes,
+            // saved SFTP servers, and Connect to Server. The boot disk and home
+            // live in Favorites, so they aren't duplicated here.
             for (label, path) in volumes {
                 let icon_key = path.to_string_lossy().into_owned();
                 push_nav(&mut items, cx, &mut key, label, icon_key, path, current, collapsed);
+            }
+            // Saved SFTP servers — click to connect and browse remotely.
+            for server in sftp_servers() {
+                key += 1;
+                let s = server.clone();
+                let label = server.name.clone();
+                let tip_text = format!("{}\nsftp://{}", server.name, server.display());
+                let row = div()
+                    .id(("sftp", key))
+                    .flex()
+                    .items_center()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_color(rgb(theme().text_muted))
+                    .hover(|s| s.bg(rgb(theme().hover)).text_color(rgb(theme().text)));
+                let row = if collapsed {
+                    row.mx_1().py_1().justify_center().child("🖧")
+                } else {
+                    row.mx_2()
+                        .px_2()
+                        .py_1()
+                        .gap_2()
+                        .child(div().w(px(16.0)).flex().justify_center().child("🖧"))
+                        .child(div().min_w_0().truncate().child(label))
+                };
+                let s2 = server.clone();
+                items.push(
+                    row.tooltip(tip(tip_text))
+                        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.connect_sftp(s.clone(), cx);
+                        }))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                let (x, y) = (
+                                    f64::from(ev.position.x) as f32,
+                                    f64::from(ev.position.y) as f32,
+                                );
+                                this.open_sidebar_menu(x, y, SidebarTarget::Sftp(s2.clone()), cx);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .into_any_element(),
+                );
             }
             // "Connect to Server…" action row.
             let base = div()
@@ -8872,6 +10181,11 @@ impl Shuffle {
                     }))
                     .into_any_element(),
             );
+        }
+
+        // --- Waterfall: an inline, expandable folder tree of the active dir ---
+        if prefs().waterfall && !collapsed && self.active_tab().remote.is_none() {
+            self.render_waterfall(&mut items, &mut key, current, cx);
         }
 
         let groups_on = prefs().groups_enabled;
@@ -9042,6 +10356,11 @@ impl Shuffle {
             _ => current_dir.clone(),
         };
 
+        // A remote tab's root is the server, not the local disk.
+        let root_label = match &tab.remote {
+            Some(s) => s.name.clone(),
+            None => "Macintosh HD".to_string(),
+        };
         let mut segs: Vec<AnyElement> = Vec::new();
         let mut acc = PathBuf::new();
         let mut idx = 0usize;
@@ -9049,7 +10368,7 @@ impl Shuffle {
             let (label, full) = match comp {
                 Component::RootDir => {
                     acc.push("/");
-                    ("Macintosh HD".to_string(), acc.clone())
+                    (root_label.clone(), acc.clone())
                 }
                 Component::Normal(s) => {
                     acc.push(s);
@@ -9297,7 +10616,12 @@ impl Shuffle {
         let mut chips: Vec<AnyElement> = Vec::new();
         for (i, tab) in p.tabs.iter().enumerate() {
             let active = i == p.active && pane == self.active_pane;
-            let label = path_label(&tab.current_dir);
+            // A remote tab at its root shows the server name, not "Macintosh HD".
+            let label = match &tab.remote {
+                Some(s) if tab.current_dir == Path::new("/") => s.name.clone(),
+                _ => path_label(&tab.current_dir),
+            };
+            let drag_label = label.clone();
             let drag = TabDrag { pane, tab: i };
             chips.push(
                 div()
@@ -9319,7 +10643,7 @@ impl Shuffle {
                     .on_drag(drag, move |_, _, _, cx| {
                         TAB_DRAG_LIVE.store(true, Ordering::Relaxed);
                         cx.new(|_| TabDragPreview {
-                            label: label.clone(),
+                            label: drag_label.clone(),
                         })
                     })
                     // Drop another tab here → insert at this position.
@@ -9334,7 +10658,7 @@ impl Shuffle {
                         div()
                             .min_w_0()
                             .truncate()
-                            .child(path_label(&tab.current_dir)),
+                            .child(label.clone()),
                     )
                     .child(
                         div()
@@ -9480,9 +10804,7 @@ impl Shuffle {
                         |s| s.bg(Theme::alpha(theme().accent, 0x22)),
                     )
                     .on_drop(cx.listener(move |this, drag: &ExternalPaths, _, cx| {
-                        for p in drag.paths() {
-                            this.move_into(pane_dir.clone(), p.clone(), cx);
-                        }
+                        this.drop_files(pane, pane_dir.clone(), drag.paths().to_vec(), cx);
                     }))
                     .child(
                         // Horizontal scroller holding the column header + rows, so
@@ -9579,9 +10901,7 @@ impl Shuffle {
                                             cx.stop_propagation();
                                         }),
                                         cx.listener(move |this, drag: &ExternalPaths, _, cx| {
-                                            for p in drag.paths() {
-                                                this.move_into(parent.clone(), p.clone(), cx);
-                                            }
+                                            this.drop_files(pane, parent.clone(), drag.paths().to_vec(), cx);
                                         }),
                                         // ".." isn't draggable; just swallow the press.
                                         |_, _, cx: &mut App| cx.stop_propagation(),
@@ -9661,10 +10981,8 @@ impl Shuffle {
                                         cx.stop_propagation();
                                     }),
                                     cx.listener(move |this, drag: &ExternalPaths, _, cx| {
-                                        // Drop onto a folder → move the file(s) into it.
-                                        for p in drag.paths() {
-                                            this.move_into(drop_target.clone(), p.clone(), cx);
-                                        }
+                                        // Drop onto a folder → move (or upload) the file(s) into it.
+                                        this.drop_files(pane, drop_target.clone(), drag.paths().to_vec(), cx);
                                     }),
                                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                                         if let Some(dp) = &drag_target {
@@ -9738,9 +11056,7 @@ impl Shuffle {
                 |s| s.bg(Theme::alpha(theme().accent, 0x22)),
             )
             .on_drop(cx.listener(move |this, drag: &ExternalPaths, _, cx| {
-                for p in drag.paths() {
-                    this.move_into(pane_dir.clone(), p.clone(), cx);
-                }
+                this.drop_files(pane, pane_dir.clone(), drag.paths().to_vec(), cx);
             }))
             .child(
                 uniform_list(
@@ -10065,6 +11381,8 @@ fn header_cell(
 impl Render for Shuffle {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
+        // Kick off any pending waterfall folder reads before rendering the tree.
+        self.ensure_waterfall_loaded(cx);
         // Main row: sidebar | content (canvas) | optional inspector.
         let mut main_row = div()
             .flex()
@@ -10124,6 +11442,37 @@ impl Render for Shuffle {
         if let Some(banner) = self.render_update_banner(cx) {
             root = root.child(banner);
         }
+        // SFTP error bar (connection / transfer failure).
+        if let Some(err) = self.remote_error.clone() {
+            root = root.child(
+                div()
+                    .flex_none()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .py_1p5()
+                    .bg(rgb(0xef4444))
+                    .text_color(rgb(0xffffff))
+                    .child(div().flex_none().child("⚠"))
+                    .child(div().flex_1().min_w_0().truncate().child(err))
+                    .child(
+                        div()
+                            .id("sftp-err-dismiss")
+                            .flex_none()
+                            .px_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|s| s.bg(rgba(0xffffff33)))
+                            .child("✕")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                this.remote_error = None;
+                                cx.notify();
+                            })),
+                    ),
+            );
+        }
 
         root = root.child(main_row);
 
@@ -10143,6 +11492,9 @@ impl Render for Shuffle {
         }
         if self.confirm_delete.is_some() {
             root = root.child(self.render_confirm_delete(cx));
+        }
+        if self.ssh_ask {
+            root = root.child(self.render_ssh_prompt(cx));
         }
         if self.server_dialog.is_some() {
             root = root.child(self.render_server_dialog(cx));
@@ -11193,9 +12545,7 @@ fn icon_cell(
         cell = cell
             .drag_over::<ExternalPaths>(|s, _, _, _| s.bg(rgb(theme().selected)))
             .on_drop(cx.listener(move |this, d: &ExternalPaths, _, cx| {
-                for p in d.paths() {
-                    this.move_into(drop_t.clone(), p.clone(), cx);
-                }
+                this.drop_files(pane, drop_t.clone(), d.paths().to_vec(), cx);
             }));
     }
     cell.into_any_element()
@@ -11540,6 +12890,37 @@ fn sidebar_locations() -> (Vec<(String, PathBuf)>, Vec<(String, PathBuf)>) {
     }
 }
 
+/// List a folder's visible subdirectories (sorted case-insensitively) plus its
+/// current mtime. Used by the waterfall sidebar tree; runs off the main thread
+/// (may block on I/O). The mtime lets the watcher detect outside changes.
+fn read_subdirs(dir: &Path) -> (Vec<PathBuf>, Option<SystemTime>) {
+    let mut out = Vec::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let p = e.path();
+            let is_dir = match e.file_type() {
+                Ok(ft) if ft.is_dir() => true,
+                Ok(ft) if ft.is_symlink() => p.is_dir(),
+                _ => false,
+            };
+            let hidden = p
+                .file_name()
+                .map(|n| n.to_string_lossy().starts_with('.'))
+                .unwrap_or(false);
+            if is_dir && !hidden {
+                out.push(p);
+            }
+        }
+    }
+    out.sort_by_cached_key(|p| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().to_lowercase())
+            .unwrap_or_default()
+    });
+    let mtime = fs::metadata(dir).ok().and_then(|m| m.modified().ok());
+    (out, mtime)
+}
+
 /// `stat` results for sidebar rows (bookmarks, group members, favorites),
 /// cached so `render` never touches the filesystem per frame — a single dead
 /// network bookmark would otherwise freeze every repaint. Stale entries are
@@ -11633,6 +13014,9 @@ fn pretty_cloud_name(raw: &str) -> String {
 /// excluding the boot volume. Returns `(label, path)`.
 fn mounted_volumes() -> Vec<(String, PathBuf)> {
     let mut out: Vec<(String, PathBuf)> = Vec::new();
+    // Mount points flagged `nobrowse` (installer DMGs, simulator runtimes, …)
+    // are hidden from Finder's sidebar; hide them here too.
+    let hidden = nobrowse_mounts();
     if let Ok(rd) = fs::read_dir("/Volumes") {
         for e in rd.flatten() {
             let p = e.path();
@@ -11643,12 +13027,41 @@ fn mounted_volumes() -> Vec<(String, PathBuf)> {
             if fs::canonicalize(&p).map(|t| t == Path::new("/")).unwrap_or(false) {
                 continue;
             }
+            // Skip nobrowse mounts (and their resolved targets).
+            let resolved = fs::canonicalize(&p).unwrap_or_else(|_| p.clone());
+            if hidden.contains(&p) || hidden.contains(&resolved) {
+                continue;
+            }
             let name = e.file_name().to_string_lossy().into_owned();
             out.push((name, p));
         }
     }
     out.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
     out
+}
+
+/// The set of currently-mounted paths flagged `nobrowse` (per `mount`), which
+/// macOS hides from Finder — mounted installer disk images, OS simulator
+/// runtimes, cryptex mounts, and the like.
+fn nobrowse_mounts() -> HashSet<PathBuf> {
+    let mut set = HashSet::new();
+    if let Ok(out) = Command::new("/sbin/mount").output() {
+        if out.status.success() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            for line in text.lines() {
+                // Format: "<dev> on <mount point> (<fstype>, <flags…>)".
+                let Some(on) = line.find(" on ") else { continue };
+                let rest = &line[on + 4..];
+                let Some(paren) = rest.rfind(" (") else { continue };
+                let mount_point = &rest[..paren];
+                let flags = &rest[paren + 2..];
+                if flags.contains("nobrowse") {
+                    set.insert(PathBuf::from(mount_point));
+                }
+            }
+        }
+    }
+    set
 }
 
 /// Paths whose real macOS icon should be cached for the sidebar (cloud
@@ -11674,6 +13087,627 @@ fn ensure_dynamic_sidebar_icons() {
             c.borrow_mut().insert(key, icon);
         });
     }
+}
+
+// ----- SFTP servers (browse remote hosts over SSH) ---------------------------
+
+/// A saved SFTP server. Auth is delegated to the system `ssh`/`sftp`, so a
+/// server is mostly a host reference; `key` is only used in "configure in-app"
+/// mode (otherwise the user's `~/.ssh` config/keys/agent handle auth).
+#[derive(Clone, Default, PartialEq)]
+struct SftpServer {
+    /// Display label in the sidebar.
+    name: String,
+    /// Hostname or a `~/.ssh/config` alias.
+    host: String,
+    /// Login user (empty = from ssh config / current user).
+    user: String,
+    /// Port (0 = default / from ssh config).
+    port: u16,
+    /// Explicit private-key path (in-app auth mode only; empty otherwise).
+    key: String,
+    /// True when this server authenticates with a password (stored in the macOS
+    /// Keychain, fetched at connect time via an askpass helper). False = use the
+    /// user's ~/.ssh keys/agent (or the explicit `key`).
+    use_password: bool,
+    /// Reconnect and reopen this server automatically on launch.
+    auto_reopen: bool,
+}
+
+impl SftpServer {
+    /// The `[user@]host` target passed to ssh/sftp.
+    fn target(&self) -> String {
+        if self.user.trim().is_empty() {
+            self.host.trim().to_string()
+        } else {
+            format!("{}@{}", self.user.trim(), self.host.trim())
+        }
+    }
+
+    /// A short display of the connection ("user@host:port").
+    fn display(&self) -> String {
+        let mut s = self.target();
+        if self.port != 0 {
+            s.push_str(&format!(":{}", self.port));
+        }
+        s
+    }
+}
+
+/// Which tab of the Connect-to-Server dialog is showing.
+#[derive(Clone, Copy, PartialEq)]
+enum ServerMode {
+    /// A single address (smb://, afp://, ftp://, or sftp://[user@]host).
+    Quick,
+    /// SFTP with an explicit username + password (stored in the Keychain).
+    Credentials,
+}
+
+/// A focused field in the Credentials tab.
+#[derive(Clone, Copy, PartialEq)]
+enum CredField {
+    Name,
+    Host,
+    User,
+    Port,
+    Password,
+}
+
+/// State of the Connect-to-Server dialog.
+#[derive(Clone)]
+struct ServerForm {
+    mode: ServerMode,
+    /// Quick tab: the address being typed.
+    addr: String,
+    /// Credentials tab fields.
+    name: String,
+    host: String,
+    user: String,
+    port: String,
+    password: String,
+    field: CredField,
+    /// "Reconnect on launch" toggle for the server being added.
+    auto_reopen: bool,
+    /// When editing an existing server, its original `display()` (so submit
+    /// replaces it instead of adding a duplicate). `None` = adding a new one.
+    editing: Option<String>,
+}
+
+impl Default for ServerForm {
+    fn default() -> Self {
+        ServerForm {
+            mode: ServerMode::Quick,
+            addr: String::new(),
+            name: String::new(),
+            host: String::new(),
+            user: String::new(),
+            port: String::new(),
+            password: String::new(),
+            field: CredField::Host,
+            auto_reopen: false,
+            editing: None,
+        }
+    }
+}
+
+impl ServerForm {
+    /// Pre-fill the dialog from an existing server, for editing. Password
+    /// servers open the Credentials tab; key/agent servers open Quick.
+    fn editing_server(s: &SftpServer) -> Self {
+        if s.use_password {
+            ServerForm {
+                mode: ServerMode::Credentials,
+                name: s.name.clone(),
+                host: s.host.clone(),
+                user: s.user.clone(),
+                port: if s.port == 0 { String::new() } else { s.port.to_string() },
+                auto_reopen: s.auto_reopen,
+                editing: Some(s.display()),
+                field: CredField::Host,
+                ..ServerForm::default()
+            }
+        } else {
+            ServerForm {
+                mode: ServerMode::Quick,
+                addr: format!("sftp://{}", s.display()),
+                auto_reopen: s.auto_reopen,
+                editing: Some(s.display()),
+                ..ServerForm::default()
+            }
+        }
+    }
+}
+
+impl ServerForm {
+    /// The credentials field currently focused, as a mutable string.
+    fn field_mut(&mut self) -> &mut String {
+        match self.field {
+            CredField::Name => &mut self.name,
+            CredField::Host => &mut self.host,
+            CredField::User => &mut self.user,
+            CredField::Port => &mut self.port,
+            CredField::Password => &mut self.password,
+        }
+    }
+
+    /// The string being edited: the Quick address, or the focused credentials
+    /// field.
+    fn active_field(&mut self) -> &mut String {
+        match self.mode {
+            ServerMode::Quick => &mut self.addr,
+            ServerMode::Credentials => self.field_mut(),
+        }
+    }
+
+    /// Advance focus to the next credentials field (Tab).
+    fn next_field(&mut self) {
+        self.field = match self.field {
+            CredField::Name => CredField::Host,
+            CredField::Host => CredField::User,
+            CredField::User => CredField::Port,
+            CredField::Port => CredField::Password,
+            CredField::Password => CredField::Name,
+        };
+    }
+}
+
+/// The Keychain account name for a server's password.
+fn keychain_account(s: &SftpServer) -> String {
+    format!("sftp:{}", s.display())
+}
+
+/// Store a server's password in the login Keychain (updating any existing one).
+fn keychain_set_password(s: &SftpServer, pw: &str) {
+    let _ = Command::new("security")
+        .args(["add-generic-password", "-U", "-s", "shuffle-sftp", "-a"])
+        .arg(keychain_account(s))
+        .arg("-w")
+        .arg(pw)
+        .output();
+}
+
+/// Remove a server's stored password.
+fn keychain_delete_password(s: &SftpServer) {
+    let _ = Command::new("security")
+        .args(["delete-generic-password", "-s", "shuffle-sftp", "-a"])
+        .arg(keychain_account(s))
+        .output();
+}
+
+/// Read a server's stored password back from the Keychain (empty = none).
+fn keychain_get_password(s: &SftpServer) -> Option<String> {
+    let out = Command::new("security")
+        .args(["find-generic-password", "-w", "-s", "shuffle-sftp", "-a"])
+        .arg(keychain_account(s))
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let pw = String::from_utf8_lossy(&out.stdout);
+    let pw = pw.trim_end_matches(['\n', '\r']);
+    (!pw.is_empty()).then(|| pw.to_string())
+}
+
+/// The `expect` script that establishes a password SSH connection: it drives
+/// `sftp`, types the password at the prompt (password AND keyboard-interactive
+/// servers both use this prompt), and leaves a persistent ControlMaster socket
+/// that later operations reuse without re-authenticating. Created once.
+/// Args: <control-socket> <user@host> <port>. Env: SHUFFLE_SFTP_PW.
+fn ensure_connect_expect() -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let path = config_dir()?.join("sftp-connect.exp");
+    let body = r#"#!/usr/bin/expect -f
+set timeout 25
+set sock [lindex $argv 0]
+set target [lindex $argv 1]
+set port [lindex $argv 2]
+set pw $env(SHUFFLE_SFTP_PW)
+spawn sftp -o ControlMaster=yes -o ControlPath=$sock -o ControlPersist=180 \
+  -o ConnectTimeout=12 -o StrictHostKeyChecking=accept-new \
+  -o PubkeyAuthentication=no -o NumberOfPasswordPrompts=1 -P $port $target
+expect {
+  -re "(?i)permission denied" { exit 11 }
+  -re "(?i)could not resolve|name or service not known" { exit 12 }
+  -re "(?i)assword:" { send -- "$pw\r"; exp_continue }
+  "sftp>" { send -- "quit\r"; exit 0 }
+  timeout { exit 13 }
+  eof { exit 14 }
+}
+"#;
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&path, body).ok()?;
+    if let Ok(md) = fs::metadata(&path) {
+        let mut perm = md.permissions();
+        perm.set_mode(0o755);
+        let _ = fs::set_permissions(&path, perm);
+    }
+    Some(path)
+}
+
+/// Is the multiplexed master connection for a password server alive?
+fn password_master_alive(s: &SftpServer) -> bool {
+    Command::new("ssh")
+        .arg("-o")
+        .arg(format!("ControlPath={}", ssh_control_path(s).to_string_lossy()))
+        .arg("-O")
+        .arg("check")
+        .arg(s.target())
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Ensure a password server has a live authenticated master connection,
+/// establishing it via `expect` (typing the Keychain password) if needed.
+/// No-op for key/agent servers.
+fn ensure_master(server: &SftpServer) -> Result<(), String> {
+    if !server.use_password {
+        return Ok(());
+    }
+    if password_master_alive(server) {
+        return Ok(());
+    }
+    let pw = keychain_get_password(server)
+        .ok_or_else(|| "No saved password — edit the server to set it.".to_string())?;
+    let script = ensure_connect_expect().ok_or_else(|| "helper unavailable".to_string())?;
+    let port = if server.port == 0 { 22 } else { server.port };
+    let out = Command::new("expect")
+        .arg(script)
+        .arg(ssh_control_path(server))
+        .arg(server.target())
+        .arg(port.to_string())
+        .env("SHUFFLE_SFTP_PW", pw)
+        .output()
+        .map_err(|e| format!("couldn't launch expect: {e}"))?;
+    match out.status.code() {
+        Some(0) => Ok(()),
+        Some(11) => Err("Authentication failed — check the username and password.".into()),
+        Some(12) => Err("Host not found.".into()),
+        Some(13) => Err("Connection timed out.".into()),
+        _ => Err("Couldn't connect to the server.".into()),
+    }
+}
+
+/// Parse `[user@]host[:port]` (the part after `sftp://`) into a server. The
+/// display name defaults to the host/alias.
+fn parse_sftp_url(s: &str) -> Option<SftpServer> {
+    // Drop any trailing path.
+    let s = s.split('/').next().unwrap_or(s).trim();
+    if s.is_empty() {
+        return None;
+    }
+    let (user, hostport) = match s.split_once('@') {
+        Some((u, h)) => (u.to_string(), h),
+        None => (String::new(), s),
+    };
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
+            (h.to_string(), p.parse().unwrap_or(0))
+        }
+        _ => (hostport.to_string(), 0u16),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(SftpServer {
+        name: host.clone(),
+        host,
+        user,
+        port,
+        key: String::new(),
+        use_password: false,
+        auto_reopen: false,
+    })
+}
+
+#[derive(Clone)]
+struct SftpServersGlobal(Vec<SftpServer>);
+impl gpui::Global for SftpServersGlobal {}
+
+thread_local! {
+    static ACTIVE_SERVERS: RefCell<Vec<SftpServer>> = const { RefCell::new(Vec::new()) };
+}
+
+/// The saved SFTP servers (read this in render code).
+fn sftp_servers() -> Vec<SftpServer> {
+    ACTIVE_SERVERS.with(|s| s.borrow().clone())
+}
+
+fn set_active_sftp_servers(list: Vec<SftpServer>) {
+    ACTIVE_SERVERS.with(|c| *c.borrow_mut() = list);
+}
+
+/// Persist + broadcast a new server list to every window.
+fn apply_sftp_servers(list: Vec<SftpServer>, cx: &mut App) {
+    set_active_sftp_servers(list.clone());
+    save_sftp_servers(&list);
+    cx.set_global(SftpServersGlobal(list));
+    cx.refresh_windows();
+}
+
+/// A per-server socket path for SSH connection multiplexing (ControlMaster), so
+/// repeated listings/transfers reuse one authenticated connection.
+fn ssh_control_path(s: &SftpServer) -> PathBuf {
+    // Unix socket paths are capped near 104 bytes, so we can't use macOS's long
+    // per-user temp dir (/var/folders/…/T). A short, stable /tmp name keyed by a
+    // hash of the target stays well under the limit.
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    s.display().hash(&mut h);
+    PathBuf::from(format!("/tmp/shuffle-ssh-{:016x}.sock", h.finish()))
+}
+
+/// Common `ssh`/`sftp` options for a server: multiplexing, non-interactive
+/// (fail fast instead of hanging on a password prompt), trust-on-first-use host
+/// keys, and an explicit key when in "configure in-app" mode.
+fn ssh_options(s: &SftpServer, use_system: bool) -> Vec<String> {
+    let cp = ssh_control_path(s);
+    let mut o = vec![
+        "-o".into(),
+        format!("ControlPath={}", cp.to_string_lossy()),
+        "-o".into(),
+        "ConnectTimeout=12".into(),
+        "-o".into(),
+        "StrictHostKeyChecking=accept-new".into(),
+    ];
+    if s.use_password {
+        // Password auth: reuse the authenticated master that `ensure_master`
+        // established via expect; never prompt (fail fast if it's gone).
+        o.push("-o".into());
+        o.push("ControlMaster=no".into());
+        o.push("-o".into());
+        o.push("BatchMode=yes".into());
+    } else {
+        // Key/agent auth: multiplex directly, fail fast instead of prompting.
+        o.push("-o".into());
+        o.push("ControlMaster=auto".into());
+        o.push("-o".into());
+        o.push("ControlPersist=120".into());
+        o.push("-o".into());
+        o.push("BatchMode=yes".into());
+        if !use_system && !s.key.trim().is_empty() {
+            o.push("-o".into());
+            o.push("IdentitiesOnly=yes".into());
+            o.push("-i".into());
+            o.push(s.key.trim().to_string());
+        }
+    }
+    o
+}
+
+/// Single-quote a path for a remote POSIX shell command.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Run a shell command over ssh on `server` (reusing the multiplexed
+/// connection). Used for operations sftp lacks (recursive delete, touch).
+fn ssh_exec(server: &SftpServer, remote_cmd: &str, use_system: bool) -> Result<String, String> {
+    ensure_master(server)?;
+    let mut cmd = Command::new("ssh");
+    for opt in ssh_options(server, use_system) {
+        cmd.arg(opt);
+    }
+    if server.port != 0 {
+        cmd.arg("-p").arg(server.port.to_string());
+    }
+    cmd.arg(server.target()).arg(remote_cmd);
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let out = cmd.output().map_err(|e| format!("couldn't launch ssh: {e}"))?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        Err(err
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("command failed")
+            .to_string())
+    }
+}
+
+/// Run a batch of sftp commands against `server`, returning stdout on success.
+/// `use_system` selects auth mode (delegate to ~/.ssh vs. explicit key).
+fn sftp_batch(server: &SftpServer, script: &str, use_system: bool) -> Result<String, String> {
+    use std::io::Write;
+    // Password servers: make sure the authenticated master is up first.
+    ensure_master(server)?;
+    let mut cmd = Command::new("sftp");
+    cmd.arg("-b").arg("-"); // read commands from stdin
+    for opt in ssh_options(server, use_system) {
+        cmd.arg(opt);
+    }
+    if server.port != 0 {
+        cmd.arg("-P").arg(server.port.to_string());
+    }
+    cmd.arg(server.target());
+    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().map_err(|e| format!("couldn't launch sftp: {e}"))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(script.as_bytes());
+        let _ = stdin.write_all(b"\nquit\n");
+    }
+    let out = child.wait_with_output().map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    } else {
+        let err = String::from_utf8_lossy(&out.stderr);
+        // Surface the most useful line (auth/host/connection failure).
+        let msg = err
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("connection failed")
+            .to_string();
+        Err(msg)
+    }
+}
+
+/// The server's default remote directory (the login home), via `sftp pwd`.
+fn sftp_home(server: &SftpServer, use_system: bool) -> Result<String, String> {
+    let out = sftp_batch(server, "pwd", use_system)?;
+    // sftp prints: "Remote working directory: /home/user"
+    for line in out.lines() {
+        if let Some(p) = line.split_once("working directory:") {
+            let path = p.1.trim();
+            if !path.is_empty() {
+                return Ok(path.to_string());
+            }
+        }
+    }
+    Ok("/".to_string())
+}
+
+/// List a remote directory, returning entries parsed from sftp's `ls -l`.
+fn sftp_list(server: &SftpServer, path: &str, use_system: bool) -> Result<Vec<Entry>, String> {
+    // Quote the path so spaces work; sftp treats the argument as a glob-free path.
+    let script = format!("ls -la \"{}\"", path.replace('"', ""));
+    let out = sftp_batch(server, &script, use_system)?;
+    Ok(parse_sftp_ls(&out))
+}
+
+/// Create a remote directory.
+fn sftp_mkdir(server: &SftpServer, path: &str, use_system: bool) -> Result<(), String> {
+    sftp_batch(server, &format!("mkdir \"{}\"", path.replace('"', "")), use_system).map(|_| ())
+}
+
+/// Rename/move a remote path (same server).
+fn sftp_rename(server: &SftpServer, from: &str, to: &str, use_system: bool) -> Result<(), String> {
+    sftp_batch(
+        server,
+        &format!("rename \"{}\" \"{}\"", from.replace('"', ""), to.replace('"', "")),
+        use_system,
+    )
+    .map(|_| ())
+}
+
+/// Upload a local file/folder into a remote directory (recursive for folders).
+fn sftp_upload(
+    server: &SftpServer,
+    local: &Path,
+    remote_dir: &str,
+    use_system: bool,
+) -> Result<(), String> {
+    let l = local.to_string_lossy().replace('"', "");
+    let name = local
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let dest = format!("{}/{}", remote_dir.trim_end_matches('/'), name).replace('"', "");
+    let recurse = if local.is_dir() { "-r " } else { "" };
+    sftp_batch(server, &format!("put {recurse}\"{l}\" \"{dest}\""), use_system).map(|_| ())
+}
+
+/// Permanently delete a remote path (files or folders, recursively) via ssh.
+fn sftp_delete(server: &SftpServer, path: &str, use_system: bool) -> Result<(), String> {
+    ssh_exec(server, &format!("rm -rf {}", shell_quote(path)), use_system).map(|_| ())
+}
+
+/// Create an empty remote file via ssh `touch`.
+fn sftp_touch(server: &SftpServer, path: &str, use_system: bool) -> Result<(), String> {
+    ssh_exec(server, &format!("touch {}", shell_quote(path)), use_system).map(|_| ())
+}
+
+/// Parse sftp `ls -l` output into entries. Lines look like:
+/// `drwxr-xr-x  2 1000 1000  4096 Jul 30 10:00 name` — 8 fixed fields + name.
+/// The format is produced by the sftp client itself, so it's consistent across
+/// remote operating systems.
+fn parse_sftp_ls(out: &str) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    for line in out.lines() {
+        let line = line.trim_end();
+        // Skip the echoed command ("sftp> ls …") and blank lines.
+        if line.is_empty() || line.starts_with("sftp>") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 9 {
+            continue;
+        }
+        let perms = parts[0];
+        // A permissions field starts with a type char (d/-/l/…); skip anything
+        // that isn't a long-listing line (e.g. stray output).
+        let first = perms.chars().next().unwrap_or(' ');
+        if !matches!(first, 'd' | '-' | 'l' | 'c' | 'b' | 'p' | 's') || perms.len() < 10 {
+            continue;
+        }
+        let is_dir = first == 'd';
+        let size = parts[4].parse::<u64>().unwrap_or(0);
+        let mut name = parts[8..].join(" ");
+        // Symlinks list as "name -> target"; keep just the name.
+        if first == 'l' {
+            if let Some((n, _)) = name.split_once(" -> ") {
+                name = n.to_string();
+            }
+        }
+        if name == "." || name == ".." || name.is_empty() {
+            continue;
+        }
+        entries.push(Entry {
+            name,
+            is_dir,
+            size,
+            modified: None,
+            created: None,
+            loaded: true,
+        });
+    }
+    sort_default(&mut entries);
+    entries
+}
+
+/// Persist saved servers, one per line (tab-separated fields).
+fn save_sftp_servers(list: &[SftpServer]) {
+    if let Some(file) = config_file("sftp_servers.txt") {
+        if let Some(parent) = file.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let body: String = list
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                    s.name.replace('\t', " "),
+                    s.host.replace('\t', " "),
+                    s.user.replace('\t', " "),
+                    s.port,
+                    s.key.replace('\t', " "),
+                    s.use_password,
+                    s.auto_reopen
+                )
+            })
+            .collect();
+        let _ = fs::write(&file, body);
+    }
+}
+
+/// Load saved servers.
+fn load_sftp_servers() -> Vec<SftpServer> {
+    let mut out = Vec::new();
+    if let Some(file) = config_file("sftp_servers.txt") {
+        if let Ok(s) = fs::read_to_string(&file) {
+            for line in s.lines() {
+                let f: Vec<&str> = line.split('\t').collect();
+                if f.len() < 2 || f[0].trim().is_empty() {
+                    continue;
+                }
+                out.push(SftpServer {
+                    name: f[0].to_string(),
+                    host: f.get(1).unwrap_or(&"").to_string(),
+                    user: f.get(2).unwrap_or(&"").to_string(),
+                    port: f.get(3).and_then(|p| p.parse().ok()).unwrap_or(0),
+                    key: f.get(4).unwrap_or(&"").to_string(),
+                    use_password: f.get(5).map(|v| v.trim() == "true").unwrap_or(false),
+                    auto_reopen: f.get(6).map(|v| v.trim() == "true").unwrap_or(false),
+                });
+            }
+        }
+    }
+    out
 }
 
 // ----- native OS file drag-out (drag files into Finder / other apps) ---------
@@ -11986,6 +14020,22 @@ fn render_pdf_page(path: &Path, page: usize) -> Option<(Arc<RenderImage>, usize)
 
 fn lookup_info(path: &Path) -> Option<FileInfo> {
     INFO_CACHE.with(|c| c.borrow().get(path).cloned())
+}
+
+/// Deterministic local temp path for previewing a remote file. Keeps the
+/// original file name (so the extension drives QuickLook/PDF rendering) and
+/// hashes the full remote path so distinct files never collide.
+fn remote_preview_temp(remote: &Path) -> PathBuf {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    remote.to_string_lossy().hash(&mut h);
+    let name = remote
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".into());
+    std::env::temp_dir()
+        .join("shuffle-remote-preview")
+        .join(format!("{:016x}-{name}", h.finish()))
 }
 
 /// Generate a preview image for any file via macOS QuickLook (`qlmanage -t`),
@@ -13165,18 +15215,6 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
-fn username() -> String {
-    std::env::var("USER")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| {
-            home_dir()
-                .file_name()
-                .map(|s| s.to_string_lossy().into_owned())
-        })
-        .unwrap_or_else(|| "Home".to_string())
-}
-
 fn config_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(|h| PathBuf::from(h).join("Library/Application Support/Shuffle"))
@@ -13682,8 +15720,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions
+            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\n",
+            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall
         );
         let _ = fs::write(&file, body);
     }
@@ -13822,6 +15860,9 @@ fn load_prefs() -> Prefs {
                     "show_filter_button" => p.show_filter_button = on,
                     "show_fps" => p.show_fps = on,
                     "script_actions" => p.script_actions = on,
+                    "ssh_use_system" => p.ssh_use_system = on,
+                    "ssh_configured" => p.ssh_configured = on,
+                    "waterfall" => p.waterfall = on,
                     _ => {}
                 }
             }
@@ -13879,6 +15920,116 @@ fn main() {
     }
 
     // Scaffold + discover script actions, and test matching/execution.
+    // Parse a canned sftp `ls -l` block (arg 2 = file), or live-list a server.
+    if args.len() >= 2 && args[1] == "--sftp-parse-test" {
+        let sample = "drwxr-xr-x    5 1000     1000         4096 Jul 30 10:00 my folder\n\
+                      -rw-r--r--    1 1000     1000       123456 Jul 29 09:00 report.pdf\n\
+                      lrwxrwxrwx    1 1000     1000           11 Jan  1  2025 link -> target.txt\n\
+                      drwxr-xr-x    2 1000     1000         4096 Jul 30 10:00 .\n\
+                      drwxr-xr-x    9 1000     1000         4096 Jul 30 10:00 ..\n\
+                      sftp> ls -la /home/user";
+        for e in parse_sftp_ls(sample) {
+            eprintln!("  {:<14} dir={} size={}", e.name, e.is_dir, e.size);
+        }
+        return;
+    }
+    if args.len() >= 3 && args[1] == "--sftp-list" {
+        // --sftp-list <[user@]host[:port]> [path] [password]
+        let raw = args[2].clone();
+        let (user, hostport) = raw.split_once('@').map_or(("", raw.as_str()), |(u, h)| (u, h));
+        let (host, port) = hostport
+            .rsplit_once(':')
+            .filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
+            .map(|(h, p)| (h.to_string(), p.parse().unwrap_or(0)))
+            .unwrap_or((hostport.to_string(), 0));
+        let password = args.get(4).cloned();
+        let srv = SftpServer {
+            name: host.clone(),
+            host,
+            user: user.to_string(),
+            port,
+            key: String::new(),
+            use_password: password.is_some(),
+            auto_reopen: false,
+        };
+        if let Some(pw) = &password {
+            keychain_set_password(&srv, pw);
+            eprintln!("(password mode: stored in Keychain, using expect+ControlMaster)");
+        }
+        let path = args.get(3).cloned().unwrap_or_else(|| ".".into());
+        match sftp_home(&srv, true) {
+            Ok(h) => eprintln!("home: {h}"),
+            Err(e) => eprintln!("home error: {e}"),
+        }
+        match sftp_list(&srv, &path, true) {
+            Ok(es) => {
+                eprintln!("{} entries:", es.len());
+                for e in es.iter().take(20) {
+                    eprintln!("  {:<30} dir={} size={}", e.name, e.is_dir, e.size);
+                }
+            }
+            Err(e) => eprintln!("list error: {e}"),
+        }
+        return;
+    }
+
+    if args.len() >= 4 && args[1] == "--sftp-preview-test" {
+        // --sftp-preview-test <[user@]host[:port]> <remote_path> [password]
+        // Exercises the remote-preview pipeline headlessly: fetch → QuickLook.
+        let raw = args[2].clone();
+        let (user, hostport) = raw.split_once('@').map_or(("", raw.as_str()), |(u, h)| (u, h));
+        let (host, port) = hostport
+            .rsplit_once(':')
+            .filter(|(_, p)| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
+            .map(|(h, p)| (h.to_string(), p.parse().unwrap_or(0)))
+            .unwrap_or((hostport.to_string(), 0));
+        let password = args.get(4).cloned();
+        let srv = SftpServer {
+            name: host.clone(),
+            host,
+            user: user.to_string(),
+            port,
+            key: String::new(),
+            use_password: password.is_some(),
+            auto_reopen: false,
+        };
+        if let Some(pw) = &password {
+            keychain_set_password(&srv, pw);
+        }
+        let remote = PathBuf::from(&args[3]);
+        let local = remote_preview_temp(&remote);
+        if let Some(parent) = local.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let r = remote.to_string_lossy().replace('"', "");
+        let l = local.to_string_lossy().replace('"', "");
+        eprintln!("fetching {r} -> {l}");
+        match sftp_batch(&srv, &format!("get \"{r}\" \"{l}\""), true) {
+            Ok(_) => {
+                let bytes = fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+                eprintln!("downloaded {bytes} bytes");
+                match build_preview(&local) {
+                    Some(img) => {
+                        let sz = img.size(0);
+                        eprintln!("build_preview OK: {}x{}", sz.width.0, sz.height.0);
+                    }
+                    None => eprintln!("build_preview FAILED"),
+                }
+                if is_pdf(&remote) {
+                    match render_pdf_page(&local, 0) {
+                        Some((img, count)) => {
+                            let sz = img.size(0);
+                            eprintln!("render_pdf_page OK: {}x{}, {count} page(s)", sz.width.0, sz.height.0);
+                        }
+                        None => eprintln!("render_pdf_page FAILED"),
+                    }
+                }
+            }
+            Err(e) => eprintln!("download error: {e}"),
+        }
+        return;
+    }
+
     if args.len() >= 2 && args[1] == "--script-test" {
         let dir = ensure_scripts_dir();
         eprintln!("scripts dir: {:?}", dir);
@@ -14071,6 +16222,11 @@ fn main() {
         set_active_menu(saved_menu);
         cx.set_global(MenuStyleGlobal(saved_menu));
 
+        // Load saved SFTP servers.
+        let saved_servers = load_sftp_servers();
+        set_active_sftp_servers(saved_servers.clone());
+        cx.set_global(SftpServersGlobal(saved_servers));
+
         // Load the app-icon background and apply it to the Dock icon.
         let saved_icon_bg = load_icon_bg();
         set_active_icon_bg(saved_icon_bg.clone());
@@ -14120,6 +16276,10 @@ fn open_main_window(cx: &mut App) {
                 finder.check_for_update(cx);
                 // Fill the initial folder's metadata in the background.
                 finder.reload_pane(0, cx);
+                // Reconnect any SFTP servers marked "reconnect on launch".
+                for server in sftp_servers().into_iter().filter(|s| s.auto_reopen) {
+                    finder.connect_sftp(server, cx);
+                }
                 finder
             });
             // Focus the root so it receives keystrokes (Cmd+P) immediately.
