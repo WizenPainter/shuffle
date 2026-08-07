@@ -28,8 +28,11 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
     echo "         the $TAG tag points at the code you're shipping."
 fi
 
-echo "==> Building signed + notarized $DMG"
-cargo build --release
+echo "==> Building signed + notarized $DMG (universal: arm64 + x86_64)"
+# Build both slices so the release runs on Apple Silicon and Intel Macs;
+# make_app.sh lipos them into one universal binary.
+cargo build --release --target aarch64-apple-darwin
+cargo build --release --target x86_64-apple-darwin
 SHUFFLE_SIGN_ID="__force_adhoc__" ./make_app.sh   # make_dmg re-signs with Developer ID
 ./make_dmg.sh
 

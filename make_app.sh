@@ -10,15 +10,35 @@ VERSION=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
-cp target/release/shuffle "$APP/Contents/MacOS/shuffle"
+# Prefer a universal binary (arm64 + x86_64) so Shuffle runs on both Apple
+# Silicon and Intel Macs. release.sh builds both per-target binaries; if only
+# the default host build exists (e.g. a quick local dev build) fall back to it.
+ARM_BIN="target/aarch64-apple-darwin/release/shuffle"
+X86_BIN="target/x86_64-apple-darwin/release/shuffle"
+if [ -f "$ARM_BIN" ] && [ -f "$X86_BIN" ]; then
+    lipo -create "$ARM_BIN" "$X86_BIN" -output "$APP/Contents/MacOS/shuffle"
+    echo "Universal binary: $(lipo -archs "$APP/Contents/MacOS/shuffle")"
+else
+    cp target/release/shuffle "$APP/Contents/MacOS/shuffle"
+    echo "Single-arch binary: $(lipo -archs "$APP/Contents/MacOS/shuffle")"
+fi
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 # Compile the native "Remove Background" helper (Vision framework) next to the
-# main binary. Best-effort: if swiftc is missing the feature just won't appear.
+# main binary, universal so it also runs on Intel. Best-effort: if swiftc is
+# missing or a slice fails, the feature just won't appear.
 if command -v swiftc >/dev/null 2>&1; then
-    swiftc -O removebg.swift -o "$APP/Contents/MacOS/removebg" 2>/dev/null \
-        && echo "Built removebg helper" \
-        || echo "WARNING: removebg helper failed to compile (Remove Background disabled)"
+    if swiftc -O -target arm64-apple-macos12 removebg.swift -o "$APP/Contents/MacOS/removebg.arm64" 2>/dev/null \
+        && swiftc -O -target x86_64-apple-macos12 removebg.swift -o "$APP/Contents/MacOS/removebg.x86" 2>/dev/null; then
+        lipo -create "$APP/Contents/MacOS/removebg.arm64" "$APP/Contents/MacOS/removebg.x86" \
+            -output "$APP/Contents/MacOS/removebg"
+        rm -f "$APP/Contents/MacOS/removebg.arm64" "$APP/Contents/MacOS/removebg.x86"
+        echo "Built removebg helper: $(lipo -archs "$APP/Contents/MacOS/removebg")"
+    elif swiftc -O removebg.swift -o "$APP/Contents/MacOS/removebg" 2>/dev/null; then
+        echo "Built removebg helper (host arch only)"
+    else
+        echo "WARNING: removebg helper failed to compile (Remove Background disabled)"
+    fi
 fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
