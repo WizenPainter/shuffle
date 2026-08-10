@@ -25,11 +25,13 @@ fi
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 # Compile the native "Remove Background" helper (Vision framework) next to the
-# main binary, universal so it also runs on Intel. Best-effort: if swiftc is
-# missing or a slice fails, the feature just won't appear.
+# main binary, universal so it also runs on Intel. The Vision API it uses
+# (VNGenerateForegroundInstanceMaskRequest) needs macOS 14, so both slices
+# target macos14. Best-effort: if swiftc is missing or a slice fails, the
+# feature just won't appear.
 if command -v swiftc >/dev/null 2>&1; then
-    if swiftc -O -target arm64-apple-macos12 removebg.swift -o "$APP/Contents/MacOS/removebg.arm64" 2>/dev/null \
-        && swiftc -O -target x86_64-apple-macos12 removebg.swift -o "$APP/Contents/MacOS/removebg.x86" 2>/dev/null; then
+    if swiftc -O -target arm64-apple-macos14 removebg.swift -o "$APP/Contents/MacOS/removebg.arm64" 2>/dev/null \
+        && swiftc -O -target x86_64-apple-macos14 removebg.swift -o "$APP/Contents/MacOS/removebg.x86" 2>/dev/null; then
         lipo -create "$APP/Contents/MacOS/removebg.arm64" "$APP/Contents/MacOS/removebg.x86" \
             -output "$APP/Contents/MacOS/removebg"
         rm -f "$APP/Contents/MacOS/removebg.arm64" "$APP/Contents/MacOS/removebg.x86"
