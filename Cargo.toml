@@ -1,6 +1,6 @@
 [package]
 name = "shuffle"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "Shuffle — a fast, snappy file manager for Apple Silicon Macs"
 publish = false
