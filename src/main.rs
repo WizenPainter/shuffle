@@ -2885,6 +2885,25 @@ struct Entry {
     loaded: bool,
 }
 
+/// A file's cloud-storage materialization state. Detected from the kernel's
+/// `SF_DATALESS` flag, which Finder itself uses — set on iCloud and File
+/// Provider (Dropbox, Google Drive, OneDrive, …) placeholders whose bytes live
+/// in the cloud, not on disk.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CloudSync {
+    /// Not a cloud placeholder: an ordinary local file, or a fully downloaded
+    /// cloud file. No badge.
+    Local,
+    /// Online-only: content is in the cloud, not materialized on disk.
+    OnlineOnly,
+    /// Actively downloading (we kicked off a materialize; clears once local).
+    Syncing,
+}
+
+/// `SF_DATALESS` (super-user file flag): the bytes aren't on disk — a cloud
+/// placeholder. See `chflags(2)` / `<sys/stat.h>`.
+const SF_DATALESS: u32 = 0x4000_0000;
+
 /// How the listing is sorted. `None` is the default (folders first, by name).
 #[derive(Clone, Copy, PartialEq)]
 enum SortKey {
@@ -3198,6 +3217,19 @@ struct Shuffle {
     /// Each cached waterfall folder's mtime, so the folder watcher can spot an
     /// outside change and invalidate just that folder for a live refresh.
     waterfall_mtime: HashMap<PathBuf, SystemTime>,
+    /// Cloud files with a download/evict in flight — shown with the syncing
+    /// badge until the operation finishes and the listing is re-read.
+    cloud_busy: HashSet<PathBuf>,
+}
+
+/// Which cloud store a path belongs to, for routing download/evict.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CloudKind {
+    /// iCloud Drive — full download + evict via Foundation.
+    ICloud,
+    /// A third-party File Provider store (Dropbox, Google Drive, OneDrive, …) —
+    /// download works when the provider is running; evict is provider-driven.
+    Provider,
 }
 
 /// Update-check state shared between the Settings window (which drives the
@@ -3407,6 +3439,7 @@ impl Shuffle {
             waterfall_children: HashMap::new(),
             waterfall_pending: HashSet::new(),
             waterfall_mtime: HashMap::new(),
+            cloud_busy: HashSet::new(),
         }
     }
 
@@ -4432,6 +4465,108 @@ impl Shuffle {
         .detach();
     }
 
+    /// The badge state for an item: syncing if a download/evict is in flight,
+    /// online-only if it's a cloud placeholder, else local (no badge). Only
+    /// files under a cloud root are stat'd (cheap, cached) — everything else is
+    /// free.
+    fn cloud_state(&self, path: &Path, is_dir: bool) -> CloudSync {
+        if self.cloud_busy.contains(path) {
+            return CloudSync::Syncing;
+        }
+        if !is_dir && cloud_kind(path).is_some() && cached_dataless(path) {
+            return CloudSync::OnlineOnly;
+        }
+        CloudSync::Local
+    }
+
+    /// Download (materialize) online-only cloud files to disk. `path` may be a
+    /// file or a folder (downloads its online-only descendants). Runs the
+    /// `cloudctl` helper per file in the background; badges show ↻ meanwhile.
+    fn cloud_download(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        let Some(tool) = cloudctl_path() else { return };
+        // Gather the online-only files to fetch (the file itself, or a folder's
+        // dataless descendants — capped so a giant tree can't spawn thousands).
+        let targets = collect_cloud_files(&path, /* want_dataless */ true, 2000);
+        if targets.is_empty() {
+            return;
+        }
+        for t in &targets {
+            self.cloud_busy.insert(t.clone());
+        }
+        cx.notify();
+        let dir = self.tab(pane).current_dir.clone();
+        cx.spawn(async move |this, cx| {
+            let done = targets.clone();
+            cx.background_spawn(async move {
+                for f in &targets {
+                    let _ = Command::new(&tool).arg("download").arg(f).status();
+                }
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                for f in &done {
+                    this.cloud_busy.remove(f);
+                }
+                // Re-read the folder so freshly-materialized files lose the badge.
+                if this.tab(pane).current_dir == dir {
+                    this.refresh_pane(pane, cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Free up space: evict downloaded cloud files back to online-only. iCloud
+    /// only (third-party eviction is driven by the provider's own app). `path`
+    /// may be a file or a folder (evicts its materialized descendants).
+    fn cloud_evict(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        let Some(tool) = cloudctl_path() else { return };
+        let targets = collect_cloud_files(&path, /* want_dataless */ false, 5000);
+        if targets.is_empty() {
+            return;
+        }
+        for t in &targets {
+            self.cloud_busy.insert(t.clone());
+        }
+        cx.notify();
+        let dir = self.tab(pane).current_dir.clone();
+        cx.spawn(async move |this, cx| {
+            let all = targets.clone();
+            let err = cx
+                .background_spawn(async move {
+                    let mut last_err = None;
+                    for f in &targets {
+                        let out = Command::new(&tool).arg("evict").arg(f).output();
+                        if let Ok(o) = out {
+                            if !o.status.success() {
+                                last_err = Some(String::from_utf8_lossy(&o.stderr).trim().to_string());
+                            }
+                        }
+                    }
+                    last_err
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                for f in &all {
+                    this.cloud_busy.remove(f);
+                }
+                if let Some(e) = err.filter(|e| !e.is_empty()) {
+                    this.remote_error = Some(e);
+                }
+                if this.tab(pane).current_dir == dir {
+                    this.refresh_pane(pane, cx);
+                } else {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     /// Set the file as the desktop picture on every display (Service).
     fn set_desktop_picture(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let script = format!(
@@ -4487,6 +4622,33 @@ impl Shuffle {
                 }))
                 .into_any_element(),
             );
+            // Cloud storage: download-on-demand / free up space. Offered for
+            // files/folders in a cloud store, when the helper is present.
+            if let (Some(kind), true) = (cloud_kind(&path), cloudctl_path().is_some()) {
+                let has_online = collect_cloud_files(&path, true, 1).len() == 1;
+                let has_local = collect_cloud_files(&path, false, 1).len() == 1;
+                if has_online {
+                    let label = if is_dir { "Download Contents" } else { "Download Now" };
+                    let p = path.clone();
+                    items.push(
+                        ctx_item(label, cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.cloud_download(pane, p.clone(), cx);
+                        }))
+                        .into_any_element(),
+                    );
+                }
+                // Eviction is iCloud-only here (third-party is provider-driven).
+                if has_local && kind == CloudKind::ICloud {
+                    let label = if is_dir { "Free Up Space in Folder" } else { "Free Up Space" };
+                    let p = path.clone();
+                    items.push(
+                        ctx_item(label, cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.cloud_evict(pane, p.clone(), cx);
+                        }))
+                        .into_any_element(),
+                    );
+                }
+            }
             // Type-specific actions, Finder-style: archives extract in place,
             // app bundles reveal their contents.
             if archive_suffix(&path).is_some() {
@@ -10928,6 +11090,7 @@ impl Shuffle {
                             let modified = entry.modified;
                             let entry_loaded = entry.loaded;
                             let target = base_dir.join(&name);
+                            let cloud = this.cloud_state(&target, is_dir);
                             let ctx_target = target.clone();
                             let drop_target = target.clone();
                             let hover_target = target.clone();
@@ -10944,7 +11107,7 @@ impl Shuffle {
                             } else {
                                 Some(target.clone())
                             };
-                            let icon = icon_element(&target, is_dir);
+                            let icon = cloud_badged_icon(icon_element(&target, is_dir), cloud, 11.0);
 
                             items.push(
                                 file_row(
@@ -11186,6 +11349,7 @@ impl Shuffle {
             let name = entry.name.clone();
             let is_dir = entry.is_dir;
             let target = pane_dir.join(&name);
+            let cloud = self.cloud_state(&target, is_dir);
             let selected = tab.selection.contains(&target);
             let nav_t = target.clone();
             strip.push(
@@ -11202,7 +11366,7 @@ impl Shuffle {
                     .cursor_pointer()
                     .when(selected, |s| s.bg(rgb(t.selected)))
                     .hover(|s| s.bg(rgb(t.hover)))
-                    .child(icon_element_sized(&target, is_dir, 44.0))
+                    .child(cloud_badged_icon(icon_element_sized(&target, is_dir, 44.0), cloud, 16.0))
                     .child(div().w_full().truncate().text_xs().text_color(rgb(t.text_muted)).child(name))
                     .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
                         if ev.click_count() >= 2 {
@@ -12152,6 +12316,95 @@ fn removebg_path() -> Option<PathBuf> {
     cand.exists().then_some(cand)
 }
 
+/// Path to the bundled `cloudctl` Swift helper (download/evict cloud files).
+fn cloudctl_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let cand = exe.parent()?.join("cloudctl");
+    cand.exists().then_some(cand)
+}
+
+/// Which cloud store `path` lives in, or `None` if it isn't under one. iCloud
+/// Drive is `~/Library/Mobile Documents`; third-party File Provider stores live
+/// under `~/Library/CloudStorage`.
+fn cloud_kind(path: &Path) -> Option<CloudKind> {
+    let home = home_dir();
+    if path.starts_with(home.join("Library/Mobile Documents")) {
+        return Some(CloudKind::ICloud);
+    }
+    if path.starts_with(home.join("Library/CloudStorage")) {
+        return Some(CloudKind::Provider);
+    }
+    None
+}
+
+/// Whether `path` is an online-only cloud placeholder (kernel `SF_DATALESS`).
+fn is_dataless(path: &Path) -> bool {
+    use std::os::macos::fs::MetadataExt;
+    fs::metadata(path)
+        .map(|m| m.st_flags() & SF_DATALESS != 0)
+        .unwrap_or(false)
+}
+
+/// `SF_DATALESS` cache for render, keyed by path with a short TTL. The flag
+/// isn't reliably captured during bulk directory enumeration (it lags on a
+/// background thread), so the badge reads it lazily here instead. The stat is a
+/// local metadata read (cloud placeholders live on-disk; only their bytes are
+/// remote), so it's fast on the main thread — no network blocking like a dead
+/// mount, hence no background dance.
+static DATALESS_STAT: OnceLock<Mutex<HashMap<PathBuf, (bool, Instant)>>> = OnceLock::new();
+
+fn cached_dataless(path: &Path) -> bool {
+    const TTL: Duration = Duration::from_secs(3);
+    let map = DATALESS_STAT.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some((v, at)) = map.lock().unwrap().get(path).copied() {
+        if at.elapsed() <= TTL {
+            return v;
+        }
+    }
+    let v = is_dataless(path);
+    map.lock().unwrap().insert(path.to_path_buf(), (v, Instant::now()));
+    v
+}
+
+/// Files to act on for a cloud download/evict: `path` itself when it's a file,
+/// or the matching descendants when it's a folder. `want_dataless` selects
+/// online-only files (download) or materialized ones (evict). Capped at `cap`
+/// so a huge tree can't spawn an unbounded number of helper calls.
+fn collect_cloud_files(path: &Path, want_dataless: bool, cap: usize) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    if path.is_file() {
+        if is_dataless(path) == want_dataless {
+            out.push(path.to_path_buf());
+        }
+        return out;
+    }
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if out.len() >= cap {
+            break;
+        }
+        let Ok(rd) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            if out.len() >= cap {
+                break;
+            }
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => {
+                    let p = e.path();
+                    if is_dataless(&p) == want_dataless {
+                        out.push(p);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 /// Installed terminal emulators, for the "Open in …" services.
 fn installed_terminals() -> Vec<(&'static str, PathBuf)> {
     [
@@ -12654,6 +12907,48 @@ fn kind_label(name: &str, is_dir: bool) -> String {
 /// emoji (per design — folder icon stays as-is for now).
 fn icon_element(path: &Path, is_dir: bool) -> AnyElement {
     icon_element_sized(path, is_dir, 16.0)
+}
+
+/// Wrap a file icon with a small corner badge showing its cloud-sync state:
+/// a cloud for online-only files, a rotating arrow while downloading. Local
+/// (fully-present) files get no badge. `badge` is the badge diameter in px.
+fn cloud_badged_icon(icon: AnyElement, cloud: CloudSync, badge: f32) -> AnyElement {
+    if cloud == CloudSync::Local {
+        return icon;
+    }
+    let t = theme();
+    // A small corner chip. `☁`/`↻` aren't in the UI font (they render blank),
+    // so use a solid colored disc with a glyph the app already draws: `▾`
+    // (points down = "download this") in blue for online-only, amber while a
+    // download/evict is in flight. A ring in the surface color separates it.
+    let (bg, glyph) = match cloud {
+        CloudSync::OnlineOnly => (0x3b82f6u32, "\u{25BE}"), // blue ▾ — online-only
+        CloudSync::Syncing => (0xf59e0bu32, "\u{25BE}"),    // amber ▾ — working
+        CloudSync::Local => unreachable!(),
+    };
+    div()
+        .relative()
+        .flex()
+        .child(icon)
+        .child(
+            div()
+                .absolute()
+                .bottom(px(-3.0))
+                .right(px(-4.0))
+                .w(px(badge))
+                .h(px(badge))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(rgb(bg))
+                .border_1()
+                .border_color(rgb(t.bg))
+                .text_size(px(badge * 0.64))
+                .text_color(rgb(0xffffff))
+                .child(glyph),
+        )
+        .into_any_element()
 }
 
 /// Like [`icon_element`] but at an explicit pixel size (for the icon/gallery views).
@@ -16026,6 +16321,25 @@ fn main() {
                 }
             }
             Err(e) => eprintln!("download error: {e}"),
+        }
+        return;
+    }
+
+    if args.len() >= 3 && args[1] == "--cloud-test" {
+        use std::os::macos::fs::MetadataExt;
+        let p = PathBuf::from(&args[2]);
+        match fs::metadata(&p) {
+            Ok(m) => {
+                let flags = m.st_flags();
+                eprintln!("st_flags = 0x{flags:08X}");
+                eprintln!("SF_DATALESS set = {}", flags & SF_DATALESS != 0);
+                eprintln!("is_dataless() = {}", is_dataless(&p));
+                eprintln!("cloud_kind = {:?}", cloud_kind(&p).map(|k| match k {
+                    CloudKind::ICloud => "iCloud",
+                    CloudKind::Provider => "Provider",
+                }));
+            }
+            Err(e) => eprintln!("stat error: {e}"),
         }
         return;
     }

@@ -41,6 +41,20 @@ if command -v swiftc >/dev/null 2>&1; then
     else
         echo "WARNING: removebg helper failed to compile (Remove Background disabled)"
     fi
+
+    # "cloudctl" helper: download / evict cloud files (iCloud + File Provider).
+    # Universal too. Best-effort — if it fails, the cloud actions just hide.
+    if swiftc -O -target arm64-apple-macos12 cloudctl.swift -o "$APP/Contents/MacOS/cloudctl.arm64" 2>/dev/null \
+        && swiftc -O -target x86_64-apple-macos12 cloudctl.swift -o "$APP/Contents/MacOS/cloudctl.x86" 2>/dev/null; then
+        lipo -create "$APP/Contents/MacOS/cloudctl.arm64" "$APP/Contents/MacOS/cloudctl.x86" \
+            -output "$APP/Contents/MacOS/cloudctl"
+        rm -f "$APP/Contents/MacOS/cloudctl.arm64" "$APP/Contents/MacOS/cloudctl.x86"
+        echo "Built cloudctl helper: $(lipo -archs "$APP/Contents/MacOS/cloudctl")"
+    elif swiftc -O cloudctl.swift -o "$APP/Contents/MacOS/cloudctl" 2>/dev/null; then
+        echo "Built cloudctl helper (host arch only)"
+    else
+        echo "WARNING: cloudctl helper failed to compile (cloud download/evict disabled)"
+    fi
 fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST
