@@ -1267,20 +1267,28 @@ impl Render for Settings {
             }))
             .child(rail)
             .child(
-                // The section blocks are direct children so a rail link can
-                // scroll_to_top_of_item(section_index + 1) to jump to one.
+                // Relative wrapper so the scrollbar thumb can overlay the
+                // scrolling content at the right edge.
                 div()
-                    .id("settings-content")
+                    .relative()
                     .flex_1()
                     .min_w_0()
                     .h_full()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.content_scroll)
-                    .flex()
-                    .flex_col()
-                    .gap_4()
-                    .p_5()
-                    .children(children),
+                    .child(
+                        // The section blocks are direct children so a rail link
+                        // can scroll_to_top_of_item(section_index + 1) to jump.
+                        div()
+                            .id("settings-content")
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.content_scroll)
+                            .flex()
+                            .flex_col()
+                            .gap_4()
+                            .p_5()
+                            .children(children),
+                    )
+                    .children(static_scrollbar_thumb(&self.content_scroll)),
             )
     }
 }
@@ -6688,27 +6696,7 @@ impl Shuffle {
 
     /// Read-only scroll indicator for the palette results list.
     fn palette_scrollbar_thumb(&self) -> Option<AnyElement> {
-        let base = &self.palette_scroll;
-        let viewport = f64::from(base.bounds().size.height) as f32;
-        let max = f64::from(base.max_offset().height) as f32;
-        if viewport <= 1.0 || max <= 1.0 {
-            return None;
-        }
-        let scrolled = (-(f64::from(base.offset().y) as f32)).clamp(0.0, max);
-        let content = viewport + max;
-        let thumb_h = (viewport * viewport / content).clamp(20.0, viewport);
-        let thumb_top = (viewport - thumb_h) * (scrolled / max);
-        Some(
-            div()
-                .absolute()
-                .top(px(thumb_top))
-                .right(px(2.0))
-                .w(px(6.0))
-                .h(px(thumb_h))
-                .rounded_full()
-                .bg(Theme::alpha(theme().text, 0x44))
-                .into_any_element(),
-        )
+        static_scrollbar_thumb(&self.palette_scroll)
     }
 
     fn activate_selection(&mut self, cx: &mut Context<Self>) {
@@ -11584,19 +11572,29 @@ impl Shuffle {
                 let ctx_active = self.is_ctx_target(&target);
                 rows.push(column_row(pane, i, &e.name, target, e.is_dir, selected, ctx_active, cx));
             }
+            let vscroll = col_scroll(pane, i);
+            let thumb = static_scrollbar_thumb(&vscroll);
             cols.push(
                 div()
                     .id(("col", pane * 100 + i))
+                    .relative()
                     .flex_none()
                     .w(px(230.0))
                     .h_full()
-                    .overflow_y_scroll()
                     .border_r_1()
                     .border_color(rgb(t.border))
-                    .flex()
-                    .flex_col()
-                    .py_1()
-                    .children(rows)
+                    .child(
+                        div()
+                            .id(("col-scroll", pane * 100 + i))
+                            .size_full()
+                            .overflow_y_scroll()
+                            .track_scroll(&vscroll)
+                            .flex()
+                            .flex_col()
+                            .py_1()
+                            .children(rows),
+                    )
+                    .children(thumb)
                     .into_any_element(),
             );
         }
@@ -14456,6 +14454,51 @@ fn start_os_file_drag(view_ptr: *mut std::ffi::c_void, paths: &[PathBuf]) {
     let source = drag_source(mtm);
     let source_proto: &ProtocolObject<dyn NSDraggingSource> = ProtocolObject::from_ref(&*source);
     let _ = view.beginDraggingSessionWithItems_event_source(&array, &event, source_proto);
+}
+
+thread_local! {
+    /// Persistent vertical scroll handles for Column view, keyed by (pane,
+    /// column index) so each column keeps its scroll position across frames and
+    /// we can read its offset to draw a scrollbar thumb.
+    static COL_SCROLLS: RefCell<HashMap<(usize, usize), gpui::ScrollHandle>> =
+        RefCell::new(HashMap::new());
+}
+
+/// The persistent scroll handle for one Column-view column.
+fn col_scroll(pane: usize, col: usize) -> gpui::ScrollHandle {
+    COL_SCROLLS.with(|m| {
+        m.borrow_mut()
+            .entry((pane, col))
+            .or_insert_with(gpui::ScrollHandle::new)
+            .clone()
+    })
+}
+
+/// A minimal, non-interactive vertical scrollbar thumb for any tracked
+/// `ScrollHandle`. Returns `None` when the content fits (nothing to scroll).
+/// Used by the palette, Settings, and column view (the main list has its own
+/// richer draggable/fading bar).
+fn static_scrollbar_thumb(base: &gpui::ScrollHandle) -> Option<AnyElement> {
+    let viewport = f64::from(base.bounds().size.height) as f32;
+    let max = f64::from(base.max_offset().height) as f32;
+    if viewport <= 1.0 || max <= 1.0 {
+        return None;
+    }
+    let scrolled = (-(f64::from(base.offset().y) as f32)).clamp(0.0, max);
+    let content = viewport + max;
+    let thumb_h = (viewport * viewport / content).clamp(20.0, viewport);
+    let thumb_top = (viewport - thumb_h) * (scrolled / max);
+    Some(
+        div()
+            .absolute()
+            .top(px(thumb_top))
+            .right(px(2.0))
+            .w(px(6.0))
+            .h(px(thumb_h))
+            .rounded_full()
+            .bg(Theme::alpha(theme().text, 0x44))
+            .into_any_element(),
+    )
 }
 
 /// Build a `.tooltip(...)` callback showing `text` in a small floating label.
