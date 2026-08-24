@@ -40,8 +40,29 @@ use rayon::prelude::*;
 
 const RECENTS_CAP: usize = 12;
 
-// Menu-bar actions.
+// Menu-bar actions. OpenSettings/Quit are app-level; the rest are dispatched to
+// the focused explorer window and handled in `Shuffle::render`'s root.
 actions!(shuffle, [OpenSettings, Quit]);
+actions!(
+    shuffle,
+    [
+        NewTab,
+        NewFolder,
+        CloseTab,
+        MoveToTrash,
+        ViewList,
+        ViewIcons,
+        ViewColumns,
+        ViewGallery,
+        ToggleSidebar,
+        GoBack,
+        GoForward,
+        GoHome,
+        GoApplications,
+        GoComputer,
+        FocusSearch,
+    ]
+);
 
 // ----- theming ---------------------------------------------------------------
 
@@ -11873,6 +11894,68 @@ impl Render for Shuffle {
             // Focusable so it receives key events (Cmd+P, palette typing).
             .track_focus(&self.focus)
             .on_key_down(cx.listener(Self::on_key))
+            // Native menu-bar actions (File / View / Go menus).
+            .on_action(cx.listener(|this, _: &NewTab, _, cx| {
+                let p = this.active_pane;
+                this.new_tab_in(p, cx);
+            }))
+            .on_action(cx.listener(|this, _: &NewFolder, window, cx| {
+                let p = this.active_pane;
+                this.new_folder(p, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
+                let p = this.active_pane;
+                let t = this.pane(p).active;
+                this.close_tab(p, t, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MoveToTrash, _, cx| {
+                let p = this.active_pane;
+                this.request_delete(p, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewList, _, cx| {
+                let p = this.active_pane;
+                this.set_view(p, ViewMode::List, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewIcons, _, cx| {
+                let p = this.active_pane;
+                this.set_view(p, ViewMode::Icons, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewColumns, _, cx| {
+                let p = this.active_pane;
+                this.set_view(p, ViewMode::Columns, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ViewGallery, _, cx| {
+                let p = this.active_pane;
+                this.set_view(p, ViewMode::Gallery, cx);
+            }))
+            .on_action(cx.listener(|_, _: &ToggleSidebar, _, cx| {
+                let mut np = prefs();
+                np.sidebar_collapsed = !np.sidebar_collapsed;
+                apply_prefs(np, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &GoBack, _, cx| {
+                let p = this.active_pane;
+                this.go_back(p, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoForward, _, cx| {
+                let p = this.active_pane;
+                this.go_forward(p, cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoHome, _, cx| {
+                this.navigate_to(home_dir(), cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoApplications, _, cx| {
+                this.navigate_to(PathBuf::from("/Applications"), cx);
+            }))
+            .on_action(cx.listener(|this, _: &GoComputer, _, cx| {
+                this.navigate_to(PathBuf::from("/"), cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusSearch, window, cx| {
+                if !this.palette_open {
+                    this.toggle_palette(window, cx);
+                }
+            }))
             // Track column drags anywhere in the window so the cursor can leave
             // the thin handle without dropping the resize.
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
@@ -16957,14 +17040,49 @@ fn main() {
             KeyBinding::new("cmd-,", OpenSettings, None),
             KeyBinding::new("cmd-q", Quit, None),
         ]);
-        cx.set_menus(vec![Menu {
-            name: "Shuffle".into(),
-            items: vec![
-                MenuItem::action("Settings…", OpenSettings),
-                MenuItem::separator(),
-                MenuItem::action("Quit Shuffle", Quit),
-            ],
-        }]);
+        cx.set_menus(vec![
+            Menu {
+                name: "Shuffle".into(),
+                items: vec![
+                    MenuItem::action("Settings…", OpenSettings),
+                    MenuItem::separator(),
+                    MenuItem::action("Quit Shuffle", Quit),
+                ],
+            },
+            Menu {
+                name: "File".into(),
+                items: vec![
+                    MenuItem::action("New Tab", NewTab),
+                    MenuItem::action("New Folder", NewFolder),
+                    MenuItem::separator(),
+                    MenuItem::action("Close Tab", CloseTab),
+                    MenuItem::action("Move to Trash", MoveToTrash),
+                ],
+            },
+            Menu {
+                name: "View".into(),
+                items: vec![
+                    MenuItem::action("as List", ViewList),
+                    MenuItem::action("as Icons", ViewIcons),
+                    MenuItem::action("as Columns", ViewColumns),
+                    MenuItem::action("as Gallery", ViewGallery),
+                    MenuItem::separator(),
+                    MenuItem::action("Hide/Show Sidebar", ToggleSidebar),
+                    MenuItem::action("Search…", FocusSearch),
+                ],
+            },
+            Menu {
+                name: "Go".into(),
+                items: vec![
+                    MenuItem::action("Back", GoBack),
+                    MenuItem::action("Forward", GoForward),
+                    MenuItem::separator(),
+                    MenuItem::action("Home", GoHome),
+                    MenuItem::action("Applications", GoApplications),
+                    MenuItem::action("Computer", GoComputer),
+                ],
+            },
+        ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
         cx.on_action(|_: &OpenSettings, cx: &mut App| open_settings_window(cx));
 
