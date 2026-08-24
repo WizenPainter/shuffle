@@ -1,4 +1,10 @@
 #!/bin/bash
+# LOCAL / emergency release path. The CANONICAL release is now the CI workflow
+# (.github/workflows/release.yml): push a tag `vX.Y.Z` and GitHub builds,
+# notarizes, and — crucially — records a build-provenance attestation that ties
+# the DMG to the source commit. DMGs built here locally are signed + notarized
+# but NOT attested, so users can't `gh attestation verify` them. Prefer tagging.
+#
 # Cut a new Shuffle release and publish it to GitHub as the "latest" release,
 # so the website's fixed download link always serves the newest version.
 #

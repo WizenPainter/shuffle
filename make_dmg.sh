@@ -83,13 +83,29 @@ hdiutil create -volname "$VOL" -srcfolder "$STAGING" -ov -format UDZO "$DMG"
 rm -rf "$STAGING"
 
 # --- Optional: notarize + staple so there's NO Gatekeeper warning ------------
-if [ -n "$SHUFFLE_DEVID" ] && [ -n "$SHUFFLE_NOTARY_PROFILE" ]; then
+# Notarization credentials, in priority order so the same script works locally
+# and in CI:
+#   1. a stored notarytool keychain profile   (SHUFFLE_NOTARY_PROFILE) — local default
+#   2. an App Store Connect API key (.p8)      (SHUFFLE_NOTARY_KEY / _KEY_ID / _ISSUER) — CI
+#   3. an Apple ID + app-specific password      (SHUFFLE_NOTARY_APPLE_ID / _PASSWORD / _TEAM_ID)
+# In CI set SHUFFLE_NOTARY_PROFILE="" so it skips the (absent) profile.
+NOTARY_ARGS=()
+if [ -n "$SHUFFLE_NOTARY_PROFILE" ]; then
+    NOTARY_ARGS=(--keychain-profile "$SHUFFLE_NOTARY_PROFILE")
+elif [ -n "$SHUFFLE_NOTARY_KEY" ] && [ -n "$SHUFFLE_NOTARY_KEY_ID" ] && [ -n "$SHUFFLE_NOTARY_ISSUER" ]; then
+    NOTARY_ARGS=(--key "$SHUFFLE_NOTARY_KEY" --key-id "$SHUFFLE_NOTARY_KEY_ID" --issuer "$SHUFFLE_NOTARY_ISSUER")
+elif [ -n "$SHUFFLE_NOTARY_APPLE_ID" ] && [ -n "$SHUFFLE_NOTARY_PASSWORD" ] && [ -n "$SHUFFLE_NOTARY_TEAM_ID" ]; then
+    NOTARY_ARGS=(--apple-id "$SHUFFLE_NOTARY_APPLE_ID" --password "$SHUFFLE_NOTARY_PASSWORD" --team-id "$SHUFFLE_NOTARY_TEAM_ID")
+fi
+
+if [ -n "$SHUFFLE_DEVID" ] && [ "${#NOTARY_ARGS[@]}" -gt 0 ]; then
     echo "Submitting $DMG to Apple for notarization (this can take a few minutes)…"
-    xcrun notarytool submit "$DMG" --keychain-profile "$SHUFFLE_NOTARY_PROFILE" --wait
+    xcrun notarytool submit "$DMG" "${NOTARY_ARGS[@]}" --wait
     xcrun stapler staple "$DMG"
     echo "Notarized + stapled. This DMG installs with no warnings."
 elif [ -n "$SHUFFLE_DEVID" ]; then
-    echo "Signed but NOT notarized (set SHUFFLE_NOTARY_PROFILE to notarize)."
+    echo "Signed but NOT notarized (no notary credentials — set SHUFFLE_NOTARY_PROFILE,"
+    echo "  or SHUFFLE_NOTARY_KEY/_KEY_ID/_ISSUER, or SHUFFLE_NOTARY_APPLE_ID/_PASSWORD/_TEAM_ID)."
 fi
 
 echo "Built $DMG"

@@ -1,0 +1,150 @@
+name: Release
+
+# Build the signed + notarized universal DMG IN CI on a tag push, attest its
+# build provenance, and publish it as the GitHub "latest" release. The
+# attestation cryptographically ties the exact DMG bytes to this commit and this
+# workflow run, so anyone can verify a download was built from this source:
+#
+#   gh attestation verify Shuffle.dmg -R WizenPainter/shuffle
+#
+# To cut a release: bump `version` in Cargo.toml, commit + push, then push a tag:
+#   git tag v0.3.3 && git push origin v0.3.3
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   MACOS_CERT_P12_BASE64   Developer ID Application cert + private key, exported
+#                           as a .p12 and base64-encoded:
+#                             base64 -i DeveloperID.p12 | pbcopy
+#   MACOS_CERT_PASSWORD     the password you set when exporting that .p12
+#   MACOS_SIGN_IDENTITY     e.g. "Developer ID Application: Jaime Guzman (Z69U4AQSH3)"
+#
+#   Notarization — provide EITHER an App Store Connect API key (recommended):
+#     AC_API_KEY_ID         the key's Key ID
+#     AC_API_ISSUER_ID      the issuer UUID (App Store Connect → Users and Access → Integrations)
+#     AC_API_KEY_P8_BASE64  the downloaded AuthKey_XX.p8, base64-encoded
+#   …OR an Apple ID + app-specific password:
+#     APPLE_ID              your Apple ID email
+#     APPLE_APP_PASSWORD    an app-specific password (appleid.apple.com → App-Specific Passwords)
+#     APPLE_TEAM_ID         your Developer ID team, e.g. Z69U4AQSH3
+#   (Set only one set; the build auto-detects which is present.)
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write      # create the release + upload assets
+  id-token: write      # mint the OIDC token the attestation is signed with
+  attestations: write  # record the provenance attestation
+
+jobs:
+  release:
+    runs-on: macos-14  # Apple Silicon; cross-builds the x86_64 slice too
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: Import Developer ID certificate
+        env:
+          CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN="$RUNNER_TEMP/build.keychain-db"
+          KPASS="$(openssl rand -base64 24)"
+          echo "$CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$KPASS" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KPASS" "$KEYCHAIN"
+          security import "$RUNNER_TEMP/cert.p12" -P "$CERT_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN"
+          # Let codesign use the key without an interactive prompt.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KPASS" "$KEYCHAIN" >/dev/null
+          # Put our keychain first in the search list (keep the existing ones).
+          security list-keychains -d user -s "$KEYCHAIN" \
+            $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          security find-identity -v -p codesigning
+
+      - name: Build signed + notarized universal DMG
+        id: build
+        env:
+          # make_app.sh ad-hoc signs; make_dmg.sh re-signs with the Developer ID.
+          SHUFFLE_DEVID: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          SHUFFLE_NOTARY_PROFILE: ""  # no stored profile in CI — use creds below
+          SHUFFLE_NOTARY_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
+          SHUFFLE_NOTARY_ISSUER: ${{ secrets.AC_API_ISSUER_ID }}
+          AC_API_KEY_P8_BASE64: ${{ secrets.AC_API_KEY_P8_BASE64 }}
+          SHUFFLE_NOTARY_APPLE_ID: ${{ secrets.APPLE_ID }}
+          SHUFFLE_NOTARY_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          SHUFFLE_NOTARY_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          # Materialize the API key (.p8) if that path is configured.
+          if [ -n "${AC_API_KEY_P8_BASE64:-}" ]; then
+            echo "$AC_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/ac_key.p8"
+            export SHUFFLE_NOTARY_KEY="$RUNNER_TEMP/ac_key.p8"
+          fi
+
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          SHUFFLE_SIGN_ID="__force_adhoc__" ./make_app.sh
+          ./make_dmg.sh
+
+          VERSION="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          cp "Shuffle-$VERSION.dmg" "Shuffle.dmg"   # stable name for the website/updater
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          rm -f "$RUNNER_TEMP/ac_key.p8"
+
+          # Sanity: the tag must match Cargo.toml's version.
+          TAG="${GITHUB_REF_NAME}"
+          if [ "$TAG" != "v$VERSION" ]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version v$VERSION"
+            exit 1
+          fi
+
+      # This is the crux: GitHub attests that THIS workflow run (tied to this
+      # commit) produced these exact DMG bytes. Verifiable with:
+      #   gh attestation verify Shuffle.dmg -R WizenPainter/shuffle
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            Shuffle-${{ steps.build.outputs.version }}.dmg
+            Shuffle.dmg
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          NOTES="Shuffle $VERSION. Verify this download's build provenance: \`gh attestation verify Shuffle.dmg -R ${{ github.repository }}\`"
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" "Shuffle-$VERSION.dmg" "Shuffle.dmg" --clobber
+            gh release edit "v$VERSION" --notes "$NOTES" --latest
+          else
+            gh release create "v$VERSION" "Shuffle-$VERSION.dmg" "Shuffle.dmg" \
+              --title "Shuffle $VERSION" --notes "$NOTES" --latest
+          fi
+
+      - name: Clean up keychain
+        if: always()
+        run: security delete-keychain "$RUNNER_TEMP/build.keychain-db" || true
