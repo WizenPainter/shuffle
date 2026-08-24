@@ -3808,10 +3808,38 @@ impl Shuffle {
         self.begin_rename(pane, path, window, cx);
     }
 
+    /// Quick Look the current selection (spacebar), like Finder. Uses macOS
+    /// `qlmanage -p`, which pops the system preview panel. Local files only —
+    /// remote (SFTP) items aren't on disk for QuickLook to read.
+    fn quick_look(&self, pane: usize) {
+        if self.tab(pane).remote.is_some() {
+            return;
+        }
+        let mut paths: Vec<PathBuf> = self.tab(pane).selection.iter().cloned().collect();
+        if paths.is_empty() {
+            if let Some(a) = self.tab(pane).anchor.clone() {
+                paths.push(a);
+            }
+        }
+        if paths.is_empty() {
+            return;
+        }
+        paths.sort();
+        let _ = Command::new("qlmanage")
+            .arg("-p")
+            .args(&paths)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn();
+    }
+
     fn open_path(&mut self, pane: usize, path: PathBuf, is_dir: bool, cx: &mut Context<Self>) {
-        if is_dir {
+        // App bundles are directories, but double-clicking one should *launch*
+        // it like Finder — browse inside via right-click → Show Package Contents.
+        let is_app = is_dir && path.extension().is_some_and(|e| e == "app");
+        if is_dir && !is_app {
             self.navigate_in(pane, path, cx);
-        } else if self.tab(pane).remote.is_some() {
+        } else if !is_app && self.tab(pane).remote.is_some() {
             // Remote file → download to ~/Downloads, then open it.
             self.download_remote(pane, path, None, true, cx);
         } else {
@@ -6807,6 +6835,11 @@ impl Shuffle {
                     self.arrow_move(pane, dx, dy, cx);
                     return;
                 }
+                // Spacebar → Quick Look the selection, like Finder.
+                if key == "space" {
+                    self.quick_look(pane);
+                    return;
+                }
             }
             // Enter renames the item under the mouse first (point-and-rename),
             // else the focused one (Finder-style; not rebindable). The hover
@@ -9063,6 +9096,7 @@ impl Shuffle {
             .border_color(rgb(t.border))
             .child(
                 div()
+                    .flex_none()
                     .text_color(rgb(t.text))
                     .truncate()
                     .child(path_label(&sel)),
@@ -9094,11 +9128,16 @@ impl Shuffle {
             };
             let preview_box = div()
                 .relative()
+                .flex_none()
                 .flex()
                 .items_center()
                 .justify_center()
                 .w_full()
                 .min_h(px(120.0))
+                // Clip so a tall preview can't paint over the title above or the
+                // "Information" section below.
+                .max_h(px(380.0))
+                .overflow_hidden()
                 .p_2()
                 .rounded_md()
                 // White "page" so document/text previews (black text, often
@@ -10423,7 +10462,7 @@ impl Shuffle {
     fn render_view_toolbar(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
         let t = theme();
         let view = self.tab(pane).view;
-        let btn = |id: &'static str, glyph: &'static str, mode: ViewMode, cx: &Context<Self>| {
+        let btn = |id: &'static str, glyph: &'static str, name: &'static str, mode: ViewMode, cx: &Context<Self>| {
             let on = view == mode;
             div()
                 .id((id, pane)) // ids must be unique per pane, or only one pane works
@@ -10439,6 +10478,7 @@ impl Shuffle {
                 .when(on, |s| s.bg(rgb(t.surface)))
                 .hover(|s| s.bg(rgb(t.hover)))
                 .child(glyph)
+                .tooltip(tip(name))
                 .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                     this.set_view(pane, mode, cx);
                 }))
@@ -10458,37 +10498,31 @@ impl Shuffle {
             .text_color(rgb(t.text_dim))
             .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
             .child("🔍")
+            .tooltip(tip("Search (⌘P)"))
             .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
                 this.active_pane = pane;
                 if !this.palette_open {
                     this.toggle_palette(window, cx);
                 }
             }));
-        div()
+        // Sort has no effect in Column view (columns are always folders-first,
+        // by name), so grey it out and make it inert there rather than misleading.
+        let sort_enabled = view != ViewMode::Columns;
+        let sort_btn = div()
+            .id(("sort-by", pane))
             .flex_none()
+            .px_2()
+            .h(px(22.0))
             .flex()
             .items_center()
-            .gap_1()
-            .pl_2()
-            .child(search_btn)
-            .child(btn("view-list", "☰", ViewMode::List, cx))
-            .child(btn("view-icons", "▦", ViewMode::Icons, cx))
-            .child(btn("view-columns", "▥", ViewMode::Columns, cx))
-            .child(btn("view-gallery", "▭", ViewMode::Gallery, cx))
-            .child(
-                // Sort-By button — opens a dropdown at the click location.
-                div()
-                    .id(("sort-by", pane))
-                    .flex_none()
-                    .px_2()
-                    .h(px(22.0))
-                    .flex()
-                    .items_center()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_color(rgb(t.text_dim))
+            .rounded_md()
+            .when(sort_enabled, |d| d.text_color(rgb(t.text_dim)))
+            .when(!sort_enabled, |d| d.text_color(Theme::alpha(t.text_dim, 0x66)))
+            .child("⇅")
+            .tooltip(tip(if sort_enabled { "Sort By" } else { "Sort By (not available in Column view)" }))
+            .when(sort_enabled, |d| {
+                d.cursor_pointer()
                     .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
-                    .child("⇅")
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
@@ -10500,8 +10534,20 @@ impl Shuffle {
                             cx.stop_propagation();
                             cx.notify();
                         }),
-                    ),
-            )
+                    )
+            });
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_1()
+            .pl_2()
+            .child(search_btn)
+            .child(btn("view-list", "☰", "List view", ViewMode::List, cx))
+            .child(btn("view-icons", "▦", "Icon view", ViewMode::Icons, cx))
+            .child(btn("view-columns", "▥", "Column view", ViewMode::Columns, cx))
+            .child(btn("view-gallery", "▭", "Gallery view", ViewMode::Gallery, cx))
+            .child(sort_btn)
     }
 
     /// Clickable breadcrumb for a pane. Segments up to and including the current
