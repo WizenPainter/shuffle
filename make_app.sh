@@ -83,11 +83,20 @@ PLIST
 # instead of re-prompting every run (which ad-hoc signing causes).
 SIGN_ID="${SHUFFLE_SIGN_ID:-Apple Development: Jaime Guzman (7UB4C2P6D6)}"
 if security find-identity -v -p codesigning 2>/dev/null | grep -q "$SIGN_ID"; then
-    codesign --force --sign "$SIGN_ID" --identifier com.shuffle.app "$APP"
+    SIGN_WITH="$SIGN_ID"
     echo "Signed with: $SIGN_ID"
 else
     echo "WARNING: signing identity not found; falling back to ad-hoc (permissions will re-prompt)."
-    codesign --force --sign - --identifier com.shuffle.app "$APP"
+    SIGN_WITH="-"
 fi
+# Sign nested helper executables BEFORE the app. Extra Mach-Os in Contents/MacOS
+# are treated as nested code that must already be signed, or sealing the bundle
+# fails ("code object is not signed at all in subcomponent").
+for helper in removebg cloudctl; do
+    if [ -f "$APP/Contents/MacOS/$helper" ]; then
+        codesign --force --sign "$SIGN_WITH" "$APP/Contents/MacOS/$helper"
+    fi
+done
+codesign --force --sign "$SIGN_WITH" --identifier com.shuffle.app "$APP"
 codesign -dv --verbose=2 "$APP" 2>&1 | grep -iE 'Identifier|Authority|Signature' | head -3
 echo "Built $APP"
