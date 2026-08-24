@@ -8882,6 +8882,17 @@ impl Shuffle {
     ) {
         self.active_pane = pane;
         self.term_focused = false;
+        // Cmd-click: toggle this item in a multi-selection without navigating or
+        // collapsing the columns to its right (Finder-style non-contiguous pick).
+        if ev.modifiers().platform {
+            let tab = self.tab_mut(pane);
+            if !tab.selection.remove(&target) {
+                tab.selection.insert(target.clone());
+            }
+            tab.anchor = tab.selection.iter().next().cloned();
+            cx.notify();
+            return;
+        }
         if is_dir {
             if ev.click_count() >= 2 {
                 // Double-click drills in as the new root.
@@ -11568,7 +11579,8 @@ impl Shuffle {
             for e in &entries {
                 let target = dir.join(&e.name);
                 let selected = next_dir.as_deref() == Some(target.as_path())
-                    || anchor.as_deref() == Some(target.as_path());
+                    || anchor.as_deref() == Some(target.as_path())
+                    || tab.selection.contains(&target);
                 let ctx_active = self.is_ctx_target(&target);
                 rows.push(column_row(pane, i, &e.name, target, e.is_dir, selected, ctx_active, cx));
             }
