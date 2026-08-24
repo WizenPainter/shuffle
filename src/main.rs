@@ -374,7 +374,7 @@ struct Prefs {
     ssh_configured: bool,
     /// Show the expandable "waterfall" folder tree at the bottom of the sidebar.
     waterfall: bool,
-    /// Command palette / search window opacity, as a percent (40–100). Lower is
+    /// Command palette / search window opacity, as a percent (20–100). Lower is
     /// more see-through; the default is nearly opaque so it doesn't read as a
     /// confusing floating pane over the explorer.
     palette_opacity: u8,
@@ -437,7 +437,7 @@ fn prefs() -> Prefs {
 
 /// The command palette's background alpha (0–255) from the opacity pref.
 fn palette_alpha() -> u32 {
-    let pct = prefs().palette_opacity.clamp(40, 100) as u32;
+    let pct = prefs().palette_opacity.clamp(20, 100) as u32;
     pct * 255 / 100
 }
 
@@ -1015,6 +1015,9 @@ struct Settings {
     recording: Option<KeyAction>,
     /// In-progress hex color entry: (which color, typed hex digits).
     color_edit: Option<(ColorTarget, String)>,
+    /// In-progress typed entry for the search-window opacity (the digits shown
+    /// while the value field is focused). `None` when not editing.
+    opacity_edit: Option<String>,
 }
 
 /// Section names shown as nested rail items for a settings tab (and the order
@@ -1048,6 +1051,7 @@ impl Settings {
             focus: cx.focus_handle(),
             recording: None,
             color_edit: None,
+            opacity_edit: None,
         }
     }
 
@@ -1071,12 +1075,67 @@ impl Settings {
         .detach();
     }
 
-    /// Route key events: hex entry first, then keybind recording.
+    /// Route key events: opacity/hex entry first, then keybind recording.
     fn handle_settings_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
-        if self.color_edit.is_some() {
+        if self.opacity_edit.is_some() {
+            self.handle_opacity_key(ev, cx);
+        } else if self.color_edit.is_some() {
             self.handle_hex_key(ev, cx);
         } else if self.recording.is_some() {
             self.handle_keybind_key(ev, cx);
+        }
+    }
+
+    /// Capture typed digits for the search-window opacity field; each edit
+    /// applies live (clamped 40–100), Enter/Esc finish. Typing "30" sets 30%.
+    fn handle_opacity_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let apply = |s: &str, cx: &mut Context<Self>| {
+            if let Ok(n) = s.parse::<u8>() {
+                let mut np = prefs();
+                np.palette_opacity = n.clamp(20, 100);
+                apply_prefs(np, cx);
+            }
+        };
+        match ev.keystroke.key.as_str() {
+            "escape" | "enter" | "tab" => {
+                // Commit whatever's typed (clamped), then leave edit mode.
+                if let Some(s) = self.opacity_edit.take() {
+                    if !s.is_empty() {
+                        apply(&s, cx);
+                    }
+                }
+                cx.notify();
+            }
+            "backspace" => {
+                if let Some(s) = self.opacity_edit.as_mut() {
+                    s.pop();
+                }
+                if let Some(s) = self.opacity_edit.clone() {
+                    if !s.is_empty() {
+                        apply(&s, cx);
+                    }
+                }
+                cx.notify();
+            }
+            _ => {
+                if let Some(ch) = ev.keystroke.key_char.as_ref() {
+                    if let Some(s) = self.opacity_edit.as_mut() {
+                        for c in ch.chars() {
+                            // Up to 3 digits ("100"); ignore anything else.
+                            if c.is_ascii_digit() && s.len() < 3 {
+                                s.push(c);
+                            }
+                        }
+                    }
+                    // Apply live as they type so the preview updates.
+                    if let Some(s) = self.opacity_edit.clone() {
+                        if !s.is_empty() {
+                            apply(&s, cx);
+                        }
+                    }
+                    cx.notify();
+                }
+            }
         }
     }
 
@@ -1315,6 +1374,118 @@ impl Render for Settings {
 }
 
 impl Settings {
+    /// The search-window-opacity row: title/description on the left, and on the
+    /// right a −/+ stepper around a **typable** value. Click the number to edit
+    /// it and just type (e.g. "30" → 30%); Enter/Esc/click-away commit.
+    fn render_opacity_row(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = theme();
+        let pct = prefs().palette_opacity;
+        let editing = self.opacity_edit.clone();
+
+        let step_btn = |bid: &'static str, glyph: &'static str, delta: i16| {
+            div()
+                .id(bid)
+                .flex_none()
+                .w(px(24.0))
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_pointer()
+                .bg(rgb(t.surface))
+                .text_color(rgb(t.text))
+                .hover(|s| s.bg(rgb(t.hover)))
+                .child(glyph)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    // Stepping also leaves the typing field, committing nothing extra.
+                    this.opacity_edit = None;
+                    let mut np = prefs();
+                    let next = (np.palette_opacity as i16 + delta).clamp(20, 100);
+                    np.palette_opacity = next as u8;
+                    apply_prefs(np, cx);
+                    cx.notify();
+                }))
+        };
+
+        // The value: an editable field when focused, else a clickable label.
+        let value: AnyElement = match &editing {
+            Some(s) => div()
+                .id("opacity-value")
+                .flex_none()
+                .min_w(px(52.0))
+                .px_2()
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .bg(rgb(t.bg))
+                .border_1()
+                .border_color(rgb(t.accent))
+                .text_color(rgb(t.text))
+                .child(s.clone())
+                // A caret so it reads as an active text field.
+                .child(div().w(px(1.5)).h(px(13.0)).ml(px(1.0)).bg(rgb(t.text)))
+                .child("%")
+                .into_any_element(),
+            None => div()
+                .id("opacity-value")
+                .flex_none()
+                .min_w(px(52.0))
+                .px_2()
+                .h(px(24.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_md()
+                .cursor_text()
+                .text_color(rgb(t.text))
+                .hover(|s| s.bg(rgb(t.hover)))
+                .child(format!("{pct}%"))
+                .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                    // Start empty so the user can just type the number they want.
+                    this.opacity_edit = Some(String::new());
+                    window.focus(&this.focus);
+                    cx.notify();
+                }))
+                .into_any_element(),
+        };
+
+        div()
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().text_color(rgb(t.text)).child("Search window opacity"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(t.text_muted))
+                            .child("How opaque the Cmd+P search window is. Click the number to type a value (20–100). Lower lets the explorer show through."),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(step_btn("opacity-dec", "\u{2212}", -1))
+                    .child(value)
+                    .child(step_btn("opacity-inc", "+", 1)),
+            )
+            .into_any_element()
+    }
+
     /// The General tab as an ordered list of blocks: page header, then one card
     /// per section (matching `tab_sections(0)`), then the reset button. Returned
     /// as separate children so the rail can scroll to any section.
@@ -1579,25 +1750,7 @@ impl Settings {
                         }),
                     )
                     .into_any_element(),
-                    stepper_row(
-                        "st-palette-opacity",
-                        "Search window opacity",
-                        "How opaque the Cmd+P search window is. Lower lets the explorer show through; higher (default) is nearly solid so it doesn't read as a floating overlay.",
-                        format!("{}%", p.palette_opacity),
-                        cx.listener(|_, _: &ClickEvent, _, cx| {
-                            let mut np = prefs();
-                            np.palette_opacity = np.palette_opacity.saturating_sub(1).max(40);
-                            apply_prefs(np, cx);
-                            cx.notify();
-                        }),
-                        cx.listener(|_, _: &ClickEvent, _, cx| {
-                            let mut np = prefs();
-                            np.palette_opacity = (np.palette_opacity + 1).min(100);
-                            apply_prefs(np, cx);
-                            cx.notify();
-                        }),
-                    )
-                    .into_any_element(),
+                    self.render_opacity_row(cx),
                     // Live sample so the opacity change is visible immediately.
                     palette_opacity_preview(),
                 ],
@@ -16830,7 +16983,7 @@ fn load_prefs() -> Prefs {
                     "waterfall" => p.waterfall = on,
                     "palette_opacity" => {
                         if let Ok(n) = v.trim().parse::<u8>() {
-                            p.palette_opacity = n.clamp(40, 100);
+                            p.palette_opacity = n.clamp(20, 100);
                         }
                     }
                     _ => {}
