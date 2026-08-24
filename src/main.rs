@@ -4526,6 +4526,36 @@ impl Shuffle {
         .detach();
     }
 
+    /// Compute a folder's total size in the background (once) and cache it, then
+    /// repaint so List view can show it. No-op if cached or already computing.
+    fn ensure_folder_size(&self, dir: PathBuf, cx: &mut Context<Self>) {
+        if folder_size_lookup(&dir).is_some() {
+            return;
+        }
+        let pending = FOLDER_SIZE_PENDING.get_or_init(|| Mutex::new(HashSet::new()));
+        if !pending.lock().unwrap().insert(dir.clone()) {
+            return; // already in flight
+        }
+        cx.spawn(async move |this, cx| {
+            let d = dir.clone();
+            let size = cx.background_spawn(async move { dir_total_size(&d) }).await;
+            let _ = this.update(cx, |_, cx| {
+                FOLDER_SIZE
+                    .get_or_init(|| Mutex::new(HashMap::new()))
+                    .lock()
+                    .unwrap()
+                    .insert(dir.clone(), size);
+                FOLDER_SIZE_PENDING
+                    .get_or_init(|| Mutex::new(HashSet::new()))
+                    .lock()
+                    .unwrap()
+                    .remove(&dir);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// The badge state for an item: syncing if a download/evict is in flight,
     /// online-only if it's a cloud placeholder, else local (no badge). Only
     /// files under a cloud root are stat'd (cheap, cached) — everything else is
@@ -11164,6 +11194,7 @@ impl Shuffle {
                                         "..",
                                         true,
                                         0,
+                                        None,        // no size for the ".." row
                                         None,
                                         true,        // ".." has no metadata to load
                                         row_key,
@@ -11218,6 +11249,17 @@ impl Shuffle {
                             let entry_loaded = entry.loaded;
                             let target = base_dir.join(&name);
                             let cloud = this.cloud_state(&target, is_dir);
+                            // Folder sizes: look up the cached total, kicking off
+                            // a background sum on first sight (List view only).
+                            let folder_size = if is_dir && tab.remote.is_none() {
+                                let fs = folder_size_lookup(&target);
+                                if fs.is_none() {
+                                    this.ensure_folder_size(target.clone(), cx);
+                                }
+                                fs
+                            } else {
+                                None
+                            };
                             let ctx_target = target.clone();
                             let drop_target = target.clone();
                             let hover_target = target.clone();
@@ -11241,6 +11283,7 @@ impl Shuffle {
                                     &name,
                                     is_dir,
                                     entry_size,
+                                    folder_size,
                                     modified,
                                     entry_loaded,
                                     row_key,
@@ -12673,6 +12716,8 @@ fn file_row(
     name: &str,
     is_dir: bool,
     size: u64,
+    // For folders: the recursively-summed size once computed (else None → "--").
+    folder_size: Option<u64>,
     modified: Option<SystemTime>,
     loaded: bool,
     key: usize,
@@ -12825,7 +12870,17 @@ fn file_row(
                 .flex()
                 .justify_end()
                 .text_color(meta_color)
-                .child(if loaded { format_size(is_dir, size) } else { "--".to_string() }),
+                .child(if !loaded {
+                    "--".to_string()
+                } else if is_dir {
+                    // Folder size once summed; sentinel/none → "--".
+                    match folder_size {
+                        Some(s) if s != u64::MAX => format_size(false, s),
+                        _ => "--".to_string(),
+                    }
+                } else {
+                    format_size(is_dir, size)
+                }),
         )
         // Slack space after the last column (keeps row hover full-width).
         .child(div().flex_1())
@@ -13341,6 +13396,46 @@ fn read_subdirs(dir: &Path) -> (Vec<PathBuf>, Option<SystemTime>) {
     });
     let mtime = fs::metadata(dir).ok().and_then(|m| m.modified().ok());
     (out, mtime)
+}
+
+/// Recursively-summed folder sizes for List view, computed off-thread and
+/// cached (a folder can hold millions of files; we never walk on the render
+/// thread). `u64::MAX` is a sentinel: the folder blew past the entry cap, so we
+/// show "--" rather than a wrong number.
+static FOLDER_SIZE: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+static FOLDER_SIZE_PENDING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+/// Stop summing a folder past this many entries (bounds cost on huge trees like
+/// `/` or a home with node_modules); such folders show "--".
+const FOLDER_SIZE_CAP: usize = 400_000;
+
+fn folder_size_lookup(path: &Path) -> Option<u64> {
+    FOLDER_SIZE
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .get(path)
+        .copied()
+}
+
+/// Total bytes of all files under `dir` (jwalk, parallel, symlinks not
+/// followed). Returns `u64::MAX` if the tree exceeds [`FOLDER_SIZE_CAP`].
+fn dir_total_size(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut count: usize = 0;
+    for entry in jwalk::WalkDir::new(dir).skip_hidden(false) {
+        count += 1;
+        if count > FOLDER_SIZE_CAP {
+            return u64::MAX;
+        }
+        if let Ok(e) = entry {
+            if let Ok(m) = e.metadata() {
+                if m.is_file() {
+                    total += m.len();
+                }
+            }
+        }
+    }
+    total
 }
 
 /// `stat` results for sidebar rows (bookmarks, group members, favorites),
