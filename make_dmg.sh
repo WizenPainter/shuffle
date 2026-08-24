@@ -41,11 +41,15 @@ fi
 # --- Optional: sign with Developer ID + hardened runtime (needed to notarize) --
 if [ -n "$SHUFFLE_DEVID" ]; then
     echo "Signing with: $SHUFFLE_DEVID"
-    # Sign nested helpers first, then the app, with the hardened runtime.
-    if [ -f "$APP/Contents/MacOS/removebg" ]; then
-        codesign --force --options runtime --timestamp \
-            --sign "$SHUFFLE_DEVID" "$APP/Contents/MacOS/removebg"
-    fi
+    # Sign nested helper executables first, then the app, with the hardened
+    # runtime. Every bundled helper must be signed or the outer bundle's
+    # signature is rejected ("code object is not signed at all in subcomponent").
+    for helper in removebg cloudctl; do
+        if [ -f "$APP/Contents/MacOS/$helper" ]; then
+            codesign --force --options runtime --timestamp \
+                --sign "$SHUFFLE_DEVID" "$APP/Contents/MacOS/$helper"
+        fi
+    done
     codesign --force --options runtime --timestamp \
         --sign "$SHUFFLE_DEVID" --identifier com.shuffle.app "$APP"
     codesign --verify --deep --strict --verbose=2 "$APP"

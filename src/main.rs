@@ -353,6 +353,10 @@ struct Prefs {
     ssh_configured: bool,
     /// Show the expandable "waterfall" folder tree at the bottom of the sidebar.
     waterfall: bool,
+    /// Command palette / search window opacity, as a percent (40–100). Lower is
+    /// more see-through; the default is nearly opaque so it doesn't read as a
+    /// confusing floating pane over the explorer.
+    palette_opacity: u8,
 }
 
 impl Default for Prefs {
@@ -374,6 +378,7 @@ impl Default for Prefs {
             ssh_use_system: true,
             ssh_configured: false,
             waterfall: false,
+            palette_opacity: 92,
         }
     }
 }
@@ -400,12 +405,19 @@ thread_local! {
         ssh_use_system: true,
         ssh_configured: false,
         waterfall: false,
+        palette_opacity: 92,
     }) };
 }
 
 /// The active preferences. Read this anywhere in render code.
 fn prefs() -> Prefs {
     ACTIVE_PREFS.with(|p| *p.borrow())
+}
+
+/// The command palette's background alpha (0–255) from the opacity pref.
+fn palette_alpha() -> u32 {
+    let pct = prefs().palette_opacity.clamp(40, 100) as u32;
+    pct * 255 / 100
 }
 
 fn set_active_prefs(p: Prefs) {
@@ -1524,19 +1536,40 @@ impl Settings {
             settings_section(
                 "Command Palette",
                 Some("The Cmd+P search and actions."),
-                vec![toggle_row(
-                    "tg-palette-history",
-                    "Command palette history",
-                    "Give Cmd+P its own query history: press Up/Down in the palette to cycle through your previous searches.",
-                    p.palette_history,
-                    cx.listener(|_, _: &ClickEvent, _, cx| {
-                        let mut np = prefs();
-                        np.palette_history = !np.palette_history;
-                        apply_prefs(np, cx);
-                        cx.notify();
-                    }),
-                )
-                .into_any_element()],
+                vec![
+                    toggle_row(
+                        "tg-palette-history",
+                        "Command palette history",
+                        "Give Cmd+P its own query history: press Up/Down in the palette to cycle through your previous searches.",
+                        p.palette_history,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.palette_history = !np.palette_history;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    stepper_row(
+                        "st-palette-opacity",
+                        "Search window opacity",
+                        "How opaque the Cmd+P search window is. Lower lets the explorer show through; higher (default) is nearly solid so it doesn't read as a floating overlay.",
+                        format!("{}%", p.palette_opacity),
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.palette_opacity = np.palette_opacity.saturating_sub(5).max(40);
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.palette_opacity = (np.palette_opacity + 5).min(100);
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                ],
             ),
             settings_section(
                 "Sidebar",
@@ -7259,8 +7292,9 @@ impl Shuffle {
             .flex()
             .flex_col()
             .overflow_hidden()
-            // ~75% opaque so the explorer shows faintly through the menu.
-            .bg(Theme::alpha(t.surface, 0xbf))
+            // Opacity is user-configurable (Settings → Appearance); default is
+            // nearly opaque so the palette doesn't read as a confusing overlay.
+            .bg(Theme::alpha(t.surface, palette_alpha()))
             .rounded_lg()
             .border_1()
             .border_color(rgb(t.border_strong))
@@ -16061,8 +16095,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall
+            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\n",
+            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity
         );
         let _ = fs::write(&file, body);
     }
@@ -16204,6 +16238,11 @@ fn load_prefs() -> Prefs {
                     "ssh_use_system" => p.ssh_use_system = on,
                     "ssh_configured" => p.ssh_configured = on,
                     "waterfall" => p.waterfall = on,
+                    "palette_opacity" => {
+                        if let Ok(n) = v.trim().parse::<u8>() {
+                            p.palette_opacity = n.clamp(40, 100);
+                        }
+                    }
                     _ => {}
                 }
             }
