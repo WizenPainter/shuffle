@@ -10539,6 +10539,51 @@ impl Shuffle {
                     this.toggle_palette(window, cx);
                 }
             }));
+        // New Folder — creates a folder in this pane and drops into rename.
+        // Remote tabs can't create folders locally, so hide it there.
+        let is_remote = self.tab(pane).remote.is_some();
+        let new_folder_btn = div()
+            .id(("tb-new-folder", pane))
+            .flex_none()
+            .w(px(24.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(rgb(t.text_dim))
+            .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+            .child("🗀")
+            .tooltip(tip("New Folder (⇧⌘N)"))
+            .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                this.active_pane = pane;
+                this.new_folder(pane, window, cx);
+            }));
+        // Delete — Trash the selection; greyed out when nothing is selected.
+        let has_sel =
+            !self.tab(pane).selection.is_empty() || self.tab(pane).anchor.is_some();
+        let delete_btn = div()
+            .id(("tb-delete", pane))
+            .flex_none()
+            .w(px(24.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .when(has_sel, |d| d.text_color(rgb(t.text_dim)))
+            .when(!has_sel, |d| d.text_color(Theme::alpha(t.text_dim, 0x66)))
+            .child("🗑")
+            .tooltip(tip(if has_sel { "Move to Trash (⌫)" } else { "Move to Trash (select an item first)" }))
+            .when(has_sel, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.active_pane = pane;
+                        this.request_delete(pane, cx);
+                    }))
+            });
         // Sort has no effect in Column view (columns are always folders-first,
         // by name), so grey it out and make it inert there rather than misleading.
         let sort_enabled = view != ViewMode::Columns;
@@ -10576,6 +10621,8 @@ impl Shuffle {
             .items_center()
             .gap_1()
             .pl_2()
+            // File actions (hidden on remote tabs, which can't create locally).
+            .when(!is_remote, |d| d.child(new_folder_btn).child(delete_btn))
             .child(search_btn)
             .child(btn("view-list", "☰", "List view", ViewMode::List, cx))
             .child(btn("view-icons", "▦", "Icon view", ViewMode::Icons, cx))
