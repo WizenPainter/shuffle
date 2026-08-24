@@ -2895,6 +2895,10 @@ enum SidebarTarget {
     GroupMember(usize, PathBuf),
     /// A saved SFTP server → offer "Edit…" / "Remove".
     Sftp(SftpServer),
+    /// A tab chip: (pane, tab index) → New Tab / Duplicate / Close / Close Others.
+    Tab(usize, usize),
+    /// The nav/path bar of a pane → New Tab / Copy Path / Open in Terminal.
+    NavBar(usize),
 }
 
 /// One row in the command palette: a title, a gray subtitle (full path), and
@@ -6133,6 +6137,72 @@ impl Shuffle {
                     .into_any_element(),
                 );
             }
+            SidebarTarget::Tab(pane, tab) => {
+                items.push(
+                    ctx_item("New Tab", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.new_tab_in(pane, cx);
+                    }))
+                    .into_any_element(),
+                );
+                items.push(
+                    ctx_item("Duplicate Tab", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.duplicate_tab(pane, tab, cx);
+                    }))
+                    .into_any_element(),
+                );
+                items.push(ctx_separator().into_any_element());
+                items.push(
+                    ctx_item("Close Tab", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.close_tab(pane, tab, cx);
+                    }))
+                    .into_any_element(),
+                );
+                // Only offer "Close Other Tabs" when there's more than one.
+                if self.pane(pane).tabs.len() > 1 {
+                    items.push(
+                        ctx_item("Close Other Tabs", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.close_sidebar_menu(cx);
+                            this.close_other_tabs(pane, tab, cx);
+                        }))
+                        .into_any_element(),
+                    );
+                }
+            }
+            SidebarTarget::NavBar(pane) => {
+                items.push(
+                    ctx_item("New Tab", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.new_tab_in(pane, cx);
+                    }))
+                    .into_any_element(),
+                );
+                let dir = self.tab(pane).current_dir.clone();
+                let is_remote = self.tab(pane).remote.is_some();
+                let dc = dir.clone();
+                items.push(
+                    ctx_item("Copy Path", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        cx.write_to_clipboard(ClipboardItem::new_string(
+                            dc.to_string_lossy().into_owned(),
+                        ));
+                    }))
+                    .into_any_element(),
+                );
+                // Reveal-in-Finder / terminal only make sense for local folders.
+                if !is_remote {
+                    let dr = dir.clone();
+                    items.push(
+                        ctx_item("Reveal in Finder", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            this.close_sidebar_menu(cx);
+                            let _ = Command::new("open").arg(&dr).spawn();
+                        }))
+                        .into_any_element(),
+                    );
+                }
+            }
         }
         if items.is_empty() {
             items.push(ctx_disabled("No actions").into_any_element());
@@ -8316,6 +8386,36 @@ impl Shuffle {
 
     /// Close a tab. Closing a pane's last tab removes the pane (collapsing the
     /// split); closing the last tab of the last pane is a no-op.
+    /// Open a copy of `tab` (same folder) right after it in the same pane.
+    fn duplicate_tab(&mut self, pane: usize, tab: usize, cx: &mut Context<Self>) {
+        if pane >= self.panes.len() || tab >= self.panes[pane].tabs.len() {
+            return;
+        }
+        let dir = self.panes[pane].tabs[tab].current_dir.clone();
+        let remote = self.panes[pane].tabs[tab].remote.clone();
+        let mut new = Tab::new(dir);
+        new.remote = remote;
+        let p = self.pane_mut(pane);
+        p.tabs.insert(tab + 1, new);
+        p.active = tab + 1;
+        self.active_pane = pane;
+        self.reload_pane(pane, cx);
+    }
+
+    /// Close every tab in `pane` except `keep`.
+    fn close_other_tabs(&mut self, pane: usize, keep: usize, cx: &mut Context<Self>) {
+        if pane >= self.panes.len() || keep >= self.panes[pane].tabs.len() {
+            return;
+        }
+        let kept = self.panes[pane].tabs.remove(keep);
+        let p = self.pane_mut(pane);
+        p.tabs.clear();
+        p.tabs.push(kept);
+        p.active = 0;
+        self.active_pane = pane;
+        cx.notify();
+    }
+
     fn close_tab(&mut self, pane: usize, tab: usize, cx: &mut Context<Self>) {
         if pane >= self.panes.len() || tab >= self.panes[pane].tabs.len() {
             return;
@@ -10506,6 +10606,18 @@ impl Shuffle {
             .overflow_hidden()
             .border_b_1()
             .border_color(rgb(theme().border))
+            // Right-click the nav bar → New Tab / Copy Path / Reveal in Finder.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let (x, y) = (
+                        f64::from(ev.position.x) as f32,
+                        f64::from(ev.position.y) as f32,
+                    );
+                    this.open_sidebar_menu(x, y, SidebarTarget::NavBar(pane), cx);
+                    cx.stop_propagation();
+                }),
+            )
             .child(nav_arrow(
                 ("nav-back", pane),
                 "‹",
@@ -10973,6 +11085,18 @@ impl Shuffle {
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.select_tab(pane, i, cx);
                     }))
+                    // Right-click → tab context menu (New/Duplicate/Close/…).
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            let (x, y) = (
+                                f64::from(ev.position.x) as f32,
+                                f64::from(ev.position.y) as f32,
+                            );
+                            this.open_sidebar_menu(x, y, SidebarTarget::Tab(pane, i), cx);
+                            cx.stop_propagation();
+                        }),
+                    )
                     .child(
                         div()
                             .min_w_0()
