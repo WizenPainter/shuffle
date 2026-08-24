@@ -1586,18 +1586,20 @@ impl Settings {
                         format!("{}%", p.palette_opacity),
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
-                            np.palette_opacity = np.palette_opacity.saturating_sub(5).max(40);
+                            np.palette_opacity = np.palette_opacity.saturating_sub(1).max(40);
                             apply_prefs(np, cx);
                             cx.notify();
                         }),
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
-                            np.palette_opacity = (np.palette_opacity + 5).min(100);
+                            np.palette_opacity = (np.palette_opacity + 1).min(100);
                             apply_prefs(np, cx);
                             cx.notify();
                         }),
                     )
                     .into_any_element(),
+                    // Live sample so the opacity change is visible immediately.
+                    palette_opacity_preview(),
                 ],
             ),
             settings_section(
@@ -2604,6 +2606,134 @@ fn reset_button(
                 .child(label.to_string())
                 .on_click(on_click),
         )
+}
+
+/// A live sample of the command palette for the opacity setting: a mock
+/// explorer backdrop with a scaled-down palette floating over it, using the
+/// same background alpha as the real palette. As the opacity stepper changes,
+/// this repaints so the user sees exactly how see-through the search window
+/// will be over their files.
+fn palette_opacity_preview() -> AnyElement {
+    let t = theme();
+    // Backdrop: a few faux "file rows" (icon chip + name/detail bars) so the
+    // transparency is visible — a solid backdrop would hide the effect.
+    let faux_row = |icon: u32, w1: f32, w2: f32| {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .h(px(22.0))
+            .child(div().flex_none().w(px(12.0)).h(px(12.0)).rounded_sm().bg(rgb(icon)))
+            .child(div().flex_none().w(px(w1)).h(px(7.0)).rounded_full().bg(Theme::alpha(t.text, 0x44)))
+            .child(div().flex_none().w(px(w2)).h(px(7.0)).rounded_full().bg(Theme::alpha(t.text, 0x22)))
+    };
+    // In-flow, fills the fixed-height box (`size_full`). An outer box with only
+    // absolutely-positioned children collapses to zero — so the backdrop must be
+    // in-flow to reliably paint.
+    let backdrop = div()
+        .size_full()
+        .bg(rgb(t.bg))
+        .flex()
+        .flex_col()
+        .py_2()
+        .child(faux_row(t.accent, 90.0, 40.0))
+        .child(faux_row(t.accent, 120.0, 30.0))
+        .child(faux_row(0xd9844f, 70.0, 55.0))
+        .child(faux_row(t.accent, 140.0, 25.0))
+        .child(faux_row(0x4faf7a, 60.0, 45.0))
+        .child(faux_row(t.accent, 100.0, 35.0))
+        .child(faux_row(0xd9544f, 110.0, 30.0));
+
+    // A miniature palette, styled exactly like the real one (same alpha).
+    let hint = |k: &'static str| {
+        div()
+            .px_1()
+            .rounded_sm()
+            .bg(Theme::alpha(t.text_dim, 0x22))
+            .text_color(rgb(t.text_muted))
+            .child(k)
+    };
+    let sample = div()
+        .absolute()
+        .top(px(14.0))
+        .left(px(28.0))
+        .right(px(28.0))
+        .flex()
+        .flex_col()
+        .overflow_hidden()
+        .bg(Theme::alpha(t.surface, palette_alpha()))
+        .rounded_lg()
+        .border_1()
+        .border_color(rgb(t.border_strong))
+        .shadow_lg()
+        // Input line.
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(rgb(t.border_strong))
+                .child(div().flex_none().text_color(rgb(t.accent)).child("›"))
+                .child(div().text_color(rgb(t.text)).child("Documents")),
+        )
+        // A selected result + a plain one.
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .h(px(24.0))
+                .bg(rgb(t.selected))
+                .child(div().flex_none().w(px(12.0)).h(px(12.0)).rounded_sm().bg(rgb(t.accent)))
+                .child(div().text_color(rgb(t.text)).child("Documents"))
+                .child(div().text_xs().text_color(rgb(t.text_muted)).child("~/Documents")),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .h(px(24.0))
+                .child(div().flex_none().w(px(12.0)).h(px(12.0)).rounded_sm().bg(rgb(t.accent)))
+                .child(div().text_color(rgb(t.text)).child("Downloads"))
+                .child(div().text_xs().text_color(rgb(t.text_muted)).child("~/Downloads")),
+        )
+        // Footer hints.
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_1()
+                .border_t_1()
+                .border_color(rgb(t.border_strong))
+                .text_xs()
+                .text_color(rgb(t.text_dim))
+                .child(hint("↩"))
+                .child("Open")
+                .child(hint("esc"))
+                .child("Close"),
+        );
+
+    div()
+        .relative()
+        .w_full()
+        .h(px(178.0))
+        .rounded_md()
+        .overflow_hidden()
+        .border_1()
+        .border_color(rgb(t.border))
+        // Fixed height + in-flow backdrop; the sample palette floats over it.
+        .child(backdrop)
+        .child(sample)
+        .into_any_element()
 }
 
 /// A labelled on/off toggle row used in the General settings tab. `id` must be
