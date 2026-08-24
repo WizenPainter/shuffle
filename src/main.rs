@@ -8628,6 +8628,49 @@ impl Shuffle {
         self.focus_entry(pane, path, cx);
     }
 
+    /// Shift-click range select within one Column-view column: select every item
+    /// between the anchor and `target` in that column's listing. Falls back to a
+    /// single selection when the anchor isn't in this column.
+    fn range_select_column(
+        &mut self,
+        pane: usize,
+        col_index: usize,
+        target: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        // The directory this column lists: column 0 is the current dir, deeper
+        // columns come from the drill-in chain.
+        let dir = if col_index == 0 {
+            self.tab(pane).current_dir.clone()
+        } else {
+            match self.tab(pane).col_chain.get(col_index - 1) {
+                Some(d) => d.clone(),
+                None => return,
+            }
+        };
+        let paths: Vec<PathBuf> = column_entries(&dir)
+            .iter()
+            .map(|e| dir.join(&e.name))
+            .collect();
+        let to = paths.iter().position(|p| p == &target);
+        let from = self
+            .tab(pane)
+            .anchor
+            .as_ref()
+            .and_then(|a| paths.iter().position(|p| p == a));
+        let sel: HashSet<PathBuf> = match (from, to) {
+            (Some(a), Some(b)) => {
+                let (lo, hi) = (a.min(b), a.max(b));
+                paths[lo..=hi].iter().cloned().collect()
+            }
+            _ => std::iter::once(target.clone()).collect(),
+        };
+        // Don't extend the drill-in past this column while range-selecting.
+        self.tab_mut(pane).col_chain.truncate(col_index);
+        self.tab_mut(pane).selection = sel;
+        cx.notify();
+    }
+
     /// Dispatch a left-click on an item, honoring Cmd / Shift modifiers.
     fn click_entry(
         &mut self,
@@ -8903,15 +8946,22 @@ impl Shuffle {
     ) {
         self.active_pane = pane;
         self.term_focused = false;
+        let mods = ev.modifiers();
         // Cmd-click: toggle this item in a multi-selection without navigating or
         // collapsing the columns to its right (Finder-style non-contiguous pick).
-        if ev.modifiers().platform {
+        if mods.platform {
             let tab = self.tab_mut(pane);
             if !tab.selection.remove(&target) {
                 tab.selection.insert(target.clone());
             }
             tab.anchor = tab.selection.iter().next().cloned();
             cx.notify();
+            return;
+        }
+        // Shift-click: select the inclusive range from the anchor to here within
+        // this column (everything in between), like Finder.
+        if mods.shift {
+            self.range_select_column(pane, col_index, target, cx);
             return;
         }
         if is_dir {
@@ -8924,8 +8974,9 @@ impl Shuffle {
             tab.col_chain.truncate(col_index);
             tab.col_chain.push(target.clone());
             tab.selection.clear();
-            tab.selection.insert(target);
-            tab.anchor = None;
+            tab.selection.insert(target.clone());
+            // Anchor this item so a following Shift-click can range from it.
+            tab.anchor = Some(target);
             cx.notify();
         } else {
             {
@@ -11694,7 +11745,12 @@ impl Shuffle {
                     .child(cloud_badged_icon(icon_element_sized(&target, is_dir, 44.0), cloud, 16.0))
                     .child(div().w_full().truncate().text_xs().text_color(rgb(t.text_muted)).child(name))
                     .on_click(cx.listener(move |this, ev: &ClickEvent, _, cx| {
-                        if ev.click_count() >= 2 {
+                        let mods = ev.modifiers();
+                        if mods.platform {
+                            this.toggle_entry(pane, nav_t.clone(), cx);
+                        } else if mods.shift {
+                            this.range_select(pane, nav_t.clone(), cx);
+                        } else if ev.click_count() >= 2 {
                             this.open_path(pane, nav_t.clone(), is_dir, cx);
                         } else {
                             this.select_entry(pane, nav_t.clone(), cx);
