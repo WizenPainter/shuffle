@@ -8990,7 +8990,83 @@ impl Shuffle {
             tab.anchor = None;
         }
         self.marquee = Some((pane, (x, y), (x, y)));
+        // Auto-scroll while the drag sits past the top/bottom edge of the list,
+        // so a marquee can keep selecting through folders taller than the view.
+        // A timer loop (not mouse-move driven) so it scrolls even while the
+        // cursor holds still past the edge; it exits when the marquee ends.
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(16))
+                    .await;
+                let alive = this
+                    .update(cx, |this, cx| {
+                        if this.marquee.is_none() {
+                            return false;
+                        }
+                        this.marquee_autoscroll_tick(cx);
+                        true
+                    })
+                    .unwrap_or(false);
+                if !alive {
+                    break;
+                }
+            }
+        })
+        .detach();
         cx.notify();
+    }
+
+    /// One auto-scroll step for an active marquee: if the pointer is beyond the
+    /// list viewport's top or bottom edge, scroll in that direction — slow near
+    /// the edge, faster the further past it — keep the marquee's anchor glued
+    /// to the content it started on, and extend the selection.
+    fn marquee_autoscroll_tick(&mut self, cx: &mut Context<Self>) {
+        let Some((pane, start, cur)) = self.marquee else {
+            return;
+        };
+        if pane >= self.panes.len() {
+            return;
+        }
+        // Distance past the viewport edge decides direction and speed.
+        let (top, bottom, scrolled, max) = {
+            let st = self.tab(pane).scroll_handle.0.borrow();
+            let b = st.base_handle.bounds();
+            let top = f64::from(b.origin.y) as f32;
+            let bottom = top + f64::from(b.size.height) as f32;
+            let scrolled = (-(f64::from(st.base_handle.offset().y) as f32)).max(0.0);
+            let max = f64::from(st.base_handle.max_offset().height) as f32;
+            (top, bottom, scrolled, max)
+        };
+        if max <= 1.0 {
+            return; // everything fits; nothing to scroll
+        }
+        let overshoot = if cur.1 < top {
+            cur.1 - top // negative → scroll up
+        } else if cur.1 > bottom {
+            cur.1 - bottom // positive → scroll down
+        } else {
+            return; // inside the viewport — no auto-scroll
+        };
+        // ~2px/tick just past the edge up to ~28px/tick (≈1700px/s) at 120px out.
+        let speed = (overshoot.abs() * 0.22).clamp(2.0, 28.0);
+        let target = (scrolled + speed.copysign(overshoot)).clamp(0.0, max);
+        let applied = target - scrolled;
+        if applied.abs() < 0.5 {
+            return; // already at that end of the list
+        }
+        {
+            let st = self.tab(pane).scroll_handle.0.borrow();
+            let x = st.base_handle.offset().x;
+            st.base_handle.set_offset(point(x, px(-target)));
+        }
+        // The anchor is stored in window coords; shift it opposite the scroll so
+        // it stays on the content row where the drag began (otherwise the whole
+        // selection would drift with the scroll).
+        self.marquee = Some((pane, (start.0, start.1 - applied), cur));
+        self.mark_scrolled(pane, cx); // show the scrollbar while auto-scrolling
+        // Recompute the covered rows against the new scroll position.
+        self.update_marquee(cur.0, cur.1, cx);
     }
 
     /// Update the marquee end point and recompute which rows it covers.
