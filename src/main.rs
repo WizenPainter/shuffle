@@ -9002,6 +9002,16 @@ impl Shuffle {
         cx.notify();
     }
 
+    /// Whether a marquee drag is in flight with real displacement — used to
+    /// swallow the row click that lands on the same mouse-up (row `on_click`
+    /// bubbles before the root's `end_marquee`), so finishing a box-select over
+    /// a row doesn't replace the fresh multi-selection with that one row.
+    /// Stationary press-releases (displacement ≈ 0) still click through.
+    fn marquee_click_suppressed(&self) -> bool {
+        self.marquee
+            .is_some_and(|(_, s, c)| (c.0 - s.0).abs().max((c.1 - s.1).abs()) > 6.0)
+    }
+
     /// Dispatch a left-click on an item, honoring Cmd / Shift modifiers.
     fn click_entry(
         &mut self,
@@ -9011,6 +9021,9 @@ impl Shuffle {
         ev: &ClickEvent,
         cx: &mut Context<Self>,
     ) {
+        if self.marquee_click_suppressed() {
+            return;
+        }
         self.active_pane = pane;
         self.term_focused = false;
         let mods = ev.modifiers();
@@ -9029,6 +9042,9 @@ impl Shuffle {
 
     /// Start a marquee (rubber-band) selection from empty list space.
     fn begin_marquee(&mut self, pane: usize, x: f32, y: f32, cx: &mut Context<Self>) {
+        if mq_log() {
+            eprintln!("[mq] begin pane={pane} at ({x:.0},{y:.0})");
+        }
         self.active_pane = pane;
         self.term_focused = false;
         self.rename = None;
@@ -9091,19 +9107,34 @@ impl Shuffle {
         }
         // Scroll when the cursor is within an edge ZONE inside the viewport, not
         // only past the edge — when the list reaches the window bottom the
-        // cursor may never report coordinates beyond it. The anchor comparison
-        // (clamped into the viewport, since auto-scroll shifts it off-screen)
-        // keeps a press inside a zone from scrolling until the drag actually
-        // heads toward that edge.
+        // cursor may never report coordinates beyond it. Zone-scrolling only
+        // engages once the box has actually been dragged a little, so a plain
+        // press inside a zone doesn't scroll; after that the zone side alone
+        // picks the direction (an anchor-side gate here would block reversing:
+        // after a long down-scroll the glued anchor clamps to the top edge and
+        // no reachable in-zone position passes it).
         const ZONE: f32 = 28.0;
-        let anchor = start.1.clamp(top, bottom);
-        let overshoot = if cur.1 < top + ZONE && cur.1 < anchor {
+        let moved =
+            (cur.0 - start.0).abs().max((cur.1 - start.1).abs()) > 8.0;
+        let overshoot = if moved && cur.1 < top + ZONE {
             (cur.1 - (top + ZONE)).min(-0.1) // negative → scroll up
-        } else if cur.1 > bottom - ZONE && cur.1 > anchor {
+        } else if moved && cur.1 > bottom - ZONE {
             (cur.1 - (bottom - ZONE)).max(0.1) // positive → scroll down
         } else {
-            return; // outside both zones (or not dragging toward the edge)
+            if mq_log() {
+                eprintln!(
+                    "[mq] tick idle: cur.y={:.0} top={top:.0} bottom={bottom:.0} moved={moved} zone={ZONE}",
+                    cur.1
+                );
+            }
+            return; // outside both zones, or the box hasn't been dragged yet
         };
+        if mq_log() {
+            eprintln!(
+                "[mq] tick scroll: cur.y={:.0} overshoot={overshoot:.0} scrolled={scrolled:.0}/{max:.0}",
+                cur.1
+            );
+        }
         // ~2px/tick at the zone boundary up to ~28px/tick (≈1700px/s) far past
         // the edge — "slowly or faster depending on where the mouse is".
         let speed = (overshoot.abs() * 0.22).clamp(2.0, 28.0);
@@ -9131,6 +9162,9 @@ impl Shuffle {
         let Some((pane, start, _)) = self.marquee else {
             return;
         };
+        if mq_log() {
+            eprintln!("[mq] move ({x:.0},{y:.0})");
+        }
         self.marquee = Some((pane, start, (x, y)));
 
         // Map the vertical span to row indices using the list's geometry.
@@ -11768,12 +11802,19 @@ impl Shuffle {
                                                     this.open_context_menu(pane, x, y, None, cx);
                                                 }),
                                             )
-                                            // Press on empty space → start a marquee
-                                            // (rows stop_propagation so this only
-                                            // fires on blank area).
+                                            // Press on blank space, or on a row's
+                                            // Kind/Date/Size area (only the name
+                                            // cell stops propagation), → start a
+                                            // marquee. Skip modified presses so
+                                            // Cmd/Shift-click keep their toggle /
+                                            // range-extend meaning (a marquee
+                                            // start would clear the selection).
                                             .on_mouse_down(
                                                 MouseButton::Left,
                                                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                                    if ev.modifiers.platform || ev.modifiers.shift {
+                                                        return;
+                                                    }
                                                     this.begin_marquee(
                                                         pane,
                                                         f64::from(ev.position.x) as f32,
@@ -11819,6 +11860,11 @@ impl Shuffle {
                                         cx.listener({
                                             let parent = parent.clone();
                                             move |this, _: &ClickEvent, _, cx| {
+                                                // Finishing a marquee over ".." must
+                                                // not navigate away.
+                                                if this.marquee_click_suppressed() {
+                                                    return;
+                                                }
                                                 this.navigate_in(pane, parent.clone(), cx);
                                             }
                                         }),
@@ -13197,6 +13243,12 @@ fn cloud_kind(path: &Path) -> Option<CloudKind> {
 }
 
 /// Whether `path` is an online-only cloud placeholder (kernel `SF_DATALESS`).
+/// Whether marquee debug logging is on (`SHUFFLE_MARQUEE_LOG=1`).
+fn mq_log() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("SHUFFLE_MARQUEE_LOG").is_some())
+}
+
 fn is_dataless(path: &Path) -> bool {
     use std::os::macos::fs::MetadataExt;
     fs::metadata(path)
@@ -13504,13 +13556,14 @@ fn file_row(
         // Instant press feedback (the click action lands on mouse-up).
         .active(|s| s.bg(rgb(t.selected)))
         .on_hover(on_hover_row)
-        // Press records a drag candidate (promoted to a native OS drag on move)
-        // and stops a marquee from starting on the list behind it.
-        .on_mouse_down(MouseButton::Left, on_press)
         // Name (icon + label). Long names truncate with an ellipsis. Only this
         // cell is the "drop into this folder" target — dropping further along
         // the row (Kind/Date/Size) falls through to the pane and lands in the
-        // current directory instead, like Finder.
+        // current directory instead, like Finder. It's also the only cell whose
+        // press starts a FILE drag (candidate promoted to a native OS drag on
+        // move); presses on Kind/Date/Size fall through to the list behind, so
+        // a rubber-band marquee can start from a row's non-name area even in a
+        // folder whose rows fill the whole viewport — like Finder.
         .child(
             div()
                 .flex_none()
@@ -13519,6 +13572,7 @@ fn file_row(
                 .items_center()
                 .gap_2()
                 .pr_2()
+                .on_mouse_down(MouseButton::Left, on_press)
                 .when(accept_drop, |c| c.rounded_sm().on_drop(on_drop_file))
                 .when(drop_hilite, |c| c.bg(rgb(theme().selected)))
                 .child(
