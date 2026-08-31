@@ -9008,8 +9008,15 @@ impl Shuffle {
     /// a row doesn't replace the fresh multi-selection with that one row.
     /// Stationary press-releases (displacement ≈ 0) still click through.
     fn marquee_click_suppressed(&self) -> bool {
-        self.marquee
-            .is_some_and(|(_, s, c)| (c.0 - s.0).abs().max((c.1 - s.1).abs()) > 6.0)
+        self.marquee.is_some_and(|(pane, s, c)| {
+            // The anchor is content-space; convert the cursor before comparing
+            // (comparing across spaces would suppress every click once the
+            // list is scrolled). Scroll during the marquee counts as movement —
+            // exactly then must the click not collapse the selection.
+            let (top, scrolled) = self.list_geometry(pane);
+            let cur_c = c.1 - top + scrolled;
+            (c.0 - s.0).abs().max((cur_c - s.1).abs()) > 6.0
+        })
     }
 
     /// Dispatch a left-click on an item, honoring Cmd / Shift modifiers.
@@ -9040,7 +9047,22 @@ impl Shuffle {
         }
     }
 
+    /// A pane list's `(viewport_top, scrolled)` in window coords / content px —
+    /// the numbers needed to convert between window y and content y.
+    fn list_geometry(&self, pane: usize) -> (f32, f32) {
+        let st = self.tab(pane).scroll_handle.0.borrow();
+        let top = f64::from(st.base_handle.bounds().origin.y) as f32;
+        let scrolled = (-(f64::from(st.base_handle.offset().y) as f32)).max(0.0);
+        (top, scrolled)
+    }
+
     /// Start a marquee (rubber-band) selection from empty list space.
+    ///
+    /// The anchor is stored in CONTENT coordinates (`y - list_top + scrolled`),
+    /// not window coordinates: the list can scroll underneath an in-flight
+    /// marquee (wheel/trackpad, or edge auto-scroll), and a window-space anchor
+    /// would slide with the scroll — moving the box off the rows it had already
+    /// swept and re-selecting the wrong ones.
     fn begin_marquee(&mut self, pane: usize, x: f32, y: f32, cx: &mut Context<Self>) {
         if mq_log() {
             eprintln!("[mq] begin pane={pane} at ({x:.0},{y:.0})");
@@ -9053,7 +9075,8 @@ impl Shuffle {
             tab.selection.clear();
             tab.anchor = None;
         }
-        self.marquee = Some((pane, (x, y), (x, y)));
+        let (top, scrolled) = self.list_geometry(pane);
+        self.marquee = Some((pane, (x, y - top + scrolled), (x, y)));
         // Auto-scroll while the drag sits past the top/bottom edge of the list,
         // so a marquee can keep selecting through folders taller than the view.
         // A timer loop (not mouse-move driven) so it scrolls even while the
@@ -9081,17 +9104,24 @@ impl Shuffle {
         cx.notify();
     }
 
-    /// One auto-scroll step for an active marquee: if the pointer is beyond the
-    /// list viewport's top or bottom edge, scroll in that direction — slow near
-    /// the edge, faster the further past it — keep the marquee's anchor glued
-    /// to the content it started on, and extend the selection.
+    /// One 16ms step for an active marquee. Recomputes the selection against
+    /// the CURRENT scroll position (the wheel/trackpad can scroll the list
+    /// mid-marquee with no mouse-move event — the content-space anchor stays
+    /// glued, and the rows under the box change), then, if the pointer sits in
+    /// an edge zone, auto-scrolls — slow near the edge, faster further past it.
     fn marquee_autoscroll_tick(&mut self, cx: &mut Context<Self>) {
-        let Some((pane, start, cur)) = self.marquee else {
+        let Some((pane, _, cur)) = self.marquee else {
             return;
         };
         if pane >= self.panes.len() {
             return;
         }
+        // Track external scrolls: re-derive selection + box from the live
+        // scroll offset every tick (cheap — only the covered rows).
+        self.update_marquee(cur.0, cur.1, cx);
+        let Some((pane, start, cur)) = self.marquee else {
+            return;
+        };
         // Distance past the viewport edge decides direction and speed.
         let (top, bottom, scrolled, max) = {
             let st = self.tab(pane).scroll_handle.0.borrow();
@@ -9114,8 +9144,10 @@ impl Shuffle {
         // after a long down-scroll the glued anchor clamps to the top edge and
         // no reachable in-zone position passes it).
         const ZONE: f32 = 28.0;
+        // `start` is content-space; convert the cursor for the displacement gate.
+        let cur_content_y = cur.1 - top + scrolled;
         let moved =
-            (cur.0 - start.0).abs().max((cur.1 - start.1).abs()) > 8.0;
+            (cur.0 - start.0).abs().max((cur_content_y - start.1).abs()) > 8.0;
         let overshoot = if moved && cur.1 < top + ZONE {
             (cur.1 - (top + ZONE)).min(-0.1) // negative → scroll up
         } else if moved && cur.1 > bottom - ZONE {
@@ -9148,10 +9180,7 @@ impl Shuffle {
             let x = st.base_handle.offset().x;
             st.base_handle.set_offset(point(x, px(-target)));
         }
-        // The anchor is stored in window coords; shift it opposite the scroll so
-        // it stays on the content row where the drag began (otherwise the whole
-        // selection would drift with the scroll).
-        self.marquee = Some((pane, (start.0, start.1 - applied), cur));
+        let _ = applied; // the content-space anchor is scroll-invariant
         self.mark_scrolled(pane, cx); // show the scrollbar while auto-scrolling
         // Recompute the covered rows against the new scroll position.
         self.update_marquee(cur.0, cur.1, cx);
@@ -9168,16 +9197,11 @@ impl Shuffle {
         self.marquee = Some((pane, start, (x, y)));
 
         // Map the vertical span to row indices using the list's geometry.
-        let (list_top, scrolled) = {
-            let st = self.tab(pane).scroll_handle.0.borrow();
-            let top = f64::from(st.base_handle.bounds().origin.y) as f32;
-            let scr = (-(f64::from(st.base_handle.offset().y) as f32)).max(0.0);
-            (top, scr)
-        };
-        let y0 = start.1.min(y);
-        let y1 = start.1.max(y);
-        let c0 = (y0 - list_top + scrolled).max(0.0);
-        let c1 = (y1 - list_top + scrolled).max(0.0);
+        let (list_top, scrolled) = self.list_geometry(pane);
+        // The anchor (`start.1`) is content-space; only the cursor converts.
+        let cur_c = y - list_top + scrolled;
+        let c0 = start.1.min(cur_c).max(0.0);
+        let c1 = start.1.max(cur_c).max(0.0);
         let i0 = (c0 / ROW_H).floor() as i64;
         let i1 = (c1 / ROW_H).floor() as i64;
         // Row 0 is the ".." entry when present; offset to display indices.
@@ -9363,10 +9387,21 @@ impl Shuffle {
             let o = st.base_handle.bounds().origin;
             (f64::from(o.x) as f32, f64::from(o.y) as f32)
         };
+        // The anchor is content-space: convert to window y with the LIVE scroll
+        // offset, so the box's fixed edge glides with the content when the list
+        // scrolls under an in-flight marquee.
+        let (_, scrolled) = self.list_geometry(pane);
+        let start_y = start.1 + oy - scrolled;
         let x = start.0.min(cur.0) - ox;
-        let y = start.1.min(cur.1) - oy;
+        let y = start_y.min(cur.1) - oy;
         let w = (start.0 - cur.0).abs();
-        let h = (start.1 - cur.1).abs();
+        let mut h = (start_y - cur.1).abs();
+        // Clamp to the container: when the anchored edge has scrolled off the
+        // top, shrink the height by the clipped amount (clamping only `top`
+        // would push the box's far edge past the cursor).
+        if y < 0.0 {
+            h = (h + y).max(0.0);
+        }
         let t = theme();
         Some(
             div()
