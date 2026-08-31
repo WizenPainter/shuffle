@@ -3724,6 +3724,54 @@ impl Shuffle {
             }
         })
         .detach();
+        // Hidden debug harness (SHUFFLE_MQ_SIM=1): drive a marquee + edge drag
+        // programmatically and log what the auto-scroll loop does. Synthetic OS
+        // mouse events don't reach gpui, so this is how the mechanics are
+        // verified end-to-end in-process.
+        if std::env::var_os("SHUFFLE_MQ_SIM").is_some() {
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                let _ = this.update(cx, |this, cx| {
+                    let (top, bottom) = {
+                        let st = this.tab(0).scroll_handle.0.borrow();
+                        let b = st.base_handle.bounds();
+                        let top = f64::from(b.origin.y) as f32;
+                        (top, top + f64::from(b.size.height) as f32)
+                    };
+                    eprintln!("[mq-sim] viewport top={top:.0} bottom={bottom:.0}");
+                    let mid = (top + bottom) / 2.0;
+                    this.begin_marquee(0, 400.0, mid, cx);
+                    // Drag 60px past the bottom edge and hold.
+                    this.update_marquee(400.0, bottom + 60.0, cx);
+                    eprintln!("[mq-sim] begin at y={mid:.0}, cur held at y={:.0}", bottom + 60.0);
+                });
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                let _ = this.update(cx, |this, cx| {
+                    eprintln!(
+                        "[mq-sim] after 3s down: scrolled={:.0} selected={}",
+                        this.current_scrolled(0),
+                        this.tab(0).selection.len()
+                    );
+                    // Now hold 40px above the top edge — should scroll back up.
+                    let top = {
+                        let st = this.tab(0).scroll_handle.0.borrow();
+                        f64::from(st.base_handle.bounds().origin.y) as f32
+                    };
+                    this.update_marquee(400.0, top - 40.0, cx);
+                });
+                cx.background_executor().timer(Duration::from_secs(3)).await;
+                let _ = this.update(cx, |this, cx| {
+                    eprintln!(
+                        "[mq-sim] after 3s up: scrolled={:.0} selected={}",
+                        this.current_scrolled(0),
+                        this.tab(0).selection.len()
+                    );
+                    this.end_marquee(cx);
+                    eprintln!("[mq-sim] done");
+                });
+            })
+            .detach();
+        }
         // Rebuild icons when the icon pack changes.
         cx.observe_global::<IconPackGlobal>(|this, cx| {
             set_active_icon_pack(cx.global::<IconPackGlobal>().0.clone());
@@ -9041,14 +9089,23 @@ impl Shuffle {
         if max <= 1.0 {
             return; // everything fits; nothing to scroll
         }
-        let overshoot = if cur.1 < top {
-            cur.1 - top // negative → scroll up
-        } else if cur.1 > bottom {
-            cur.1 - bottom // positive → scroll down
+        // Scroll when the cursor is within an edge ZONE inside the viewport, not
+        // only past the edge — when the list reaches the window bottom the
+        // cursor may never report coordinates beyond it. The anchor comparison
+        // (clamped into the viewport, since auto-scroll shifts it off-screen)
+        // keeps a press inside a zone from scrolling until the drag actually
+        // heads toward that edge.
+        const ZONE: f32 = 28.0;
+        let anchor = start.1.clamp(top, bottom);
+        let overshoot = if cur.1 < top + ZONE && cur.1 < anchor {
+            (cur.1 - (top + ZONE)).min(-0.1) // negative → scroll up
+        } else if cur.1 > bottom - ZONE && cur.1 > anchor {
+            (cur.1 - (bottom - ZONE)).max(0.1) // positive → scroll down
         } else {
-            return; // inside the viewport — no auto-scroll
+            return; // outside both zones (or not dragging toward the edge)
         };
-        // ~2px/tick just past the edge up to ~28px/tick (≈1700px/s) at 120px out.
+        // ~2px/tick at the zone boundary up to ~28px/tick (≈1700px/s) far past
+        // the edge — "slowly or faster depending on where the mouse is".
         let speed = (overshoot.abs() * 0.22).clamp(2.0, 28.0);
         let target = (scrolled + speed.copysign(overshoot)).clamp(0.0, max);
         let applied = target - scrolled;
