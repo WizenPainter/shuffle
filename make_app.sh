@@ -11,15 +11,28 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 
 # Prefer a universal binary (arm64 + x86_64) so Shuffle runs on both Apple
-# Silicon and Intel Macs. release.sh builds both per-target binaries; if only
-# the default host build exists (e.g. a quick local dev build) fall back to it.
+# Silicon and Intel Macs — but ONLY when the per-target pair is current. A
+# plain `cargo build --release` writes target/release/shuffle and does NOT
+# refresh the per-target binaries, so blindly preferring them ships a stale
+# build (this silently shipped a week-old binary in every dev bundle once).
 ARM_BIN="target/aarch64-apple-darwin/release/shuffle"
 X86_BIN="target/x86_64-apple-darwin/release/shuffle"
+PLAIN_BIN="target/release/shuffle"
+USE_UNIVERSAL=false
 if [ -f "$ARM_BIN" ] && [ -f "$X86_BIN" ]; then
+    USE_UNIVERSAL=true
+    # The host build being newer than either slice means the slices are stale.
+    if [ -f "$PLAIN_BIN" ] && { [ "$PLAIN_BIN" -nt "$ARM_BIN" ] || [ "$PLAIN_BIN" -nt "$X86_BIN" ]; }; then
+        USE_UNIVERSAL=false
+        echo "NOTE: per-target binaries are OLDER than target/release — using the host build."
+        echo "      (Run the two --target builds, as release.sh does, for a universal bundle.)"
+    fi
+fi
+if $USE_UNIVERSAL; then
     lipo -create "$ARM_BIN" "$X86_BIN" -output "$APP/Contents/MacOS/shuffle"
     echo "Universal binary: $(lipo -archs "$APP/Contents/MacOS/shuffle")"
 else
-    cp target/release/shuffle "$APP/Contents/MacOS/shuffle"
+    cp "$PLAIN_BIN" "$APP/Contents/MacOS/shuffle"
     echo "Single-arch binary: $(lipo -archs "$APP/Contents/MacOS/shuffle")"
 fi
 cp AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"

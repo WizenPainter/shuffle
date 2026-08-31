@@ -1948,7 +1948,15 @@ impl Settings {
                     .child(
                         div()
                             .text_color(rgb(t.text))
-                            .child(format!("Version {}", env!("CARGO_PKG_VERSION"))),
+                            .child(format!(
+                                "Version {} ({})",
+                                env!("CARGO_PKG_VERSION"),
+                                // Build stamp (git short SHA) baked in at compile
+                                // time so "which build am I actually running?"
+                                // is answerable from Settings. "dev" when built
+                                // without the stamp.
+                                option_env!("SHUFFLE_BUILD_SHA").unwrap_or("dev")
+                            )),
                     )
                     .child(div().text_xs().text_color(rgb(t.text_muted)).child(
                         "Check GitHub for a newer release and install it in place \u{2014} the app swaps itself and relaunches.",
