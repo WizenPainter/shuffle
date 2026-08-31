@@ -24,9 +24,9 @@ Format rules the website parser expects:
 
 ## Next
 
+- [x] First-class SFTP connections - saved servers, remote previews, sidebar
+- [x] Better cloud drive integration - sync badges, download-on-demand, free up space
 - [ ] More Quick Actions per file type - batch rename, convert, PDF tools - vote: github.com/WizenPainter/shuffle/discussions/2
-- [ ] First-class SFTP connections - vote: github.com/WizenPainter/shuffle/discussions/3
-- [ ] Better cloud drive integration - sync badges, on-demand downloads - vote: github.com/WizenPainter/shuffle/discussions/4
 - [ ] Restore tabs & split layout on launch - vote: github.com/WizenPainter/shuffle/discussions/6
 
 ## Later

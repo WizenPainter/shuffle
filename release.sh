@@ -35,6 +35,9 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 echo "==> Building signed + notarized $DMG (universal: arm64 + x86_64)"
+# Bake the commit into the binary so Settings shows "Version X (sha)" —
+# otherwise released builds read "(dev)" and can't be told apart.
+export SHUFFLE_BUILD_SHA="$(git rev-parse --short HEAD)"
 # Build both slices so the release runs on Apple Silicon and Intel Macs;
 # make_app.sh lipos them into one universal binary.
 cargo build --release --target aarch64-apple-darwin

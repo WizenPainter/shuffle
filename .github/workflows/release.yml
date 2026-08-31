@@ -102,6 +102,8 @@ jobs:
             export SHUFFLE_NOTARY_KEY="$RUNNER_TEMP/ac_key.p8"
           fi
 
+          # Settings shows "Version X (sha)" — bake the commit into the binary.
+          export SHUFFLE_BUILD_SHA="$(git rev-parse --short HEAD)"
           cargo build --release --target aarch64-apple-darwin
           cargo build --release --target x86_64-apple-darwin
           SHUFFLE_SIGN_ID="__force_adhoc__" ./make_app.sh

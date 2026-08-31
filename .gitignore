@@ -9,3 +9,9 @@
 # The built app bundle is a generated artifact (make_app.sh rebuilds it);
 # it ships as a Release asset, never committed.
 /Shuffle.app/
+
+# Local AI-tooling / editor state — never ship with the app.
+.agents/
+.claude/
+skills-lock.json
+release-notes-*.md
