@@ -11858,6 +11858,14 @@ impl Shuffle {
                                                     if ev.modifiers.platform || ev.modifiers.shift {
                                                         return;
                                                     }
+                                                    // A press on a row's NAME cell armed a
+                                                    // file drag (runs first, it's deeper);
+                                                    // that gesture is a click-or-drag, never
+                                                    // a marquee. drag_candidate is cleared on
+                                                    // every mouse-up, so this can't go stale.
+                                                    if this.drag_candidate.is_some() {
+                                                        return;
+                                                    }
                                                     this.begin_marquee(
                                                         pane,
                                                         f64::from(ev.position.x) as f32,
@@ -11923,8 +11931,13 @@ impl Shuffle {
                                         cx.listener(move |this, drag: &ExternalPaths, _, cx| {
                                             this.drop_files(pane, parent.clone(), drag.paths().to_vec(), cx);
                                         }),
-                                        // ".." isn't draggable; just swallow the press.
-                                        |_, _, cx: &mut App| cx.stop_propagation(),
+                                        // ".." isn't draggable — no drag candidate. Let the
+                                        // press bubble so the row's click (navigate up)
+                                        // registers; swallowing it here dead-ends clicks
+                                        // on the ".." name. A marquee starting from this
+                                        // press is fine: a stationary release still
+                                        // navigates (zero displacement isn't suppressed).
+                                        |_: &MouseDownEvent, _, _| {},
                                         // ".." can't be renamed; no hover tracking.
                                         |_: &bool, _, _| {},
                                     )
@@ -12017,7 +12030,14 @@ impl Shuffle {
                                         // Drop onto a folder → move (or upload) the file(s) into it.
                                         this.drop_files(pane, drop_target.clone(), drag.paths().to_vec(), cx);
                                     }),
-                                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                                    cx.listener(move |this, ev: &MouseDownEvent, _, _cx| {
+                                        // Arm a file drag, but DON'T stop propagation:
+                                        // the row's own click handler is an ANCESTOR of
+                                        // the name cell this press lands on, and gpui
+                                        // only registers a click if the row sees the
+                                        // mouse-down too (swallowing it here made name
+                                        // clicks select nothing). The marquee container
+                                        // skips presses that armed a drag instead.
                                         if let Some(dp) = &drag_target {
                                             let (x, y) = (
                                                 f64::from(ev.position.x) as f32,
@@ -12025,7 +12045,6 @@ impl Shuffle {
                                             );
                                             this.drag_candidate = Some((pane, dp.clone(), (x, y)));
                                         }
-                                        cx.stop_propagation();
                                     }),
                                     cx.listener(move |this, on: &bool, _, _| {
                                         if *on {
