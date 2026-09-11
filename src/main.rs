@@ -6872,6 +6872,38 @@ impl Shuffle {
         cx.notify();
     }
 
+    /// Open the command palette pre-targeted at `path`: a single selected item
+    /// for that folder with the ⌘K actions dropdown already open (Copy path,
+    /// Reveal in Finder, Open in new tab, …). Reached by clicking the
+    /// breadcrumb's current-location crumb, which previously just re-navigated
+    /// to where you already were. Typing still searches as usual.
+    fn open_palette_for_path(
+        &mut self,
+        pane: usize,
+        path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.active_pane = pane;
+        self.palette_open = true;
+        self.query.clear();
+        self.query_cursor = 0;
+        self.query_anchor = None;
+        self.palette_hist_pos = None;
+        self.selected = 0;
+        self.search_gen = self.search_gen.wrapping_add(1); // drop in-flight results
+        self.palette_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.palette_items = vec![PaletteItem {
+            title: path_label(&path),
+            subtitle: path.to_string_lossy().into_owned(),
+            action: Action::Open(path, true),
+            is_dir: true,
+        }];
+        self.palette_actions = Some(0); // land straight on the actions list
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
     /// Default items shown when the query is empty: the available commands.
     fn default_commands(&self) -> Vec<PaletteItem> {
         vec![PaletteItem {
@@ -11375,7 +11407,11 @@ impl Shuffle {
                 segs.push(breadcrumb_sep());
             }
             let active = current_dir.starts_with(&full);
-            segs.push(breadcrumb_seg(pane * 4096 + idx, pane, label, full, active, cx));
+            // Palette-on-click only for the crumb of the CURRENT dir, and only
+            // on local tabs (Reveal in Finder etc. make no sense for a remote
+            // path — there the crumb keeps its refresh/navigate behavior).
+            let is_current = full == current_dir && tab.remote.is_none();
+            segs.push(breadcrumb_seg(pane * 4096 + idx, pane, label, full, active, is_current, cx));
             idx += 1;
         }
 
@@ -12839,6 +12875,10 @@ fn breadcrumb_seg(
     label: String,
     full: PathBuf,
     active: bool,
+    // The crumb for the pane's CURRENT directory: clicking it would only
+    // re-navigate to where you already are, so it opens the command palette
+    // targeted at that folder instead (Copy path / Reveal / new tab / …).
+    is_current: bool,
     cx: &Context<Shuffle>,
 ) -> AnyElement {
     let t = theme();
@@ -12854,8 +12894,13 @@ fn breadcrumb_seg(
         .text_color(if active { rgb(t.text) } else { rgb(t.text_dim) })
         .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
         .child(label)
-        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-            this.navigate_in(pane, full.clone(), cx);
+        .when(is_current, |d| d.tooltip(tip("Actions for this folder…")))
+        .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+            if is_current {
+                this.open_palette_for_path(pane, full.clone(), window, cx);
+            } else {
+                this.navigate_in(pane, full.clone(), cx);
+            }
             cx.stop_propagation();
         }))
         .into_any_element()
