@@ -14,6 +14,7 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
@@ -3162,14 +3163,129 @@ enum Action {
 
 /// An open right-click context menu: where it sits, and the entry it targets
 /// (None when invoked on empty space).
+/// A right-click menu action, invoked with full app access so any existing
+/// method (rename needs the window, most need `cx`) can back a menu row.
+type MenuOp = Rc<dyn Fn(&mut Shuffle, &mut Window, &mut Context<Shuffle>)>;
+
+/// One entry in the (data-driven) right-click menu. The whole tree is built
+/// once when the menu opens and stored on [`ContextMenu`]; rendering, hover
+/// flyouts, and keyboard navigation all walk this data — no per-view closures.
+enum MenuNode {
+    Item {
+        label: String,
+        /// Right-aligned dim hint — only FIXED shortcuts ("⌫", "␣", "↩").
+        hint: Option<&'static str>,
+        /// Leading color dot (Finder tag colors).
+        dot: Option<u32>,
+        /// Leading ✓ (e.g. the item is already in that group).
+        checked: bool,
+        /// Destructive — rendered red (Move to Trash, Delete from Server).
+        danger: bool,
+        on: MenuOp,
+    },
+    /// A flyout submenu: opens beside the root on hover (or → / ↩).
+    Sub { label: String, items: Vec<MenuNode> },
+    Sep,
+    /// Inert explanatory row ("No applications").
+    Disabled(String),
+}
+
+impl MenuNode {
+    /// Rows the highlight can land on (items and submenu parents).
+    fn selectable(&self) -> bool {
+        matches!(self, MenuNode::Item { .. } | MenuNode::Sub { .. })
+    }
+
+    /// Fixed row heights so the flyout's vertical offset is exact.
+    fn height(&self) -> f32 {
+        match self {
+            MenuNode::Sep => 9.0,
+            _ => MENU_ROW_H,
+        }
+    }
+}
+
+/// Context-menu row height (fixed so flyout alignment is deterministic).
+const MENU_ROW_H: f32 = 26.0;
+
+fn mi(
+    label: impl Into<String>,
+    on: impl Fn(&mut Shuffle, &mut Window, &mut Context<Shuffle>) + 'static,
+) -> MenuNode {
+    MenuNode::Item {
+        label: label.into(),
+        hint: None,
+        dot: None,
+        checked: false,
+        danger: false,
+        on: Rc::new(on),
+    }
+}
+
+fn mi_hint(
+    label: impl Into<String>,
+    hint: &'static str,
+    on: impl Fn(&mut Shuffle, &mut Window, &mut Context<Shuffle>) + 'static,
+) -> MenuNode {
+    match mi(label, on) {
+        MenuNode::Item { label, dot, checked, danger, on, .. } => {
+            MenuNode::Item { label, hint: Some(hint), dot, checked, danger, on }
+        }
+        other => other,
+    }
+}
+
+fn mi_danger(
+    label: impl Into<String>,
+    hint: Option<&'static str>,
+    on: impl Fn(&mut Shuffle, &mut Window, &mut Context<Shuffle>) + 'static,
+) -> MenuNode {
+    match mi(label, on) {
+        MenuNode::Item { label, dot, checked, on, .. } => {
+            MenuNode::Item { label, hint, dot, checked, danger: true, on }
+        }
+        other => other,
+    }
+}
+
+fn mi_dot(
+    label: impl Into<String>,
+    dot: u32,
+    on: impl Fn(&mut Shuffle, &mut Window, &mut Context<Shuffle>) + 'static,
+) -> MenuNode {
+    match mi(label, on) {
+        MenuNode::Item { label, hint, checked, danger, on, .. } => {
+            MenuNode::Item { label, hint, dot: Some(dot), checked, danger, on }
+        }
+        other => other,
+    }
+}
+
+fn mi_check(
+    label: impl Into<String>,
+    checked: bool,
+    on: impl Fn(&mut Shuffle, &mut Window, &mut Context<Shuffle>) + 'static,
+) -> MenuNode {
+    match mi(label, on) {
+        MenuNode::Item { label, hint, dot, danger, on, .. } => {
+            MenuNode::Item { label, hint, dot, checked, danger, on }
+        }
+        other => other,
+    }
+}
+
 struct ContextMenu {
     x: f32,
     y: f32,
-    /// The pane whose active tab this menu acts on (for refresh after FS ops).
-    pane: usize,
     target: Option<(PathBuf, bool)>,
-    /// Which level of the menu is showing (root, or a drilled-in submenu).
-    view: MenuView,
+    /// The menu tree, built once at open.
+    nodes: Vec<MenuNode>,
+    /// Index of the root `Sub` whose flyout panel is open.
+    open_sub: Option<usize>,
+    /// Highlighted root row (mouse hover or keyboard).
+    sel_root: Option<usize>,
+    /// Highlighted row inside the open flyout (`None` = focus in the root).
+    sel_sub: Option<usize>,
 }
 
 /// In-progress inline rename of a file/folder.
@@ -3182,17 +3298,6 @@ struct Rename {
     /// Selection anchor (char index); `Some` and different from `cursor` means
     /// that range is selected (starts as the whole name, like Finder).
     anchor: Option<usize>,
-}
-
-/// The current level shown in the context menu.
-#[derive(Clone, Copy, PartialEq)]
-enum MenuView {
-    Root,
-    OpenWith,
-    Tags,
-    QuickActions,
-    Services,
-    AddToGroup,
 }
 
 /// A user-defined sidebar group: a named collection of files/folders.
@@ -3874,28 +3979,136 @@ impl Shuffle {
 
     fn open_context_menu(&mut self, pane: usize, x: f32, y: f32, target: Option<(PathBuf, bool)>, cx: &mut Context<Self>) {
         self.active_pane = pane.min(self.panes.len() - 1);
+        let pane = self.active_pane;
         self.rename = None;
+        // Remote (SFTP) tabs get a reduced menu — the local-only actions
+        // (Quick Actions, Compress, Tags, aliases, Reveal in Finder…) don't
+        // apply to a remote path.
+        let nodes = if self.tab(pane).remote.is_some() {
+            self.menu_nodes_remote(pane, target.clone())
+        } else {
+            self.menu_nodes_root(pane, target.clone())
+        };
         self.context_menu = Some(ContextMenu {
             x,
             y,
-            pane: self.active_pane,
             target,
-            view: MenuView::Root,
+            nodes,
+            open_sub: None,
+            sel_root: None,
+            sel_sub: None,
         });
         cx.notify();
-    }
-
-    /// Switch the open context menu to a different level (keeps it open).
-    fn set_menu_view(&mut self, view: MenuView, cx: &mut Context<Self>) {
-        if let Some(menu) = self.context_menu.as_mut() {
-            menu.view = view;
-            cx.notify();
-        }
     }
 
     fn close_context_menu(&mut self, cx: &mut Context<Self>) {
         if self.context_menu.take().is_some() {
             cx.notify();
+        }
+    }
+
+    /// Mouse entered a root row: highlight it, and open/close the flyout
+    /// (hovering a submenu parent opens it immediately, Finder-style).
+    fn menu_hover_root(&mut self, i: usize, cx: &mut Context<Self>) {
+        let Some(m) = self.context_menu.as_mut() else { return };
+        let want_sub = matches!(m.nodes.get(i), Some(MenuNode::Sub { .. })).then_some(i);
+        if m.sel_root == Some(i) && m.sel_sub.is_none() && m.open_sub == want_sub {
+            return;
+        }
+        m.sel_root = Some(i);
+        m.sel_sub = None;
+        m.open_sub = want_sub;
+        cx.notify();
+    }
+
+    /// Mouse entered a flyout row.
+    fn menu_hover_sub(&mut self, j: usize, cx: &mut Context<Self>) {
+        let Some(m) = self.context_menu.as_mut() else { return };
+        if m.sel_sub == Some(j) {
+            return;
+        }
+        m.sel_sub = Some(j);
+        cx.notify();
+    }
+
+    /// Run the action behind a row (`sub` addresses into the open flyout).
+    fn menu_invoke(&mut self, root: usize, sub: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let op = {
+            let Some(m) = self.context_menu.as_ref() else { return };
+            let node = match (m.nodes.get(root), sub) {
+                (Some(MenuNode::Sub { items, .. }), Some(j)) => items.get(j),
+                (node, None) => node,
+                _ => None,
+            };
+            match node {
+                Some(MenuNode::Item { on, .. }) => on.clone(),
+                _ => return,
+            }
+        };
+        op(self, window, cx);
+    }
+
+    /// Keyboard navigation while the context menu is open (it's modal: every
+    /// key is swallowed). Arrows move, → opens a flyout, ← returns, Enter
+    /// invokes, Esc closes.
+    fn menu_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) {
+        match key {
+            "escape" => self.close_context_menu(cx),
+            "down" | "up" => {
+                let delta: isize = if key == "down" { 1 } else { -1 };
+                if let Some(m) = self.context_menu.as_mut() {
+                    if m.sel_sub.is_some() {
+                        if let Some(MenuNode::Sub { items, .. }) =
+                            m.open_sub.and_then(|i| m.nodes.get(i))
+                        {
+                            m.sel_sub = step_menu_sel(items, m.sel_sub, delta);
+                        }
+                    } else {
+                        m.sel_root = step_menu_sel(&m.nodes, m.sel_root, delta);
+                        // Moving in the root closes any open flyout.
+                        m.open_sub = None;
+                    }
+                    cx.notify();
+                }
+            }
+            "right" => {
+                if let Some(m) = self.context_menu.as_mut() {
+                    if let Some(i) = m.sel_root {
+                        if let Some(MenuNode::Sub { items, .. }) = m.nodes.get(i) {
+                            m.open_sub = Some(i);
+                            m.sel_sub = step_menu_sel(items, None, 1);
+                            cx.notify();
+                        }
+                    }
+                }
+            }
+            "left" => {
+                if let Some(m) = self.context_menu.as_mut() {
+                    if m.open_sub.is_some() {
+                        m.open_sub = None;
+                        m.sel_sub = None;
+                        cx.notify();
+                    }
+                }
+            }
+            "enter" => {
+                let hit = self.context_menu.as_ref().and_then(|m| {
+                    let root = m.sel_root?;
+                    match (m.nodes.get(root)?, m.sel_sub) {
+                        (MenuNode::Sub { .. }, None) => Some((root, None, true)),
+                        (MenuNode::Sub { .. }, Some(j)) => Some((root, Some(j), false)),
+                        (MenuNode::Item { .. }, _) => Some((root, None, false)),
+                        _ => None,
+                    }
+                });
+                match hit {
+                    // Enter on a submenu parent opens it, like →.
+                    Some((_, None, true)) => self.menu_key("right", window, cx),
+                    Some((root, sub, false)) => self.menu_invoke(root, sub, window, cx),
+                    _ => {}
+                }
+            }
+            _ => {}
         }
     }
 
@@ -4303,12 +4516,6 @@ impl Shuffle {
             });
         })
         .detach();
-    }
-
-    fn move_to_trash(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
-        if trash_path(&path) {
-            self.refresh_pane(pane, cx);
-        }
     }
 
     /// Ask to move the current selection (or the focused item) to Trash.
@@ -5056,88 +5263,100 @@ impl Shuffle {
         }
     }
 
-    /// Root level of the context menu.
-    fn menu_root(
-        &self,
-        pane: usize,
-        target: Option<(PathBuf, bool)>,
-        cx: &Context<Self>,
-    ) -> Vec<AnyElement> {
-        // Remote (SFTP) tabs get a reduced menu — the local-only actions
-        // (Quick Actions, Compress, Tags, aliases, Reveal in Finder…) don't
-        // apply to a remote path.
-        if self.tab(pane).remote.is_some() {
-            return self.menu_remote(pane, target, cx);
-        }
-        let mut items: Vec<AnyElement> = Vec::new();
+    /// Build the context-menu tree for a local tab. `target` is the
+    /// right-clicked entry (`None` = the background of the folder).
+    fn menu_nodes_root(&self, pane: usize, target: Option<(PathBuf, bool)>) -> Vec<MenuNode> {
+        let mut nodes: Vec<MenuNode> = Vec::new();
+        let paste_n = pasteboard_file_paths().len();
         if let Some((path, is_dir)) = target {
-            let p = path.clone();
-            items.push(
-                ctx_item("Open", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            // Clicking inside a multi-selection acts on the whole selection
+            // (Finder semantics); clicking outside it acts on just that item.
+            let sel = &self.tab(pane).selection;
+            let targets: Vec<PathBuf> = if sel.len() > 1 && sel.contains(&path) {
+                let mut v: Vec<PathBuf> = sel.iter().cloned().collect();
+                v.sort();
+                v
+            } else {
+                vec![path.clone()]
+            };
+            let n = targets.len();
+            let many = n > 1;
+
+            // --- open / preview ---
+            {
+                let ts = targets.clone();
+                let label = if many { format!("Open {n} Items") } else { "Open".to_string() };
+                nodes.push(mi(label, move |this, _, cx| {
                     this.close_context_menu(cx);
-                    this.open_path(pane, p.clone(), is_dir, cx);
-                }))
-                .into_any_element(),
-            );
-            items.push(
-                ctx_parent("Open With", cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.set_menu_view(MenuView::OpenWith, cx);
-                }))
-                .into_any_element(),
-            );
-            // Cloud storage: download-on-demand / free up space. Offered for
-            // files/folders in a cloud store, when the helper is present.
-            if let (Some(kind), true) = (cloud_kind(&path), cloudctl_path().is_some()) {
-                let has_online = collect_cloud_files(&path, true, 1).len() == 1;
-                let has_local = collect_cloud_files(&path, false, 1).len() == 1;
-                if has_online {
-                    let label = if is_dir { "Download Contents" } else { "Download Now" };
-                    let p = path.clone();
-                    items.push(
-                        ctx_item(label, cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.cloud_download(pane, p.clone(), cx);
-                        }))
-                        .into_any_element(),
-                    );
-                }
-                // Eviction is iCloud-only here (third-party is provider-driven).
-                if has_local && kind == CloudKind::ICloud {
-                    let label = if is_dir { "Free Up Space in Folder" } else { "Free Up Space" };
-                    let p = path.clone();
-                    items.push(
-                        ctx_item(label, cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.cloud_evict(pane, p.clone(), cx);
-                        }))
-                        .into_any_element(),
-                    );
-                }
+                    if ts.len() == 1 {
+                        this.open_path(pane, ts[0].clone(), is_dir, cx);
+                    } else {
+                        // Multi-open goes through LaunchServices, like Finder.
+                        for p in &ts {
+                            let _ = Command::new("open").arg(p).spawn();
+                        }
+                    }
+                }));
             }
-            // Type-specific actions, Finder-style: archives extract in place,
-            // app bundles reveal their contents.
-            if archive_suffix(&path).is_some() {
-                let p = path.clone();
-                items.push(
-                    ctx_item("Extract Here", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            if !many {
+                nodes.push(MenuNode::Sub {
+                    label: "Open With".into(),
+                    items: self.open_with_nodes(&path),
+                });
+            }
+            {
+                let ts = targets.clone();
+                let label = if many { format!("Quick Look {n} Items") } else { "Quick Look".to_string() };
+                nodes.push(mi_hint(label, "␣", move |this, _, cx| {
+                    this.close_context_menu(cx);
+                    quick_look_paths(&ts);
+                }));
+            }
+            push_menu_sep(&mut nodes);
+
+            // --- cloud + type-specific (single target only) ---
+            if !many {
+                // Cloud storage: download-on-demand / free up space. Offered for
+                // files/folders in a cloud store, when the helper is present.
+                if let (Some(kind), true) = (cloud_kind(&path), cloudctl_path().is_some()) {
+                    let has_online = collect_cloud_files(&path, true, 1).len() == 1;
+                    let has_local = collect_cloud_files(&path, false, 1).len() == 1;
+                    if has_online {
+                        let label = if is_dir { "Download Contents" } else { "Download Now" };
+                        let p = path.clone();
+                        nodes.push(mi(label, move |this, _, cx| {
+                            this.cloud_download(pane, p.clone(), cx);
+                        }));
+                    }
+                    // Eviction is iCloud-only here (third-party is provider-driven).
+                    if has_local && kind == CloudKind::ICloud {
+                        let label = if is_dir { "Free Up Space in Folder" } else { "Free Up Space" };
+                        let p = path.clone();
+                        nodes.push(mi(label, move |this, _, cx| {
+                            this.cloud_evict(pane, p.clone(), cx);
+                        }));
+                    }
+                }
+                // Type-specific actions, Finder-style: archives extract in
+                // place, app bundles reveal their contents.
+                if archive_suffix(&path).is_some() {
+                    let p = path.clone();
+                    nodes.push(mi("Extract Here", move |this, _, cx| {
                         this.close_context_menu(cx);
                         this.extract_archive(pane, p.clone(), cx);
-                    }))
-                    .into_any_element(),
-                );
+                    }));
+                }
+                if is_dir && path.extension().is_some_and(|e| e == "app") {
+                    let p = path.clone();
+                    nodes.push(mi("Show Package Contents", move |this, _, cx| {
+                        this.close_context_menu(cx);
+                        this.navigate_in(pane, p.clone(), cx);
+                    }));
+                }
             }
-            if is_dir && path.extension().is_some_and(|e| e == "app") {
-                let p = path.clone();
-                items.push(
-                    ctx_item(
-                        "Show Package Contents",
-                        cx.listener(move |this, _: &ClickEvent, _, cx| {
-                            this.close_context_menu(cx);
-                            this.navigate_in(pane, p.clone(), cx);
-                        }),
-                    )
-                    .into_any_element(),
-                );
-            }
-            // User script actions that apply to this item (Scripts folder).
+
+            // User script actions that apply to the clicked item; they receive
+            // the whole selection as arguments.
             if prefs().script_actions {
                 let fname = path
                     .file_name()
@@ -5147,282 +5366,254 @@ impl Shuffle {
                     .into_iter()
                     .filter(|a| script_action_applies(a, &fname, is_dir))
                     .collect();
-                if !acts.is_empty() {
-                    items.push(ctx_separator().into_any_element());
-                    for (i, a) in acts.into_iter().take(12).enumerate() {
-                        let script = a.path.clone();
-                        let tgt = path.clone();
-                        items.push(
-                            ctx_item_owned(
-                                ("script-action", i),
-                                a.name,
-                                cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                    this.close_context_menu(cx);
-                                    this.run_script_action(pane, script.clone(), vec![tgt.clone()], cx);
-                                }),
-                            )
-                            .into_any_element(),
-                        );
-                    }
+                for a in acts.into_iter().take(12) {
+                    let script = a.path.clone();
+                    let ts = targets.clone();
+                    nodes.push(mi(a.name, move |this, _, cx| {
+                        this.close_context_menu(cx);
+                        this.run_script_action(pane, script.clone(), ts.clone(), cx);
+                    }));
                 }
             }
-            items.push(ctx_separator().into_any_element());
-            let p = path.clone();
-            items.push(
-                ctx_item("Rename", cx.listener(move |this, _: &ClickEvent, window, cx| {
+            push_menu_sep(&mut nodes);
+
+            // --- clipboard ---
+            {
+                let ts = targets.clone();
+                let label = if many { format!("Copy {n} Items") } else { "Copy".to_string() };
+                nodes.push(mi(label, move |this, _, cx| {
+                    this.close_context_menu(cx);
+                    copy_files_to_pasteboard(&ts);
+                }));
+            }
+            {
+                let ts = targets.clone();
+                let label = if many { "Copy Paths" } else { "Copy Path" };
+                nodes.push(mi(label, move |this, _, cx| {
+                    let text = ts
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                    this.close_context_menu(cx);
+                }));
+            }
+            if !many && is_dir && paste_n > 0 {
+                let d = path.clone();
+                let label = if paste_n == 1 {
+                    "Paste 1 Item Into Folder".to_string()
+                } else {
+                    format!("Paste {paste_n} Items Into Folder")
+                };
+                nodes.push(mi(label, move |this, _, cx| {
+                    this.close_context_menu(cx);
+                    this.paste_into(pane, d.clone(), cx);
+                }));
+            }
+            push_menu_sep(&mut nodes);
+
+            // --- file ops ---
+            if !many {
+                let p = path.clone();
+                nodes.push(mi_hint("Rename", "↩", move |this, window, cx| {
                     this.close_context_menu(cx);
                     this.begin_rename(pane, p.clone(), window, cx);
-                }))
-                .into_any_element(),
-            );
-            let p = path.clone();
-            items.push(
-                ctx_item("Reveal in Finder", cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.close_context_menu(cx);
-                    let _ = Command::new("open").arg("-R").arg(&p).spawn();
-                }))
-                .into_any_element(),
-            );
-            let p = path.clone();
-            items.push(
-                ctx_item("Copy Path", cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()));
-                    this.close_context_menu(cx);
-                }))
-                .into_any_element(),
-            );
-            let p = path.clone();
-            let already = self.bookmarks.iter().any(|b| b == &p);
-            items.push(
-                ctx_item(
-                    if already { "Remove Bookmark" } else { "Add to Bookmarks" },
-                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.close_context_menu(cx);
-                        if already {
-                            this.remove_bookmark(&p, cx);
-                        } else {
-                            this.bookmark_path(p.clone(), cx);
-                        }
-                    }),
-                )
-                .into_any_element(),
-            );
-            // "Add to Group ▸" submenu (only when groups are enabled and exist).
-            if prefs().groups_enabled && !self.groups.is_empty() {
-                items.push(
-                    ctx_parent("Add to Group", cx.listener(|this, _: &ClickEvent, _, cx| {
-                        this.set_menu_view(MenuView::AddToGroup, cx);
-                    }))
-                    .into_any_element(),
-                );
+                }));
             }
-            let p = path.clone();
-            items.push(
-                ctx_item("Duplicate", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            {
+                let ts = targets.clone();
+                let label = if many { format!("Duplicate {n} Items") } else { "Duplicate".to_string() };
+                nodes.push(mi(label, move |this, _, cx| {
                     this.close_context_menu(cx);
-                    this.duplicate_entry(pane, p.clone(), cx);
-                }))
-                .into_any_element(),
-            );
-            let p = path.clone();
-            items.push(
-                ctx_item("Make Alias", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    for p in &ts {
+                        this.duplicate_entry(pane, p.clone(), cx);
+                    }
+                }));
+            }
+            if !many {
+                let p = path.clone();
+                nodes.push(mi("Make Alias", move |this, _, cx| {
                     this.close_context_menu(cx);
                     this.make_alias(pane, p.clone(), cx);
-                }))
-                .into_any_element(),
-            );
-            let p = path.clone();
-            items.push(
-                ctx_item("Compress", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                }));
+            }
+            {
+                let ts = targets.clone();
+                let label = if many { format!("Compress {n} Items") } else { "Compress".to_string() };
+                nodes.push(mi(label, move |this, _, cx| {
                     this.close_context_menu(cx);
-                    this.compress_entry(pane, p.clone(), cx);
-                }))
-                .into_any_element(),
-            );
-            // Move to Trash — kept high so it's always visible.
-            items.push(ctx_separator().into_any_element());
-            let p = path.clone();
-            items.push(
-                ctx_item("Move to Trash", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.compress_targets(pane, ts.clone(), cx);
+                }));
+            }
+            if !many {
+                let p = path.clone();
+                nodes.push(mi("Reveal in Finder", move |this, _, cx| {
                     this.close_context_menu(cx);
-                    this.move_to_trash(pane, p.clone(), cx);
-                }))
-                .into_any_element(),
-            );
-            items.push(ctx_separator().into_any_element());
-            items.push(
-                ctx_parent("Tags", cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.set_menu_view(MenuView::Tags, cx);
-                }))
-                .into_any_element(),
-            );
-            items.push(
-                ctx_parent("Quick Actions", cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.set_menu_view(MenuView::QuickActions, cx);
-                }))
-                .into_any_element(),
-            );
-            items.push(
-                ctx_parent("Services", cx.listener(|this, _: &ClickEvent, _, cx| {
-                    this.set_menu_view(MenuView::Services, cx);
-                }))
-                .into_any_element(),
-            );
-            items.push(ctx_separator().into_any_element());
+                    let _ = Command::new("open").arg("-R").arg(&p).spawn();
+                }));
+                let p = path.clone();
+                let already = self.bookmarks.iter().any(|b| b == &p);
+                let label = if already { "Remove Bookmark" } else { "Add to Bookmarks" };
+                nodes.push(mi(label, move |this, _, cx| {
+                    this.close_context_menu(cx);
+                    if already {
+                        this.remove_bookmark(&p, cx);
+                    } else {
+                        this.bookmark_path(p.clone(), cx);
+                    }
+                }));
+                // "Add to Group ▸" (only when groups are enabled and exist).
+                if prefs().groups_enabled && !self.groups.is_empty() {
+                    nodes.push(MenuNode::Sub {
+                        label: "Add to Group".into(),
+                        items: self.add_to_group_nodes(&path),
+                    });
+                }
+            }
+            push_menu_sep(&mut nodes);
+
+            // --- tags / actions ---
+            nodes.push(MenuNode::Sub {
+                label: "Tags".into(),
+                items: self.tags_nodes(pane, &targets),
+            });
+            if !many {
+                nodes.push(MenuNode::Sub {
+                    label: "Quick Actions".into(),
+                    items: self.quick_actions_nodes(pane, &path),
+                });
+                nodes.push(MenuNode::Sub {
+                    label: "Services".into(),
+                    items: self.services_nodes(&path, is_dir),
+                });
+            }
+            push_menu_sep(&mut nodes);
+
+            // --- destructive, at the bottom like Finder ---
+            {
+                let ts = targets.clone();
+                let label = if many { format!("Move {n} Items to Trash") } else { "Move to Trash".to_string() };
+                nodes.push(mi_danger(label, Some("⌫"), move |this, _, cx| {
+                    this.close_context_menu(cx);
+                    let mut any = false;
+                    for p in &ts {
+                        if trash_path(p) {
+                            any = true;
+                        }
+                    }
+                    if any {
+                        this.refresh_pane(pane, cx);
+                    }
+                }));
+            }
+            push_menu_sep(&mut nodes);
+        } else if paste_n > 0 {
+            let label = if paste_n == 1 { "Paste 1 Item".to_string() } else { format!("Paste {paste_n} Items") };
+            nodes.push(mi(label, move |this, _, cx| {
+                this.close_context_menu(cx);
+                let dir = this.tab(pane).current_dir.clone();
+                this.paste_into(pane, dir, cx);
+            }));
+            push_menu_sep(&mut nodes);
         }
-        items.push(
-            ctx_item("New Folder", cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.close_context_menu(cx);
-                this.new_folder(pane, window, cx);
-            }))
-            .into_any_element(),
-        );
-        items.push(
-            ctx_item("New File", cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.close_context_menu(cx);
-                this.new_file(pane, window, cx);
-            }))
-            .into_any_element(),
-        );
-        items
+        nodes.push(mi("New Folder", move |this, window, cx| {
+            this.close_context_menu(cx);
+            this.new_folder(pane, window, cx);
+        }));
+        nodes.push(mi("New File", move |this, window, cx| {
+            this.close_context_menu(cx);
+            this.new_file(pane, window, cx);
+        }));
+        nodes
     }
 
     /// The right-click menu for a remote (SFTP) tab: only actions that work
     /// over the network.
-    fn menu_remote(
-        &self,
-        pane: usize,
-        target: Option<(PathBuf, bool)>,
-        cx: &Context<Self>,
-    ) -> Vec<AnyElement> {
-        let mut items: Vec<AnyElement> = Vec::new();
+    fn menu_nodes_remote(&self, pane: usize, target: Option<(PathBuf, bool)>) -> Vec<MenuNode> {
+        let mut nodes: Vec<MenuNode> = Vec::new();
         if let Some((path, is_dir)) = target {
             let p = path.clone();
-            items.push(
-                ctx_item(
-                    if is_dir { "Open" } else { "Open (Download)" },
-                    cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.close_context_menu(cx);
-                        this.open_path(pane, p.clone(), is_dir, cx);
-                    }),
-                )
-                .into_any_element(),
-            );
+            let label = if is_dir { "Open" } else { "Open (Download)" };
+            nodes.push(mi(label, move |this, _, cx| {
+                this.close_context_menu(cx);
+                this.open_path(pane, p.clone(), is_dir, cx);
+            }));
             if !is_dir {
                 let p = path.clone();
-                items.push(
-                    ctx_item("Download to Downloads", cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.close_context_menu(cx);
-                        this.download_remote(pane, p.clone(), None, false, cx);
-                    }))
-                    .into_any_element(),
-                );
+                nodes.push(mi("Download to Downloads", move |this, _, cx| {
+                    this.close_context_menu(cx);
+                    this.download_remote(pane, p.clone(), None, false, cx);
+                }));
             }
-            items.push(ctx_separator().into_any_element());
+            nodes.push(MenuNode::Sep);
             let p = path.clone();
-            items.push(
-                ctx_item("Rename", cx.listener(move |this, _: &ClickEvent, window, cx| {
-                    this.close_context_menu(cx);
-                    this.begin_rename(pane, p.clone(), window, cx);
-                }))
-                .into_any_element(),
-            );
+            nodes.push(mi_hint("Rename", "↩", move |this, window, cx| {
+                this.close_context_menu(cx);
+                this.begin_rename(pane, p.clone(), window, cx);
+            }));
             let p = path.clone();
-            items.push(
-                ctx_item("Copy Path", cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()));
-                    this.close_context_menu(cx);
-                }))
-                .into_any_element(),
-            );
-            items.push(ctx_separator().into_any_element());
+            nodes.push(mi("Copy Path", move |this, _, cx| {
+                cx.write_to_clipboard(ClipboardItem::new_string(p.to_string_lossy().into_owned()));
+                this.close_context_menu(cx);
+            }));
+            nodes.push(MenuNode::Sep);
             let p = path.clone();
-            items.push(
-                ctx_item("Delete from Server", cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.close_context_menu(cx);
-                    this.confirm_delete = Some((pane, vec![p.clone()]));
-                    cx.notify();
-                }))
-                .into_any_element(),
-            );
-            items.push(ctx_separator().into_any_element());
+            nodes.push(mi_danger("Delete from Server", Some("⌫"), move |this, _, cx| {
+                this.close_context_menu(cx);
+                this.confirm_delete = Some((pane, vec![p.clone()]));
+                cx.notify();
+            }));
+            nodes.push(MenuNode::Sep);
         }
-        items.push(
-            ctx_item("New Folder", cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.close_context_menu(cx);
-                this.new_folder(pane, window, cx);
-            }))
-            .into_any_element(),
-        );
-        items.push(
-            ctx_item("New File", cx.listener(move |this, _: &ClickEvent, window, cx| {
-                this.close_context_menu(cx);
-                this.new_file(pane, window, cx);
-            }))
-            .into_any_element(),
-        );
-        items
+        nodes.push(mi("New Folder", move |this, window, cx| {
+            this.close_context_menu(cx);
+            this.new_folder(pane, window, cx);
+        }));
+        nodes.push(mi("New File", move |this, window, cx| {
+            this.close_context_menu(cx);
+            this.new_file(pane, window, cx);
+        }));
+        nodes
     }
 
-    /// "Open With" submenu — apps that can open the target (via LaunchServices).
-    fn menu_open_with(&self, _pane: usize, path: PathBuf, cx: &Context<Self>) -> Vec<AnyElement> {
-        let mut items: Vec<AnyElement> = vec![
-            ctx_item("‹ Back", cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.set_menu_view(MenuView::Root, cx);
-            }))
-            .into_any_element(),
-            ctx_separator().into_any_element(),
-        ];
-        let apps = apps_for_file(&path);
+    /// "Open With" flyout — apps that can open the target (via LaunchServices).
+    fn open_with_nodes(&self, path: &Path) -> Vec<MenuNode> {
+        let apps = apps_for_file(path);
         if apps.is_empty() {
-            items.push(ctx_disabled("No applications").into_any_element());
+            return vec![MenuNode::Disabled("No applications".into())];
         }
-        for (i, (name, app)) in apps.into_iter().enumerate() {
-            let p = path.clone();
-            items.push(
-                ctx_app(i, name, cx.listener(move |this, _: &ClickEvent, _, cx| {
+        apps.into_iter()
+            .map(|(name, app)| {
+                let p = path.to_path_buf();
+                mi(name, move |this, _, cx| {
                     this.open_with(&app, &p, cx);
-                }))
-                .into_any_element(),
-            );
-        }
-        items
+                })
+            })
+            .collect()
     }
 
-    /// "Add to Group" submenu — one row per group.
-    fn menu_add_to_group(&self, path: PathBuf, cx: &Context<Self>) -> Vec<AnyElement> {
-        let mut items: Vec<AnyElement> = vec![
-            ctx_item("‹ Back", cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.set_menu_view(MenuView::Root, cx);
-            }))
-            .into_any_element(),
-            ctx_separator().into_any_element(),
-        ];
+    /// "Add to Group" flyout — one row per group, ✓ when already a member.
+    fn add_to_group_nodes(&self, path: &Path) -> Vec<MenuNode> {
         if self.groups.is_empty() {
-            items.push(ctx_disabled("No groups").into_any_element());
+            return vec![MenuNode::Disabled("No groups".into())];
         }
-        for (i, g) in self.groups.iter().enumerate() {
-            let p = path.clone();
-            let has = g.paths.contains(&p);
-            let label = if has {
-                format!("✓ {}", g.name)
-            } else {
-                g.name.clone()
-            };
-            items.push(
-                ctx_app(i, label, cx.listener(move |this, _: &ClickEvent, _, cx| {
+        self.groups
+            .iter()
+            .enumerate()
+            .map(|(i, g)| {
+                let p = path.to_path_buf();
+                let has = g.paths.contains(&p);
+                mi_check(g.name.clone(), has, move |this, _, cx| {
                     this.close_context_menu(cx);
                     this.add_to_group(i, p.clone(), cx);
-                }))
-                .into_any_element(),
-            );
-        }
-        items
+                })
+            })
+            .collect()
     }
 
-    /// "Tags" submenu — Finder color labels.
-    fn menu_tags(&self, pane: usize, path: PathBuf, cx: &Context<Self>) -> Vec<AnyElement> {
+    /// "Tags" flyout — Finder color labels, applied to the whole selection.
+    fn tags_nodes(&self, pane: usize, targets: &[PathBuf]) -> Vec<MenuNode> {
         // (name, color dot, Finder label index)
         const TAGS: &[(&str, u32, u8)] = &[
             ("None", 0x6b6b73, 0),
@@ -5434,146 +5625,293 @@ impl Shuffle {
             ("Purple", 0xbf5af0, 3),
             ("Gray", 0x8e8e93, 1),
         ];
-        let mut items: Vec<AnyElement> = vec![
-            ctx_item("‹ Back", cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.set_menu_view(MenuView::Root, cx);
-            }))
-            .into_any_element(),
-            ctx_separator().into_any_element(),
-        ];
-        for (i, (name, color, label)) in TAGS.iter().enumerate() {
-            let (name, color, label) = (*name, *color, *label);
-            let p = path.clone();
-            items.push(
-                ctx_tag(i, name, color, cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.set_tag(pane, p.clone(), label, cx);
-                }))
-                .into_any_element(),
-            );
-        }
-        items
+        TAGS.iter()
+            .map(|&(name, color, label)| {
+                let ts = targets.to_vec();
+                mi_dot(name, color, move |this, _, cx| {
+                    for p in &ts {
+                        this.set_tag(pane, p.clone(), label, cx);
+                    }
+                })
+            })
+            .collect()
     }
 
-    /// "Quick Actions" submenu — image/PDF operations via built-in tools.
-    fn menu_quick_actions(&self, pane: usize, path: PathBuf, cx: &Context<Self>) -> Vec<AnyElement> {
-        let mut items: Vec<AnyElement> = vec![
-            ctx_item("‹ Back", cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.set_menu_view(MenuView::Root, cx);
-            }))
-            .into_any_element(),
-            ctx_separator().into_any_element(),
-        ];
-
-        let img = is_image(&path);
-        let pdf = is_pdf(&path);
+    /// "Quick Actions" flyout — image/PDF operations via built-in tools.
+    fn quick_actions_nodes(&self, pane: usize, path: &Path) -> Vec<MenuNode> {
+        let mut items: Vec<MenuNode> = Vec::new();
+        let img = is_image(path);
+        let pdf = is_pdf(path);
 
         if img {
-            let p = path.clone();
-            items.push(ctx_item("Rotate Left", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            let p = path.to_path_buf();
+            items.push(mi("Rotate Left", move |this, _, cx| {
                 this.rotate_image(pane, p.clone(), -90, cx);
-            })).into_any_element());
-            let p = path.clone();
-            items.push(ctx_item("Rotate Right", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            }));
+            let p = path.to_path_buf();
+            items.push(mi("Rotate Right", move |this, _, cx| {
                 this.rotate_image(pane, p.clone(), 90, cx);
-            })).into_any_element());
+            }));
         }
-
         if img || pdf {
-            let p = path.clone();
-            items.push(ctx_item("Markup", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            let p = path.to_path_buf();
+            items.push(mi("Markup", move |this, _, cx| {
                 this.close_context_menu(cx);
                 let _ = Command::new("open").arg("-a").arg("Preview").arg(&p).spawn();
-            })).into_any_element());
+            }));
         }
-
         if img {
-            let p = path.clone();
-            items.push(ctx_item("Create PDF", cx.listener(move |this, _: &ClickEvent, _, cx| {
+            let p = path.to_path_buf();
+            items.push(mi("Create PDF", move |this, _, cx| {
                 this.convert_image(pane, p.clone(), "pdf", "pdf", cx);
-            })).into_any_element());
+            }));
             // Convert Image to … (sips formats).
-            for (i, (label, fmt, ext)) in [
+            for (label, fmt, ext) in [
                 ("Convert to JPEG", "jpeg", "jpg"),
                 ("Convert to PNG", "png", "png"),
                 ("Convert to HEIC", "heic", "heic"),
-            ].iter().enumerate()
-            {
+            ] {
                 let (fmt, ext) = (fmt.to_string(), ext.to_string());
-                let p = path.clone();
-                items.push(
-                    ctx_app(100 + i, label.to_string(), cx.listener(move |this, _: &ClickEvent, _, cx| {
-                        this.convert_image(pane, p.clone(), &fmt, &ext, cx);
-                    }))
-                    .into_any_element(),
-                );
+                let p = path.to_path_buf();
+                items.push(mi(label, move |this, _, cx| {
+                    this.convert_image(pane, p.clone(), &fmt, &ext, cx);
+                }));
             }
             // Remove Background (native Vision helper, if compiled in).
             if removebg_path().is_some() {
-                let p = path.clone();
-                items.push(ctx_item("Remove Background", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                let p = path.to_path_buf();
+                items.push(mi("Remove Background", move |this, _, cx| {
                     this.remove_background(pane, p.clone(), cx);
-                })).into_any_element());
+                }));
             }
         }
-
-        if !img && !pdf {
-            items.push(ctx_disabled("No quick actions").into_any_element());
+        if items.is_empty() {
+            items.push(MenuNode::Disabled("No quick actions".into()));
         }
         items
     }
 
-    /// "Services" submenu — a useful, implementable subset of Finder's services.
-    fn menu_services(&self, _pane: usize, path: PathBuf, is_dir: bool, cx: &Context<Self>) -> Vec<AnyElement> {
-        let mut items: Vec<AnyElement> = vec![
-            ctx_item("‹ Back", cx.listener(|this, _: &ClickEvent, _, cx| {
-                this.set_menu_view(MenuView::Root, cx);
-            }))
-            .into_any_element(),
-            ctx_separator().into_any_element(),
-        ];
-
-        let mut any = false;
-        if is_image(&path) {
-            any = true;
-            let p = path.clone();
-            items.push(ctx_item("Set Desktop Picture", cx.listener(move |this, _: &ClickEvent, _, cx| {
+    /// "Services" flyout — a useful, implementable subset of Finder's services.
+    fn services_nodes(&self, path: &Path, is_dir: bool) -> Vec<MenuNode> {
+        let mut items: Vec<MenuNode> = Vec::new();
+        if is_image(path) {
+            let p = path.to_path_buf();
+            items.push(mi("Set Desktop Picture", move |this, _, cx| {
                 this.set_desktop_picture(p.clone(), cx);
-            })).into_any_element());
+            }));
         }
-
         // "Open in <terminal>" — opens the folder (or the file's folder).
-        let dir = if is_dir { path.clone() } else {
-            path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone())
+        let dir = if is_dir {
+            path.to_path_buf()
+        } else {
+            path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.to_path_buf())
         };
-        for (i, (name, app)) in installed_terminals().into_iter().enumerate() {
-            any = true;
+        for (name, app) in installed_terminals() {
             let d = dir.clone();
-            items.push(
-                ctx_app(200 + i, format!("Open in {name}"), cx.listener(move |this, _: &ClickEvent, _, cx| {
-                    this.close_context_menu(cx);
-                    let _ = Command::new("open").arg("-a").arg(&app).arg(&d).spawn();
-                }))
-                .into_any_element(),
-            );
+            items.push(mi(format!("Open in {name}"), move |this, _, cx| {
+                this.close_context_menu(cx);
+                let _ = Command::new("open").arg("-a").arg(&app).arg(&d).spawn();
+            }));
         }
-
-        if !any {
-            items.push(ctx_disabled("No services").into_any_element());
+        if items.is_empty() {
+            items.push(MenuNode::Disabled("No services".into()));
         }
         items
+    }
+
+    /// Paste the pasteboard's files into `dir` (background copy, then refresh).
+    fn paste_into(&mut self, pane: usize, dir: PathBuf, cx: &mut Context<Self>) {
+        let srcs = pasteboard_file_paths();
+        if srcs.is_empty() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_spawn(async move {
+                for src in srcs {
+                    let Some(name) = src.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                        continue;
+                    };
+                    let dest = unique_dest(&dir, &name);
+                    let _ = Command::new("ditto").arg(&src).arg(&dest).status();
+                }
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                if pane < this.panes.len() {
+                    this.refresh_pane(pane, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Compress one entry (ditto, like before) or several into one Archive.zip.
+    fn compress_targets(&mut self, pane: usize, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.len() == 1 {
+            let p = paths.into_iter().next().unwrap();
+            return self.compress_entry(pane, p, cx);
+        }
+        let Some(parent) = paths.first().and_then(|p| p.parent()).map(Path::to_path_buf) else {
+            return;
+        };
+        let dest = unique_child(&parent, "Archive.zip");
+        cx.spawn(async move |this, cx| {
+            cx.background_spawn(async move {
+                let names: Vec<String> = paths
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                    .collect();
+                // ditto can't zip several roots into one archive; zip can.
+                let _ = Command::new("zip")
+                    .current_dir(&parent)
+                    .args(["-r", "-q", "-y"])
+                    .arg(&dest)
+                    .args(&names)
+                    .status();
+            })
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                if pane < this.panes.len() {
+                    this.refresh_pane(pane, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// One row of the context menu. `sub` is `None` for root-panel rows,
+    /// `Some(j)` for the j-th row of the open flyout under root index `root`.
+    fn menu_row(&self, node: &MenuNode, selected: bool, root: usize, sub: Option<usize>, cx: &Context<Self>) -> AnyElement {
+        let t = theme();
+        // Unique per (root, sub) — flyouts never exceed 1023 rows.
+        let idx = root * 1024 + sub.map_or(0, |j| j + 1);
+        match node {
+            MenuNode::Sep => div()
+                .my_1()
+                .mx_2()
+                .h(px(1.0))
+                .bg(rgb(t.border_strong))
+                .into_any_element(),
+            MenuNode::Disabled(text) => div()
+                .h(px(MENU_ROW_H))
+                .mx_1()
+                .px_2()
+                .flex()
+                .items_center()
+                .text_color(rgb(t.text_dim))
+                .child(text.clone())
+                .into_any_element(),
+            MenuNode::Item { label, hint, dot, checked, danger, .. } => {
+                let mut row = div()
+                    .id(("cmrow", idx))
+                    .h(px(MENU_ROW_H))
+                    .mx_1()
+                    .px_2()
+                    .rounded_md()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .cursor_pointer()
+                    .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                        if *hovered {
+                            match sub {
+                                None => this.menu_hover_root(root, cx),
+                                Some(j) => this.menu_hover_sub(j, cx),
+                            }
+                        }
+                    }))
+                    .on_click(cx.listener(move |this, _: &ClickEvent, window, cx| {
+                        this.menu_invoke(root, sub, window, cx);
+                    }));
+                if selected {
+                    row = row.bg(rgb(t.selected));
+                }
+                if let Some(c) = *dot {
+                    row = row.child(div().flex_none().w(px(9.0)).h(px(9.0)).rounded_full().bg(rgb(c)));
+                }
+                if *checked {
+                    row = row.child(div().flex_none().text_color(rgb(t.text_dim)).child("✓"));
+                }
+                row = row.child(
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .when(*danger, |d| d.text_color(rgb(0xff5f57)))
+                        .child(label.clone()),
+                );
+                if let Some(h) = hint {
+                    row = row.child(div().flex_none().text_color(rgb(t.text_dim)).child(*h));
+                }
+                row.into_any_element()
+            }
+            MenuNode::Sub { label, .. } => div()
+                .id(("cmrow", idx))
+                .h(px(MENU_ROW_H))
+                .mx_1()
+                .px_2()
+                .rounded_md()
+                .flex()
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .when(selected, |d| d.bg(rgb(t.selected)))
+                .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                    if *hovered {
+                        this.menu_hover_root(root, cx);
+                    }
+                }))
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.menu_hover_root(root, cx);
+                }))
+                .child(div().flex_1().child(label.clone()))
+                .child(div().flex_none().text_color(rgb(t.text_dim)).child("›"))
+                .into_any_element(),
+        }
     }
 
     fn render_context_menu(&self, cx: &Context<Self>) -> impl IntoElement {
         let menu = self.context_menu.as_ref().expect("called only when open");
-        let pane = menu.pane;
-        let items: Vec<AnyElement> = match (menu.view, menu.target.clone()) {
-            (MenuView::OpenWith, Some((path, _))) => self.menu_open_with(pane, path, cx),
-            (MenuView::AddToGroup, Some((path, _))) => self.menu_add_to_group(path, cx),
-            (MenuView::Tags, Some((path, _))) => self.menu_tags(pane, path, cx),
-            (MenuView::QuickActions, Some((path, _))) => self.menu_quick_actions(pane, path, cx),
-            (MenuView::Services, Some((path, is_dir))) => self.menu_services(pane, path, is_dir, cx),
-            (_, target) => self.menu_root(pane, target, cx),
+        let ms = menu_style();
+        let panel = move |rows: Vec<AnyElement>| {
+            div()
+                .min_w(px(210.0))
+                .py_1()
+                .bg(ms.bg_rgba())
+                .text_color(rgb(ms.text))
+                .text_size(px(ms.font_px))
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(theme().border_strong))
+                .shadow_lg()
+                // Clicks inside the menu shouldn't close it via the backdrop.
+                .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
+                .children(rows)
         };
+        let root_rows: Vec<AnyElement> = menu
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(i, node)| {
+                // A submenu parent stays highlighted while its flyout is open.
+                let selected = (menu.sel_root == Some(i) && menu.sel_sub.is_none())
+                    || menu.open_sub == Some(i);
+                self.menu_row(node, selected, i, None, cx)
+            })
+            .collect();
+        // The open flyout: a second panel beside the root, its top aligned to
+        // the parent row (deterministic — every row height is fixed).
+        let flyout = menu.open_sub.and_then(|si| match menu.nodes.get(si) {
+            Some(MenuNode::Sub { items, .. }) => {
+                let off: f32 = menu.nodes[..si].iter().map(MenuNode::height).sum();
+                let rows: Vec<AnyElement> = items
+                    .iter()
+                    .enumerate()
+                    .map(|(j, node)| self.menu_row(node, menu.sel_sub == Some(j), si, Some(j), cx))
+                    .collect();
+                Some((off, rows))
+            }
+            _ => None,
+        });
 
         // Full-window backdrop: any click/right-click outside closes the menu.
         div()
@@ -5599,18 +5937,12 @@ impl Shuffle {
                     .snap_to_window()
                     .child(
                         div()
-                            .min_w(px(200.0))
-                            .py_1()
-                            .bg(menu_style().bg_rgba())
-                            .text_color(rgb(menu_style().text))
-                            .text_size(px(menu_style().font_px))
-                            .rounded_md()
-                            .border_1()
-                            .border_color(rgb(theme().border_strong))
-                            .shadow_lg()
-                            // Clicks inside the menu shouldn't close it via the backdrop.
-                            .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
-                            .children(items),
+                            .flex()
+                            .items_start()
+                            .child(panel(root_rows))
+                            .when_some(flyout, |el, (off, rows)| {
+                                el.child(panel(rows).mt(px(off)))
+                            }),
                     ),
             )
     }
@@ -7319,6 +7651,14 @@ impl Shuffle {
             return;
         }
 
+        // An open context menu is modal: arrows navigate, → / ← open and close
+        // flyouts, Enter invokes, Esc closes — and every other key is swallowed
+        // so keybindings can't fire underneath it.
+        if self.context_menu.is_some() {
+            self.menu_key(key, window, cx);
+            return;
+        }
+
         // Dispatch a configured keybinding. When the palette is open only its
         // own toggle acts, so typed characters still reach the query.
         let kc = canon_keystroke(ks);
@@ -7328,10 +7668,6 @@ impl Shuffle {
                 self.run_key_action(action, window, cx);
                 return;
             }
-        }
-        if key == "escape" && self.context_menu.is_some() {
-            self.close_context_menu(cx);
-            return;
         }
         if !self.palette_open {
             // Arrow keys move the selection within the active pane.
@@ -13000,6 +13336,137 @@ fn open_settings_window(cx: &mut App) {
 }
 
 /// One clickable row in the right-click context menu.
+/// Append a separator, unless the menu is empty or one is already last
+/// (sections are conditional, so back-to-back separators would show up).
+fn push_menu_sep(nodes: &mut Vec<MenuNode>) {
+    if !matches!(nodes.last(), None | Some(MenuNode::Sep)) {
+        nodes.push(MenuNode::Sep);
+    }
+}
+
+/// Move a menu highlight by `delta`, wrapping and skipping rows that can't be
+/// selected (separators, disabled). `None` starts from the appropriate end.
+fn step_menu_sel(nodes: &[MenuNode], cur: Option<usize>, delta: isize) -> Option<usize> {
+    let n = nodes.len() as isize;
+    if n == 0 {
+        return None;
+    }
+    let mut i = match cur {
+        Some(c) => c as isize,
+        None => {
+            if delta > 0 {
+                -1
+            } else {
+                n
+            }
+        }
+    };
+    for _ in 0..n {
+        i += delta;
+        if i < 0 {
+            i = n - 1;
+        } else if i >= n {
+            i = 0;
+        }
+        if nodes[i as usize].selectable() {
+            return Some(i as usize);
+        }
+    }
+    cur
+}
+
+/// Preview files with Quick Look (the same viewer as pressing Space).
+fn quick_look_paths(paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    let _ = Command::new("qlmanage")
+        .arg("-p")
+        .args(paths)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+}
+
+/// Put files on the general pasteboard as file URLs — Finder, Terminal, and
+/// every other app understand a paste after this (same writer the drag-out
+/// code uses).
+fn copy_files_to_pasteboard(paths: &[PathBuf]) {
+    use objc2::runtime::ProtocolObject;
+    use objc2_app_kit::{NSPasteboard, NSPasteboardWriting};
+    use objc2_foundation::NSArray;
+    let pb = NSPasteboard::generalPasteboard();
+    let _ = pb.clearContents();
+    let urls: Vec<_> = paths
+        .iter()
+        .map(|p| NSURL::fileURLWithPath(&NSString::from_str(&p.to_string_lossy())))
+        .collect();
+    let writers: Vec<&ProtocolObject<dyn NSPasteboardWriting>> =
+        urls.iter().map(|u| ProtocolObject::from_ref(&**u)).collect();
+    let _ = pb.writeObjects(&NSArray::from_slice(&writers));
+}
+
+/// Read file URLs off the general pasteboard (whatever Copy above — or
+/// Finder's ⌘C — put there).
+fn pasteboard_file_paths() -> Vec<PathBuf> {
+    use objc2_app_kit::NSPasteboard;
+    let pb = NSPasteboard::generalPasteboard();
+    let Some(items) = pb.pasteboardItems() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for item in items.iter() {
+        let Some(s) = item.stringForType(&NSString::from_str("public.file-url")) else {
+            continue;
+        };
+        if let Some(p) = file_url_to_path(&s.to_string()) {
+            if p.exists() {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// "file:///Users/x/My%20File.txt" → PathBuf (strips the host, percent-decodes).
+fn file_url_to_path(url: &str) -> Option<PathBuf> {
+    let rest = url.strip_prefix("file://")?;
+    // Skip a host component if present (file://localhost/…).
+    let rest = if rest.starts_with('/') {
+        rest
+    } else {
+        &rest[rest.find('/')?..]
+    };
+    let hex = |b: u8| -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    };
+    let bytes = rest.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (hex(bytes[i + 1]), hex(bytes[i + 2])) {
+                out.push(h * 16 + l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    let s = String::from_utf8(out).ok()?;
+    if s.is_empty() || s == "/" {
+        None
+    } else {
+        Some(PathBuf::from(s.trim_end_matches('/')))
+    }
+}
+
 fn ctx_item(
     label: &'static str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -13019,101 +13486,13 @@ fn ctx_item(
         .on_click(on_click)
 }
 
-/// Like [`ctx_item`] but with a runtime label (e.g. a user script's name).
-/// `id` is a stable element id; `label` is the shown text.
-fn ctx_item_owned(
-    id: impl Into<ElementId>,
-    label: String,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .flex()
-        .items_center()
-        .mx_1()
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .text_color(rgb(menu_style().text))
-        .hover(|s| s.bg(rgb(theme().selected)))
-        .child(label)
-        .on_click(on_click)
-}
 
 fn ctx_separator() -> impl IntoElement {
     div().my_1().mx_2().h(px(1.0)).bg(rgb(theme().border_strong))
 }
 
-/// A context-menu row that opens a submenu (shows a trailing "›").
-fn ctx_parent(
-    label: &'static str,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let t = theme();
-    div()
-        .id(label)
-        .flex()
-        .items_center()
-        .justify_between()
-        .gap_4()
-        .mx_1()
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .text_color(rgb(menu_style().text))
-        .hover(|s| s.bg(rgb(t.selected)))
-        .child(label)
-        .child(div().flex_none().text_color(rgb(t.text_dim)).child("›"))
-        .on_click(on_click)
-}
 
-/// An app row in the "Open With" submenu (dynamic label, unique id).
-fn ctx_app(
-    idx: usize,
-    name: String,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(("ow", idx))
-        .flex()
-        .items_center()
-        .mx_1()
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .text_color(rgb(menu_style().text))
-        .hover(|s| s.bg(rgb(theme().selected)))
-        .child(name)
-        .on_click(on_click)
-}
 
-/// A color row in the "Tags" submenu.
-fn ctx_tag(
-    idx: usize,
-    name: &'static str,
-    color: u32,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> impl IntoElement {
-    let t = theme();
-    div()
-        .id(("tag", idx))
-        .flex()
-        .items_center()
-        .gap_2()
-        .mx_1()
-        .px_3()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .text_color(rgb(t.text))
-        .hover(|s| s.bg(rgb(t.selected)))
-        .child(div().flex_none().w(px(10.0)).h(px(10.0)).rounded_full().bg(rgb(color)))
-        .child(name)
-        .on_click(on_click)
-}
 
 /// A non-interactive, dimmed context-menu row.
 fn ctx_disabled(label: &'static str) -> impl IntoElement {
@@ -13472,6 +13851,31 @@ fn apps_for_file(path: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// A non-existing child path under `dir` based on `base` (adds " 2", " 3" …).
+/// Like [`unique_child`], but keeps the extension at the end: pasting
+/// "alpha.txt" beside itself yields "alpha 2.txt", not "alpha.txt 2".
+fn unique_dest(dir: &Path, name: &str) -> PathBuf {
+    let first = dir.join(name);
+    if !first.exists() {
+        return first;
+    }
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s.to_string(), Some(e.to_string())),
+        _ => (name.to_string(), None),
+    };
+    let mut n = 2;
+    loop {
+        let candidate = match &ext {
+            Some(e) => format!("{stem} {n}.{e}"),
+            None => format!("{stem} {n}"),
+        };
+        let path = dir.join(candidate);
+        if !path.exists() {
+            return path;
+        }
+        n += 1;
+    }
+}
+
 fn unique_child(dir: &Path, base: &str) -> PathBuf {
     let mut path = dir.join(base);
     let mut n = 2;
