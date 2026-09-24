@@ -16629,22 +16629,43 @@ impl FileIndex {
         let threads = std::thread::available_parallelism()
             .map(|n| (n.get().saturating_sub(2)).max(2))
             .unwrap_or(2);
+        // `~/Library` is skipped as noise, but the cloud drives live inside
+        // it: Dropbox / Google Drive / OneDrive sync to
+        // `~/Library/CloudStorage/<Provider>` and iCloud Drive to
+        // `~/Library/Mobile Documents/com~apple~CloudDocs`. Walk that narrow
+        // path through Library and nothing else, so cloud files show up in
+        // the palette.
+        let home = home_dir();
+        let library = home.join("Library");
+        let mobile_docs = library.join("Mobile Documents");
         let walker = jwalk::WalkDir::new(&root)
             .skip_hidden(true)
             .parallelism(jwalk::Parallelism::RayonNewPool(threads))
-            .process_read_dir(|_depth, path, _state, children| {
+            .process_read_dir(move |_depth, path, _state, children| {
                 // The Go module cache (`~/go/pkg`, hundreds of thousands of files)
                 // is the single biggest source of index noise, but `pkg` is a
                 // legitimate source-dir name in Go projects — so only skip it
                 // when its parent directory is literally `go`.
                 let parent_is_go = path.file_name().is_some_and(|n| n == "go");
+                let at_library = path == library.as_path();
+                let at_mobile_docs = path == mobile_docs.as_path();
                 children.retain(|res| match res {
                     Ok(e) => {
+                        let name = e.file_name();
+                        let name = name.to_string_lossy();
+                        // Inside Library, descend only toward the cloud drives.
+                        if at_library {
+                            return e.file_type().is_dir()
+                                && (name == "CloudStorage" || name == "Mobile Documents");
+                        }
+                        if at_mobile_docs {
+                            return e.file_type().is_dir() && name == "com~apple~CloudDocs";
+                        }
                         if e.file_type().is_dir() {
-                            let name = e.file_name();
-                            let name = name.to_string_lossy();
                             if SKIP_DIRS.contains(&name.as_ref()) {
-                                return false;
+                                // The home-level Library alone passes, for the
+                                // cloud-drive path above.
+                                return name == "Library" && path == home.as_path();
                             }
                             if parent_is_go && name == "pkg" {
                                 return false;
