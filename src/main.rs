@@ -16,7 +16,7 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -757,6 +757,11 @@ enum KeyAction {
     RevealInFinder,
     Open,
     Refresh,
+    SwitchPane,
+    Share,
+    GetInfo,
+    BatchRename,
+    Undo,
     // Command-palette (Cmd+P) text editing. These act only while the palette is
     // open, so they're excluded from the normal (global) key dispatch.
     PaletteCursorStart,
@@ -785,6 +790,11 @@ impl KeyAction {
         KeyAction::RevealInFinder,
         KeyAction::Open,
         KeyAction::Refresh,
+        KeyAction::SwitchPane,
+        KeyAction::Share,
+        KeyAction::GetInfo,
+        KeyAction::BatchRename,
+        KeyAction::Undo,
         KeyAction::PaletteCursorStart,
         KeyAction::PaletteCursorEnd,
         KeyAction::PaletteSelectAll,
@@ -830,6 +840,11 @@ impl KeyAction {
             KeyAction::RevealInFinder => "reveal_in_finder",
             KeyAction::Open => "open",
             KeyAction::Refresh => "refresh",
+            KeyAction::SwitchPane => "switch_pane",
+            KeyAction::Share => "share",
+            KeyAction::GetInfo => "get_info",
+            KeyAction::BatchRename => "batch_rename",
+            KeyAction::Undo => "undo",
             KeyAction::PaletteCursorStart => "palette_cursor_start",
             KeyAction::PaletteCursorEnd => "palette_cursor_end",
             KeyAction::PaletteSelectAll => "palette_select_all",
@@ -858,6 +873,11 @@ impl KeyAction {
             KeyAction::RevealInFinder => "Reveal in Finder",
             KeyAction::Open => "Open",
             KeyAction::Refresh => "Refresh (syncs cloud folders)",
+            KeyAction::SwitchPane => "Switch split pane",
+            KeyAction::Share => "Share…",
+            KeyAction::GetInfo => "Get Info",
+            KeyAction::BatchRename => "Rename selected items…",
+            KeyAction::Undo => "Undo last file operation",
             KeyAction::PaletteCursorStart => "Palette: cursor to start",
             KeyAction::PaletteCursorEnd => "Palette: cursor to end",
             KeyAction::PaletteSelectAll => "Palette: select all",
@@ -876,6 +896,11 @@ impl KeyAction {
             KeyAction::Find => Some("/"),
             KeyAction::SelectAll => Some("cmd-a"),
             KeyAction::Refresh => Some("cmd-r"),
+            KeyAction::SwitchPane => Some("ctrl-tab"),
+            KeyAction::Share => Some("cmd-shift-s"),
+            KeyAction::GetInfo => Some("cmd-i"),
+            KeyAction::BatchRename => Some("cmd-shift-r"),
+            KeyAction::Undo => Some("cmd-z"),
             KeyAction::PaletteCursorStart => Some("cmd-left"),
             KeyAction::PaletteCursorEnd => Some("cmd-right"),
             KeyAction::PaletteSelectAll => Some("cmd-a"),
@@ -997,6 +1022,49 @@ fn canon_keystroke(ks: &gpui::Keystroke) -> String {
     }
     s.push_str(&ks.key);
     s
+}
+
+/// Stable names for persisting a tab's view and sort (session.txt).
+fn view_mode_key(v: ViewMode) -> &'static str {
+    match v {
+        ViewMode::List => "list",
+        ViewMode::Icons => "icons",
+        ViewMode::Columns => "columns",
+        ViewMode::Gallery => "gallery",
+    }
+}
+
+fn view_mode_from_key(s: &str) -> Option<ViewMode> {
+    Some(match s {
+        "list" => ViewMode::List,
+        "icons" => ViewMode::Icons,
+        "columns" => ViewMode::Columns,
+        "gallery" => ViewMode::Gallery,
+        _ => return None,
+    })
+}
+
+fn sort_key_name(k: SortKey) -> &'static str {
+    match k {
+        SortKey::None => "none",
+        SortKey::Name => "name",
+        SortKey::Kind => "kind",
+        SortKey::Modified => "modified",
+        SortKey::Created => "created",
+        SortKey::Size => "size",
+    }
+}
+
+fn sort_key_from_name(s: &str) -> Option<SortKey> {
+    Some(match s {
+        "none" => SortKey::None,
+        "name" => SortKey::Name,
+        "kind" => SortKey::Kind,
+        "modified" => SortKey::Modified,
+        "created" => SortKey::Created,
+        "size" => SortKey::Size,
+        _ => return None,
+    })
 }
 
 /// Which theme color a hex field edits.
@@ -3108,6 +3176,43 @@ impl ColumnWidths {
         }
     }
 
+    /// Lay the preferred widths out in a pane whose rows are `avail` px wide.
+    /// Name takes whatever is left (Finder / File Pilot style). When that would
+    /// squeeze it below a readable minimum, the other columns give way: first
+    /// shrinking toward their minimums, then Kind and then Date hide (width 0).
+    /// Only a pane too narrow even for Name + Size scrolls sideways. An
+    /// unmeasured pane (`avail` ≤ 0, first frame) gets the preferences as-is.
+    fn fit(self, avail: f32) -> ColumnWidths {
+        const NAME_MIN: f32 = 180.0;
+        if avail <= 0.0 {
+            return self;
+        }
+        let pref = [self.kind, self.date, self.size];
+        let min = [70.0f32.min(self.kind), 110.0f32.min(self.date), 60.0f32.min(self.size)];
+        for visible in [[true, true, true], [false, true, true], [false, false, true]] {
+            let pick = |v: [f32; 3]| (0..3).filter(|&i| visible[i]).map(|i| v[i]).sum::<f32>();
+            let (pref_sum, min_sum) = (pick(pref), pick(min));
+            let mut out = [0.0f32; 3];
+            if avail - pref_sum >= NAME_MIN {
+                for i in 0..3 {
+                    out[i] = if visible[i] { pref[i] } else { 0.0 };
+                }
+            } else if avail - min_sum >= NAME_MIN {
+                // Shrink each visible column in proportion to its give.
+                let need = NAME_MIN - (avail - pref_sum);
+                let give = (pref_sum - min_sum).max(1.0);
+                for i in 0..3 {
+                    out[i] = if visible[i] { pref[i] - (pref[i] - min[i]) * need / give } else { 0.0 };
+                }
+            } else {
+                continue;
+            }
+            let rest: f32 = out.iter().sum();
+            return ColumnWidths { name: avail - rest, kind: out[0], date: out[1], size: out[2] };
+        }
+        ColumnWidths { name: NAME_MIN, kind: 0.0, date: 0.0, size: min[2] }
+    }
+
     fn set(&mut self, col: Column, w: f32) {
         let w = w.max(MIN_COL_W);
         match col {
@@ -3122,9 +3227,16 @@ impl ColumnWidths {
 /// An in-progress column drag.
 #[derive(Clone, Copy)]
 struct Resize {
+    /// The column whose preferred width the drag changes.
     col: Column,
     start_x: f32,
     start_w: f32,
+    /// +1 grows `col` with the drag; -1 shrinks it (dragging Name's edge,
+    /// since Name just fills what the other columns leave).
+    sign: f32,
+    /// The column on the other side of the dragged boundary and its starting
+    /// width: it gives up what `col` gains, so the boundary tracks the cursor.
+    partner: Option<(Column, f32)>,
 }
 
 /// An in-progress scrollbar-thumb drag (which pane's list is being scrolled).
@@ -3692,12 +3804,23 @@ struct Shuffle {
     /// Cloud files with a download/evict in flight — shown with the syncing
     /// badge until the operation finishes and the listing is re-read.
     cloud_busy: HashSet<PathBuf>,
-    /// Status of the last cloud "Sync Now", shown as a neutral banner; the
-    /// generation lets a stale auto-dismiss leave a newer notice alone.
-    cloud_notice: Option<String>,
-    cloud_notice_gen: u64,
+    /// A short status message (cloud sync, undo, …) shown as a neutral
+    /// banner; the generation lets a stale auto-dismiss leave a newer one be.
+    notice: Option<String>,
+    notice_gen: u64,
     /// Bumped per Sync Now; the running sync watch stops when it's stale.
     cloud_sync_gen: u64,
+    /// Background copies/moves in flight (the progress panel).
+    jobs: Vec<FileJob>,
+    next_job_id: u64,
+    /// File operations that ⌘Z can reverse, newest last.
+    undo_stack: Vec<UndoOp>,
+    /// The tabs/split layout as last written to session.txt (skip rewrites).
+    saved_session: String,
+    /// The open Get Info card, if any.
+    info_panel: Option<InfoPanel>,
+    /// The open "Rename N Items" dialog, if any.
+    batch_rename: Option<BatchRename>,
 }
 
 /// Which cloud store a path belongs to, for routing download/evict.
@@ -3877,8 +4000,10 @@ impl Shuffle {
                             cx.notify();
                         }
                     }
-                    // Same tick: live-refresh the waterfall tree's folders.
+                    // Same tick: live-refresh the waterfall tree's folders, and
+                    // persist the tab/split layout if it changed.
                     this.refresh_waterfall(cx);
+                    this.save_session();
                 });
                 if alive.is_err() {
                     break;
@@ -3999,9 +4124,15 @@ impl Shuffle {
             waterfall_pending: HashSet::new(),
             waterfall_mtime: HashMap::new(),
             cloud_busy: HashSet::new(),
-            cloud_notice: None,
-            cloud_notice_gen: 0,
+            notice: None,
+            notice_gen: 0,
             cloud_sync_gen: 0,
+            jobs: Vec::new(),
+            next_job_id: 0,
+            undo_stack: Vec::new(),
+            saved_session: String::new(),
+            info_panel: None,
+            batch_rename: None,
         }
     }
 
@@ -4422,6 +4553,7 @@ impl Shuffle {
         }
         let path = unique_child(&self.tab(pane).current_dir, "untitled folder");
         if fs::create_dir(&path).is_ok() {
+            self.push_undo(UndoOp::Created(vec![path.clone()]));
             self.refresh_pane(pane, cx);
             self.reveal_and_rename(pane, path, window, cx);
         }
@@ -4434,6 +4566,7 @@ impl Shuffle {
         }
         let path = unique_child(&self.tab(pane).current_dir, "untitled file");
         if fs::File::create(&path).is_ok() {
+            self.push_undo(UndoOp::Created(vec![path.clone()]));
             self.refresh_pane(pane, cx);
             self.reveal_and_rename(pane, path, window, cx);
         }
@@ -4610,13 +4743,26 @@ impl Shuffle {
                     cx,
                 );
             } else {
-                for p in &paths {
-                    trash_path(p);
-                }
-                self.refresh_pane(pane, cx);
+                self.trash_items(pane, &paths, cx);
             }
         }
         cx.notify();
+    }
+
+    /// Move local items to the Trash, remembering where each went so ⌘Z can
+    /// put them back.
+    fn trash_items(&mut self, pane: usize, paths: &[PathBuf], cx: &mut Context<Self>) {
+        let moved: Vec<(PathBuf, PathBuf)> = paths
+            .iter()
+            .filter_map(|p| trash_path(p).map(|t| (p.clone(), t)))
+            .collect();
+        if moved.is_empty() {
+            return;
+        }
+        if moved.iter().all(|(_, t)| !t.as_os_str().is_empty()) {
+            self.push_undo(UndoOp::Trashed(moved));
+        }
+        self.refresh_pane(pane, cx);
     }
 
     /// Re-read every pane's directory (after a move that may affect two panes).
@@ -4627,27 +4773,790 @@ impl Shuffle {
         }
     }
 
-    /// Move `src` into `dest_dir` (a drag-and-drop between folders/panes). No-op
-    /// if it's already there; refuses to overwrite an existing item.
-    fn move_into(&mut self, dest_dir: PathBuf, src: PathBuf, cx: &mut Context<Self>) {
+    /// Move `srcs` into `dest_dir` (drag-and-drop between folders/panes, or
+    /// "Move to Other Pane") as one undoable background job. Skips items
+    /// already there, a folder into itself/its own descendant, and anything
+    /// whose name is taken in the destination (never clobbers).
+    fn move_items(&mut self, dest_dir: PathBuf, srcs: Vec<PathBuf>, cx: &mut Context<Self>) {
         if !dest_dir.is_dir() {
             return;
         }
-        let Some(name) = src.file_name() else { return };
-        // Already in this folder, or dropping a folder onto itself → ignore.
-        if src.parent() == Some(dest_dir.as_path()) || dest_dir == src {
+        let pairs: Vec<(PathBuf, PathBuf)> = srcs
+            .into_iter()
+            .filter(|src| {
+                src.parent() != Some(dest_dir.as_path()) && dest_dir != *src && !dest_dir.starts_with(src)
+            })
+            .filter_map(|src| {
+                let dest = dest_dir.join(src.file_name()?);
+                (fs::symlink_metadata(&dest).is_err()).then_some((src, dest))
+            })
+            .collect();
+        if pairs.is_empty() {
             return;
         }
-        if dest_dir.starts_with(&src) {
-            return; // can't move a folder into its own descendant
+        let label = format!("Moving {} to {}", items_label(pairs.len()), path_label(&dest_dir));
+        self.start_transfer(pairs, TransferKind::Move, label, true, cx);
+    }
+
+    /// Copy `srcs` into `dest_dir` as one undoable background job; a taken
+    /// name gets a Finder-style " 2" suffix instead of overwriting.
+    fn copy_items(&mut self, dest_dir: PathBuf, srcs: Vec<PathBuf>, cx: &mut Context<Self>) {
+        let mut taken: HashSet<PathBuf> = HashSet::new();
+        let pairs: Vec<(PathBuf, PathBuf)> = srcs
+            .into_iter()
+            .filter(|src| !dest_dir.starts_with(src))
+            .filter_map(|src| {
+                let name = src.file_name()?.to_string_lossy().into_owned();
+                let mut dest = unique_dest(&dest_dir, &name);
+                // Two sources with the same name in one batch.
+                let mut n = 2;
+                while taken.contains(&dest) {
+                    dest = unique_dest(&dest_dir, &format!("{name} {n}"));
+                    n += 1;
+                }
+                taken.insert(dest.clone());
+                Some((src, dest))
+            })
+            .collect();
+        if pairs.is_empty() {
+            return;
         }
-        let dest = dest_dir.join(name);
-        if dest.exists() {
-            return; // don't clobber existing files
+        let label = format!("Copying {} to {}", items_label(pairs.len()), path_label(&dest_dir));
+        self.start_transfer(pairs, TransferKind::Copy, label, true, cx);
+    }
+
+    /// Run a copy/move off the main thread. The progress panel shows it once
+    /// it has taken longer than a blink; when it finishes the panes reload and
+    /// (if `undoable`) the completed part lands on the undo stack.
+    fn start_transfer(
+        &mut self,
+        pairs: Vec<(PathBuf, PathBuf)>,
+        kind: TransferKind,
+        label: String,
+        undoable: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let prog = Arc::new(JobProgress::default());
+        self.next_job_id += 1;
+        let id = self.next_job_id;
+        let was_idle = self.jobs.is_empty();
+        self.jobs.push(FileJob { id, label, started: Instant::now(), prog: prog.clone() });
+        if was_idle {
+            // Repaint the progress panel while anything is running.
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor().timer(Duration::from_millis(150)).await;
+                let running = this.update(cx, |this, cx| {
+                    cx.notify();
+                    !this.jobs.is_empty()
+                });
+                if !matches!(running, Ok(true)) {
+                    break;
+                }
+            })
+            .detach();
         }
-        // `mv` handles cross-volume moves (copy + delete) too.
-        let _ = Command::new("mv").arg(&src).arg(&dest).status();
+        cx.spawn(async move |this, cx| {
+            let (done, err) = cx.background_spawn(async move { run_transfer(&pairs, kind, &prog) }).await;
+            let _ = this.update(cx, |this, cx| {
+                this.jobs.retain(|j| j.id != id);
+                if undoable && !done.is_empty() {
+                    this.push_undo(UndoOp::Transfer { kind, pairs: done });
+                }
+                if let Some(e) = err {
+                    this.remote_error = Some(e);
+                }
+                this.refresh_all_panes(cx);
+            });
+        })
+        .detach();
+    }
+
+    /// The tab/split layout, one line per fact: split ratio, active pane,
+    /// then per pane its active tab index and each local tab's view, sort and
+    /// folder (tab-separated; paths can't contain tabs in practice). Remote
+    /// tabs aren't restored.
+    fn session_string(&self) -> String {
+        let mut out = format!("ratio\t{}\nactive\t{}\n", self.split_ratio, self.active_pane);
+        for p in &self.panes {
+            let locals: Vec<(usize, &Tab)> = p.tabs.iter().enumerate().filter(|(_, t)| t.remote.is_none()).collect();
+            if locals.is_empty() {
+                continue;
+            }
+            let active = locals.iter().position(|(i, _)| *i == p.active).unwrap_or(0);
+            out.push_str(&format!("pane\t{active}\n"));
+            for (_, t) in locals {
+                out.push_str(&format!(
+                    "tab\t{}\t{}\t{}\t{}\n",
+                    view_mode_key(t.view),
+                    sort_key_name(t.sort_key),
+                    u8::from(t.sort_asc),
+                    t.current_dir.to_string_lossy()
+                ));
+            }
+        }
+        out
+    }
+
+    /// Write session.txt if the layout changed since the last write.
+    fn save_session(&mut self) {
+        let s = self.session_string();
+        if s != self.saved_session {
+            if let Some(path) = config_file("session.txt") {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                let _ = fs::write(&path, &s);
+            }
+            self.saved_session = s;
+        }
+    }
+
+    /// Reopen the tabs and split from the last run. Folders that no longer
+    /// exist are dropped; returns false (leaving the default single tab) if
+    /// nothing usable was saved.
+    fn restore_session(&mut self) -> bool {
+        let Some(text) = config_file("session.txt").and_then(|p| fs::read_to_string(p).ok()) else {
+            return false;
+        };
+        let (mut ratio, mut active_pane) = (0.5f32, 0usize);
+        let mut panes: Vec<Pane> = Vec::new();
+        let mut wanted_active: Vec<usize> = Vec::new();
+        for line in text.lines() {
+            let f: Vec<&str> = line.splitn(5, '\t').collect();
+            match f.as_slice() {
+                ["ratio", v] => ratio = v.parse().unwrap_or(0.5),
+                ["active", v] => active_pane = v.parse().unwrap_or(0),
+                ["pane", v] => {
+                    panes.push(Pane { tabs: Vec::new(), active: 0 });
+                    wanted_active.push(v.parse().unwrap_or(0));
+                }
+                ["tab", view, sort, asc, path] => {
+                    let dir = PathBuf::from(path);
+                    let Some(p) = panes.last_mut() else { continue };
+                    if !dir.is_dir() {
+                        continue;
+                    }
+                    let mut t = Tab::new(dir);
+                    t.view = view_mode_from_key(view).unwrap_or(t.view);
+                    if let Some(k) = sort_key_from_name(sort) {
+                        t.sort_key = k;
+                        t.sort_asc = *asc == "1";
+                    }
+                    p.tabs.push(t);
+                }
+                _ => {}
+            }
+        }
+        let mut kept = Vec::new();
+        for (p, want) in panes.into_iter().zip(wanted_active) {
+            if !p.tabs.is_empty() {
+                let active = want.min(p.tabs.len() - 1);
+                kept.push(Pane { active, ..p });
+            }
+        }
+        kept.truncate(2);
+        if kept.is_empty() {
+            return false;
+        }
+        self.active_pane = active_pane.min(kept.len() - 1);
+        self.split_ratio = ratio.clamp(0.2, 0.8);
+        self.panes = kept;
+        self.saved_session = self.session_string();
+        true
+    }
+
+    // ----- Get Info -----
+
+    /// Open the Get Info card for `path`. Cheap facts show at once; a folder's
+    /// total size and item count are summed in the background.
+    fn open_get_info(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        let md = fs::symlink_metadata(&path).ok();
+        let is_dir = md.as_ref().is_some_and(|m| m.is_dir());
+        let perms = md.as_ref().map(|m| {
+            use std::os::unix::fs::PermissionsExt;
+            mode_string(m.permissions().mode(), is_dir)
+        });
+        self.info_panel = Some(InfoPanel {
+            path: path.clone(),
+            is_dir,
+            info: gather_info(&path),
+            perms: perms.unwrap_or_default(),
+            owner: String::new(),
+            total: if is_dir { None } else { md.as_ref().map(|m| (m.len(), 1)) },
+        });
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let p = path.clone();
+            let (owner, total) = cx
+                .background_spawn(async move {
+                    let owner = Command::new("stat")
+                        .args(["-f", "%Su (%Sg)"])
+                        .arg(&p)
+                        .output()
+                        .ok()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                        .unwrap_or_default();
+                    (owner, is_dir.then(|| tree_size_count(&p)))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if let Some(ip) = this.info_panel.as_mut().filter(|ip| ip.path == path) {
+                    ip.owner = owner;
+                    if total.is_some() {
+                        ip.total = total;
+                    }
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn render_info_panel(&self, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let ip = self.info_panel.as_ref().expect("only when open");
+        let name = path_label(&ip.path);
+        let size = match ip.total {
+            Some((bytes, _)) if !ip.is_dir => format!("{} ({} bytes)", format_size(false, bytes), group_digits(bytes)),
+            Some((bytes, items)) => format!("{} on disk · {}", format_size(false, bytes), items_label(items as usize)),
+            None => "Calculating…".to_string(),
+        };
+        let row = |label: &str, value: String| {
+            div()
+                .flex()
+                .gap_3()
+                .child(div().flex_none().w(px(84.0)).text_color(rgb(t.text_dim)).child(label.to_string()))
+                .child(div().flex_1().min_w_0().text_color(rgb(t.text)).child(value))
+        };
+        let mut rows = div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .text_xs()
+            .child(row("Kind", ip.info.kind.clone()))
+            .child(row("Size", size))
+            .child(row("Where", ip.path.parent().map(|p| p.to_string_lossy().into_owned()).unwrap_or_default()))
+            .child(row("Created", ip.info.created.clone()))
+            .child(row("Modified", ip.info.modified.clone()))
+            .child(row("Last opened", ip.info.accessed.clone()));
+        if let Some(d) = &ip.info.dimensions {
+            rows = rows.child(row("Dimensions", d.clone()));
+        }
+        if let Some(c) = &ip.info.color {
+            rows = rows.child(row("Color", c.clone()));
+        }
+        if let Some(sig) = &ip.info.signed {
+            rows = rows.child(row("Signed", sig.clone()));
+        }
+        rows = rows
+            .child(row("Owner", if ip.owner.is_empty() { "…".into() } else { ip.owner.clone() }))
+            .child(row("Permissions", ip.perms.clone()));
+
+        let button = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(rgb(t.text))
+                .bg(rgb(t.hover))
+                .hover(|s| s.bg(rgb(t.selected)))
+                .child(label)
+        };
+        let copy_path = ip.path.clone();
+        let reveal = ip.path.clone();
+        modal_backdrop(cx.listener(|this, _, _, cx| {
+            this.info_panel = None;
+            cx.notify();
+        }))
+        .child(
+            div()
+                .w(px(420.0))
+                .flex()
+                .flex_col()
+                .gap_4()
+                .p_5()
+                .rounded_lg()
+                .bg(rgb(t.surface))
+                .border_1()
+                .border_color(rgb(t.border_strong))
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(icon_element_sized(&ip.path, ip.is_dir, 48.0))
+                        .child(div().flex_1().min_w_0().text_color(rgb(t.text)).child(name)),
+                )
+                .child(rows)
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(button("info-copy", "Copy Path").on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(copy_path.to_string_lossy().into_owned()));
+                            this.set_notice("Path copied".into(), cx);
+                        })))
+                        .child(button("info-reveal", "Reveal in Finder").on_click(move |_, _, _| {
+                            let _ = Command::new("open").arg("-R").arg(&reveal).spawn();
+                        }))
+                        .child(button("info-close", "Done").on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                            this.info_panel = None;
+                            cx.notify();
+                        }))),
+                ),
+        )
+    }
+
+    // ----- Batch rename -----
+
+    fn open_batch_rename(&mut self, pane: usize, targets: Vec<PathBuf>, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        // A single item is just an inline rename.
+        if targets.len() == 1 {
+            let p = targets[0].clone();
+            self.begin_rename(pane, p, window, cx);
+            return;
+        }
+        self.batch_rename = Some(BatchRename {
+            pane,
+            targets,
+            mode: BatchMode::Replace,
+            a: String::new(),
+            b: String::new(),
+            field: 0,
+            after: true,
+        });
+        window.focus(&self.focus);
+        cx.notify();
+    }
+
+    fn handle_batch_key(&mut self, ev: &KeyDownEvent, cx: &mut Context<Self>) {
+        let ks = &ev.keystroke;
+        let cmd = ks.modifiers.platform;
+        let Some(br) = self.batch_rename.as_mut() else { return };
+        let fields = br.mode.field_count();
+        match ks.key.as_str() {
+            "escape" => self.batch_rename = None,
+            "enter" => {
+                self.apply_batch_rename(cx);
+                return;
+            }
+            "tab" => br.field = (br.field + 1) % fields,
+            "backspace" => {
+                br.field_mut().pop();
+            }
+            "v" if cmd => {
+                if let Some(t) = cx.read_from_clipboard().and_then(|i| i.text()) {
+                    br.field_mut().push_str(t.lines().next().unwrap_or(""));
+                }
+            }
+            _ => {
+                if cmd {
+                    return;
+                }
+                if let Some(ch) = ks.key_char.as_ref() {
+                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
+                        br.field_mut().push_str(ch);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Rename every target per the dialog, as one undoable step. Refuses (and
+    /// keeps the dialog open) if any new name is invalid or collides.
+    fn apply_batch_rename(&mut self, cx: &mut Context<Self>) {
+        let Some(br) = self.batch_rename.as_ref() else { return };
+        let plan = br.plan();
+        if plan.iter().any(|(_, _, problem)| problem.is_some()) {
+            cx.notify();
+            return;
+        }
+        let pane = br.pane;
+        let moves: Vec<(PathBuf, PathBuf)> = plan
+            .into_iter()
+            .filter(|(from, to, _)| from != to)
+            .map(|(from, to, _)| (from, to))
+            .collect();
+        self.batch_rename = None;
+        // Two passes via temporary names, so swaps/cycles ("a"→"b", "b"→"a")
+        // can't trip over each other.
+        let mut staged: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
+        for (i, (from, to)) in moves.iter().enumerate() {
+            let tmp = from.with_file_name(format!(".shuffle-rename-{}-{i}", std::process::id()));
+            if fs::rename(from, &tmp).is_ok() {
+                staged.push((from.clone(), tmp, to.clone()));
+            }
+        }
+        let mut done = Vec::new();
+        for (from, tmp, to) in staged {
+            if fs::rename(&tmp, &to).is_ok() {
+                done.push((from, to));
+            } else {
+                let _ = fs::rename(&tmp, &from);
+            }
+        }
+        if !done.is_empty() {
+            let tab = self.tab_mut(pane);
+            for (from, to) in &done {
+                if tab.selection.remove(from) {
+                    tab.selection.insert(to.clone());
+                }
+            }
+            let n = done.len();
+            self.push_undo(UndoOp::Renamed(done));
+            self.set_notice(format!("Renamed {}", items_label(n)), cx);
+        }
+        self.refresh_pane(pane, cx);
+    }
+
+    fn render_batch_rename(&self, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let br = self.batch_rename.as_ref().expect("only when open");
+        let plan = br.plan();
+        let blocked = plan.iter().any(|(_, _, p)| p.is_some());
+
+        let mode_tab = |mode: BatchMode, label: &'static str| {
+            let on = br.mode == mode;
+            div()
+                .id(("batch-mode", mode as usize))
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_xs()
+                .text_color(rgb(if on { t.text } else { t.text_dim }))
+                .when(on, |s| s.bg(rgb(t.selected)))
+                .hover(|s| s.text_color(rgb(t.text)))
+                .child(label)
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(br) = this.batch_rename.as_mut() {
+                        br.mode = mode;
+                        br.field = 0;
+                    }
+                    cx.notify();
+                }))
+        };
+        let field = |ix: usize, label: &'static str, value: &str| {
+            let focused = br.field == ix;
+            div()
+                .id(("batch-field", ix))
+                .flex()
+                .items_center()
+                .gap_3()
+                .text_xs()
+                .child(div().flex_none().w(px(80.0)).text_color(rgb(t.text_dim)).child(label))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h(px(24.0))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .bg(rgb(t.bg))
+                        .border_1()
+                        .border_color(rgb(if focused { t.accent } else { t.border_strong }))
+                        .text_color(rgb(t.text))
+                        .child(value.to_string())
+                        .when(focused, |s| s.child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(t.text)))),
+                )
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    if let Some(br) = this.batch_rename.as_mut() {
+                        br.field = ix;
+                    }
+                    cx.notify();
+                }))
+        };
+        let fields = match br.mode {
+            BatchMode::Replace => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(field(0, "Find", &br.a))
+                .child(field(1, "Replace with", &br.b)),
+            BatchMode::Add => {
+                let after = br.after;
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child(field(0, "Text", &br.a))
+                    .child(
+                        div()
+                            .id("batch-where")
+                            .flex()
+                            .gap_3()
+                            .text_xs()
+                            .child(div().flex_none().w(px(80.0)).text_color(rgb(t.text_dim)).child("Where"))
+                            .child(
+                                div()
+                                    .cursor_pointer()
+                                    .text_color(rgb(t.accent))
+                                    .child(if after { "after name ▾" } else { "before name ▾" }),
+                            )
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                if let Some(br) = this.batch_rename.as_mut() {
+                                    br.after = !br.after;
+                                }
+                                cx.notify();
+                            })),
+                    )
+            }
+            BatchMode::Number => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(field(0, "Name", &br.a))
+                .child(field(1, "Start at", &br.b)),
+        };
+
+        let mut preview = div().flex().flex_col().gap_0p5().text_xs();
+        for (from, to, problem) in plan.iter().take(8) {
+            let bad = problem.is_some();
+            preview = preview.child(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().truncate().text_color(rgb(t.text_dim)).child(path_label(from)))
+                    .child(div().flex_none().text_color(rgb(t.text_dim)).child("→"))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(rgb(if bad { RENAME_ERR_COLOR } else { t.text }))
+                            .child(problem.map(String::from).unwrap_or_else(|| path_label(to))),
+                    ),
+            );
+        }
+        if plan.len() > 8 {
+            preview = preview.child(div().text_color(rgb(t.text_dim)).child(format!("…and {} more", plan.len() - 8)));
+        }
+
+        let n = br.targets.len();
+        modal_backdrop(cx.listener(|this, _, _, cx| {
+            this.batch_rename = None;
+            cx.notify();
+        }))
+        .child(
+            div()
+                .w(px(480.0))
+                .flex()
+                .flex_col()
+                .gap_4()
+                .p_5()
+                .rounded_lg()
+                .bg(rgb(t.surface))
+                .border_1()
+                .border_color(rgb(t.border_strong))
+                .shadow_lg()
+                .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
+                .child(div().text_color(rgb(t.text)).child(format!("Rename {n} Items")))
+                .child(
+                    div()
+                        .flex()
+                        .gap_1()
+                        .child(mode_tab(BatchMode::Replace, "Replace Text"))
+                        .child(mode_tab(BatchMode::Add, "Add Text"))
+                        .child(mode_tab(BatchMode::Number, "Number")),
+                )
+                .child(fields)
+                .child(preview)
+                .child(
+                    div()
+                        .flex()
+                        .justify_end()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("batch-cancel")
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_color(rgb(t.text))
+                                .bg(rgb(t.hover))
+                                .hover(|s| s.bg(rgb(t.selected)))
+                                .child("Cancel")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.batch_rename = None;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            div()
+                                .id("batch-apply")
+                                .px_3()
+                                .py_1()
+                                .rounded_md()
+                                .cursor_pointer()
+                                .text_color(rgb(0xffffff))
+                                .bg(rgb(t.accent))
+                                .when(blocked, |s| s.opacity(0.5))
+                                .child("Rename")
+                                .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                                    this.apply_batch_rename(cx);
+                                })),
+                        ),
+                ),
+        )
+    }
+
+    fn push_undo(&mut self, op: UndoOp) {
+        self.undo_stack.push(op);
+        if self.undo_stack.len() > 100 {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    /// ⌘Z: reverse the most recent file operation, if everything it touched
+    /// is still where it left it (otherwise say why and leave it alone).
+    fn undo_last(&mut self, cx: &mut Context<Self>) {
+        let Some(op) = self.undo_stack.pop() else {
+            self.set_notice("Nothing to undo".into(), cx);
+            return;
+        };
+        let what = op.label();
+        let gone = |p: &Path| fs::symlink_metadata(p).is_err();
+        match op {
+            UndoOp::Transfer { kind: TransferKind::Copy, pairs } => {
+                for (_, c) in pairs.iter().filter(|(_, d)| !gone(d)) {
+                    trash_path(c);
+                }
+            }
+            UndoOp::Created(paths) => {
+                for p in paths.iter().filter(|p| !gone(p)) {
+                    trash_path(p);
+                }
+            }
+            UndoOp::Transfer { kind: TransferKind::Move, pairs } | UndoOp::Trashed(pairs) => {
+                // Move each item back from where it went (pairs are
+                // (original, current)); skip any that moved on since or whose
+                // original spot has been taken.
+                let back: Vec<(PathBuf, PathBuf)> = pairs
+                    .into_iter()
+                    .filter(|(orig, now)| !gone(now) && gone(orig))
+                    .map(|(orig, now)| (now, orig))
+                    .collect();
+                if back.is_empty() {
+                    self.set_notice(format!("Couldn't undo {what} — the items have moved since"), cx);
+                    return;
+                }
+                self.start_transfer(back, TransferKind::Move, format!("Undoing {what}"), false, cx);
+            }
+            UndoOp::Renamed(pairs) => {
+                // Rename back in reverse order (via temporary names, so a
+                // batch that swapped names undoes cleanly too).
+                let mut staged = Vec::new();
+                for (i, (from, to)) in pairs.iter().enumerate().rev() {
+                    let case_only = from.to_string_lossy().to_lowercase() == to.to_string_lossy().to_lowercase();
+                    if gone(to) || (!case_only && !gone(from) && !pairs.iter().any(|(_, t)| t == from)) {
+                        continue;
+                    }
+                    let tmp = to.with_file_name(format!(".shuffle-undo-{}-{i}", std::process::id()));
+                    if fs::rename(to, &tmp).is_ok() {
+                        staged.push((tmp, from.clone(), to.clone()));
+                    }
+                }
+                if staged.is_empty() {
+                    self.set_notice(format!("Couldn't undo {what}"), cx);
+                    return;
+                }
+                for (tmp, from, to) in staged {
+                    if fs::rename(&tmp, &from).is_err() {
+                        let _ = fs::rename(&tmp, &to);
+                    }
+                }
+            }
+        }
+        self.set_notice(format!("Undid {what}"), cx);
         self.refresh_all_panes(cx);
+    }
+
+    /// Floating panel (bottom-right) listing copies/moves that have run for
+    /// more than a moment: label, bar, bytes, and a cancel button.
+    fn render_jobs_panel(&self) -> Option<AnyElement> {
+        let t = theme();
+        let visible: Vec<&FileJob> = self
+            .jobs
+            .iter()
+            .filter(|j| j.started.elapsed() >= Duration::from_millis(500))
+            .collect();
+        if visible.is_empty() {
+            return None;
+        }
+        let mut panel = div()
+            .absolute()
+            .bottom(px(16.0))
+            .right(px(16.0))
+            .w(px(340.0))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .bg(rgb(t.surface))
+            .border_1()
+            .border_color(rgb(t.border_strong))
+            .shadow_lg()
+            .text_xs()
+            .text_color(rgb(t.text));
+        for j in visible {
+            let total = j.prog.total.load(Ordering::Relaxed);
+            let done = j.prog.done.load(Ordering::Relaxed).min(total);
+            let frac = if total > 0 { done as f32 / total as f32 } else { 0.0 };
+            let detail = if total > 0 {
+                format!("{} of {}", format_size(false, done), format_size(false, total))
+            } else {
+                "Preparing…".to_string()
+            };
+            let prog = j.prog.clone();
+            panel = panel.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().flex_1().min_w_0().truncate().child(j.label.clone()))
+                            .child(
+                                div()
+                                    .id(("job-cancel", j.id as usize))
+                                    .flex_none()
+                                    .px_1()
+                                    .rounded_sm()
+                                    .cursor_pointer()
+                                    .text_color(rgb(t.text_dim))
+                                    .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+                                    .child("✕")
+                                    .on_click(move |_, _, _| prog.cancel.store(true, Ordering::Relaxed)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .h(px(4.0))
+                            .w_full()
+                            .rounded_full()
+                            .bg(rgb(t.border))
+                            .child(div().h_full().w(relative(frac)).rounded_full().bg(rgb(t.accent))),
+                    )
+                    .child(div().text_color(rgb(t.text_dim)).child(detail)),
+            );
+        }
+        Some(panel.into_any_element())
     }
 
     /// Handle files dropped onto `dest_dir` in `pane`: upload to the server when
@@ -4660,9 +5569,7 @@ impl Shuffle {
                 self.upload_to_remote(pane, dest_dir, locals, cx);
             }
         } else {
-            for s in srcs {
-                self.move_into(dest_dir.clone(), s, cx);
-            }
+            self.move_items(dest_dir, srcs, cx);
         }
     }
 
@@ -4758,6 +5665,7 @@ impl Shuffle {
                         .file_name()
                         .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(new));
                     if (case_only || !dest.exists()) && fs::rename(&r.path, &dest).is_ok() {
+                        self.push_undo(UndoOp::Renamed(vec![(r.path.clone(), dest.clone())]));
                         let tab = self.tab_mut(r.pane);
                         if tab.selection.remove(&r.path) {
                             tab.selection.insert(dest.clone());
@@ -4976,8 +5884,9 @@ impl Shuffle {
             None => format!("{stem} copy"),
         };
         let dest = unique_child(parent, &base);
-        let _ = Command::new("cp").arg("-R").arg(&path).arg(&dest).status();
-        self.refresh_pane(pane, cx);
+        let _ = pane;
+        let label = format!("Duplicating {}", path_label(&path));
+        self.start_transfer(vec![(path, dest)], TransferKind::Copy, label, true, cx);
     }
 
     /// Make a Finder alias of `path` in the same folder.
@@ -5254,7 +6163,7 @@ impl Shuffle {
         // A newer Sync Now (or leaving the folder) retires this session's watch.
         self.cloud_sync_gen += 1;
         let sync_gen = self.cloud_sync_gen;
-        self.set_cloud_notice_sticky(format!("Syncing changes with {name}…"), cx);
+        self.set_notice_sticky(format!("Syncing changes with {name}…"), cx);
         cx.spawn(async move |this, cx| {
             let d = dir.clone();
             let t = tool.clone();
@@ -5274,7 +6183,7 @@ impl Shuffle {
                     };
                     let _ = this.update(cx, |this, cx| {
                         if this.cloud_sync_gen == sync_gen {
-                            this.cloud_notice = None;
+                            this.notice = None;
                             this.remote_error = Some(err);
                             cx.notify();
                         }
@@ -5285,7 +6194,7 @@ impl Shuffle {
             if launched {
                 let _ = this.update(cx, |this, cx| {
                     if this.cloud_sync_gen == sync_gen {
-                        this.set_cloud_notice_sticky(format!("Started {name} — syncing changes…"), cx);
+                        this.set_notice_sticky(format!("Started {name} — syncing changes…"), cx);
                     }
                 });
             }
@@ -5309,7 +6218,7 @@ impl Shuffle {
                         && pane < this.panes.len()
                         && this.tab(pane).current_dir == dir;
                     if !ok && this.cloud_sync_gen == sync_gen {
-                        this.cloud_notice = None;
+                        this.notice = None;
                         cx.notify();
                     }
                     ok
@@ -5341,7 +6250,7 @@ impl Shuffle {
                             let s = if changes == 1 { "" } else { "s" };
                             format!("Synced {changes} change{s} from {name} — folder updated.")
                         };
-                        this.set_cloud_notice(msg, cx);
+                        this.set_notice(msg, cx);
                     } else {
                         let mut msg = format!("Syncing changes with {name}…");
                         if busy > 0 {
@@ -5349,7 +6258,7 @@ impl Shuffle {
                         } else if changes > 0 {
                             msg.push_str(&format!(" {changes} so far"));
                         }
-                        this.set_cloud_notice_sticky(msg, cx);
+                        this.set_notice_sticky(msg, cx);
                     }
                 });
                 if settled || idle || timed_out {
@@ -5361,14 +6270,14 @@ impl Shuffle {
     }
 
     /// Show a cloud status banner that clears itself after a few seconds.
-    fn set_cloud_notice(&mut self, msg: String, cx: &mut Context<Self>) {
-        self.set_cloud_notice_sticky(msg, cx);
-        let gen_ = self.cloud_notice_gen;
+    fn set_notice(&mut self, msg: String, cx: &mut Context<Self>) {
+        self.set_notice_sticky(msg, cx);
+        let gen_ = self.notice_gen;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(Duration::from_secs(6)).await;
             let _ = this.update(cx, |this, cx| {
-                if this.cloud_notice_gen == gen_ {
-                    this.cloud_notice = None;
+                if this.notice_gen == gen_ {
+                    this.notice = None;
                     cx.notify();
                 }
             });
@@ -5378,10 +6287,10 @@ impl Shuffle {
 
     /// Show a cloud status banner that stays until replaced (cancels any
     /// pending auto-dismiss of the previous one).
-    fn set_cloud_notice_sticky(&mut self, msg: String, cx: &mut Context<Self>) {
-        self.cloud_notice_gen += 1;
-        if self.cloud_notice.as_deref() != Some(msg.as_str()) {
-            self.cloud_notice = Some(msg);
+    fn set_notice_sticky(&mut self, msg: String, cx: &mut Context<Self>) {
+        self.notice_gen += 1;
+        if self.notice.as_deref() != Some(msg.as_str()) {
+            self.notice = Some(msg);
             cx.notify();
         }
     }
@@ -5664,6 +6573,36 @@ impl Shuffle {
             }
             if !many {
                 let p = path.clone();
+                nodes.push(mi("Get Info", move |this, _, cx| {
+                    this.open_get_info(p.clone(), cx);
+                }));
+            } else {
+                let ts = targets.clone();
+                nodes.push(mi(format!("Rename {n} Items…"), move |this, window, cx| {
+                    this.open_batch_rename(pane, ts.clone(), window, cx);
+                }));
+            }
+            // Split view: send the selection straight to the other pane's folder.
+            if self.panes.len() > 1 {
+                let other = 1 - pane.min(1);
+                let other_tab = self.tab(other);
+                if other_tab.remote.is_none() {
+                    let dest = other_tab.current_dir.clone();
+                    let where_ = path_label(&dest);
+                    let (ts, d) = (targets.clone(), dest.clone());
+                    nodes.push(mi(format!("Copy to “{where_}”"), move |this, _, cx| {
+                        this.close_context_menu(cx);
+                        this.copy_items(d.clone(), ts.clone(), cx);
+                    }));
+                    let (ts, d) = (targets.clone(), dest);
+                    nodes.push(mi(format!("Move to “{where_}”"), move |this, _, cx| {
+                        this.close_context_menu(cx);
+                        this.move_items(d.clone(), ts.clone(), cx);
+                    }));
+                }
+            }
+            if !many {
+                let p = path.clone();
                 nodes.push(mi("Reveal in Finder", move |this, _, cx| {
                     this.close_context_menu(cx);
                     let _ = Command::new("open").arg("-R").arg(&p).spawn();
@@ -5712,15 +6651,7 @@ impl Shuffle {
                 let label = if many { format!("Move {n} Items to Trash") } else { "Move to Trash".to_string() };
                 nodes.push(mi_danger(label, Some("⌫"), move |this, _, cx| {
                     this.close_context_menu(cx);
-                    let mut any = false;
-                    for p in &ts {
-                        if trash_path(p) {
-                            any = true;
-                        }
-                    }
-                    if any {
-                        this.refresh_pane(pane, cx);
-                    }
+                    this.trash_items(pane, &ts, cx);
                 }));
             }
             push_menu_sep(&mut nodes);
@@ -5738,7 +6669,7 @@ impl Shuffle {
             let dir = self.tab(pane).current_dir.clone();
             if cloud_kind(&dir).is_some() && cloudctl_path().is_some() {
                 let label = format!("Sync Now with {}", cloud_provider_name(&dir));
-                nodes.push(mi_hint(label, "⌘R", move |this, _, cx| {
+                nodes.push(mi(label, move |this, _, cx| {
                     this.cloud_sync(pane, dir.clone(), cx);
                 }));
                 push_menu_sep(&mut nodes);
@@ -5947,29 +6878,12 @@ impl Shuffle {
     }
 
     /// Paste the pasteboard's files into `dir` (background copy, then refresh).
-    fn paste_into(&mut self, pane: usize, dir: PathBuf, cx: &mut Context<Self>) {
+    fn paste_into(&mut self, _pane: usize, dir: PathBuf, cx: &mut Context<Self>) {
         let srcs = pasteboard_file_paths();
         if srcs.is_empty() {
             return;
         }
-        cx.spawn(async move |this, cx| {
-            cx.background_spawn(async move {
-                for src in srcs {
-                    let Some(name) = src.file_name().map(|n| n.to_string_lossy().into_owned()) else {
-                        continue;
-                    };
-                    let dest = unique_dest(&dir, &name);
-                    let _ = Command::new("ditto").arg(&src).arg(&dest).status();
-                }
-            })
-            .await;
-            let _ = this.update(cx, |this, cx| {
-                if pane < this.panes.len() {
-                    this.refresh_pane(pane, cx);
-                }
-            });
-        })
-        .detach();
+        self.copy_items(dir, srcs, cx);
     }
 
     /// Compress one entry (ditto, like before) or several into one Archive.zip.
@@ -7748,6 +8662,18 @@ impl Shuffle {
         }
     }
 
+    /// What a keyboard action acts on: the selection (sorted), else the
+    /// focused item.
+    fn action_targets(&self, pane: usize) -> Vec<PathBuf> {
+        let tab = self.tab(pane);
+        let mut v: Vec<PathBuf> = tab.selection.iter().cloned().collect();
+        if v.is_empty() {
+            v.extend(tab.anchor.clone());
+        }
+        v.sort();
+        v
+    }
+
     /// Run a bound key action against the active pane.
     fn run_key_action(&mut self, action: KeyAction, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.active_pane;
@@ -7804,6 +8730,34 @@ impl Shuffle {
                     self.open_path(pane, p, is_dir, cx);
                 }
             }
+            KeyAction::SwitchPane => {
+                if self.panes.len() > 1 {
+                    self.active_pane = (self.active_pane + 1) % self.panes.len();
+                    cx.notify();
+                }
+            }
+            KeyAction::Share => {
+                let targets = self.action_targets(pane);
+                if !targets.is_empty() && self.tab(pane).remote.is_none() {
+                    let m = window.mouse_position();
+                    if let Some(view) = ns_view_ptr(window) {
+                        show_share_picker(view, (f32::from(m.x), f32::from(m.y)), &targets);
+                    }
+                }
+            }
+            KeyAction::GetInfo => {
+                let targets = self.action_targets(pane);
+                if let Some(p) = targets.first() {
+                    self.open_get_info(p.clone(), cx);
+                }
+            }
+            KeyAction::BatchRename => {
+                let targets = self.action_targets(pane);
+                if !targets.is_empty() && self.tab(pane).remote.is_none() {
+                    self.open_batch_rename(pane, targets, window, cx);
+                }
+            }
+            KeyAction::Undo => self.undo_last(cx),
             KeyAction::Refresh => {
                 let dir = self.tab(pane).current_dir.clone();
                 if self.tab(pane).remote.is_none() && cloud_kind(&dir).is_some() && cloudctl_path().is_some() {
@@ -7857,6 +8811,20 @@ impl Shuffle {
                     cx.notify();
                 }
                 _ => {}
+            }
+            return;
+        }
+
+        // The batch-rename dialog captures typing while open.
+        if self.batch_rename.is_some() {
+            self.handle_batch_key(ev, cx);
+            return;
+        }
+        // Get Info: Esc / Enter / ⌘I close it; other keys are swallowed.
+        if self.info_panel.is_some() {
+            if matches!(key, "escape" | "enter") || (cmd && key == "i") {
+                self.info_panel = None;
+                cx.notify();
             }
             return;
         }
@@ -8534,19 +9502,56 @@ impl Shuffle {
         }
     }
 
-    fn begin_resize(&mut self, col: Column, x: f32) {
-        self.resize = Some(Resize {
-            col,
-            start_x: x,
-            start_w: self.widths.get(col),
-        });
+    /// Start a header drag. Widths start from what's on screen (the fitted
+    /// layout), so a squeezed column doesn't jump to its preference. Name's
+    /// edge moves the boundary with the next visible column instead.
+    fn begin_resize(&mut self, pane: usize, col: Column, x: f32) {
+        let f = self.fitted_widths(pane);
+        let order = [Column::Kind, Column::Date, Column::Size];
+        // The next visible column to the right of `col`.
+        let next = |after: Column| {
+            order
+                .into_iter()
+                .skip_while(|c| *c != after)
+                .skip(1)
+                .find(|c| f.get(*c) > 0.0)
+        };
+        let resize = match col {
+            // Name has no width of its own (it fills): its edge shrinks/grows
+            // the next column instead.
+            Column::Name => {
+                let n = order.into_iter().find(|c| f.get(*c) > 0.0).unwrap_or(Column::Size);
+                Resize { col: n, start_x: x, start_w: f.get(n), sign: -1.0, partner: None }
+            }
+            c => Resize {
+                col: c,
+                start_x: x,
+                start_w: f.get(c),
+                sign: 1.0,
+                // The last column's edge is the pane edge: widen it leftward.
+                partner: next(c).map(|n| (n, f.get(n))),
+            },
+        };
+        let last = resize.col == Column::Size || (resize.partner.is_none() && col != Column::Name);
+        self.resize = Some(if last && col != Column::Name { Resize { sign: -1.0, ..resize } } else { resize });
     }
 
     fn update_resize(&mut self, x: f32, cx: &mut Context<Self>) {
         if let Some(resize) = self.resize {
-            self.widths.set(resize.col, resize.start_w + (x - resize.start_x));
+            let dx = x - resize.start_x;
+            self.widths.set(resize.col, resize.start_w + resize.sign * dx);
+            if let Some((p, w)) = resize.partner {
+                self.widths.set(p, w - dx);
+            }
             cx.notify();
         }
+    }
+
+    /// The List-view column widths as laid out in this pane right now.
+    fn fitted_widths(&self, pane: usize) -> ColumnWidths {
+        let vw = f64::from(self.tab(pane).h_scroll.bounds().size.width) as f32;
+        // Rows are padded px_3 on both sides.
+        self.widths.fit(vw - 24.0)
     }
 
     fn end_resize(&mut self) {
@@ -9938,7 +10943,7 @@ impl Shuffle {
             // shifted by any horizontal column scroll.)
             let hx = f64::from(tab.h_scroll.offset().x) as f32;
             let name_x0 = x0 + hx + 12.0;
-            if x < name_x0 || x >= name_x0 + self.widths.name {
+            if x < name_x0 || x >= name_x0 + self.fitted_widths(pane).name {
                 return Some((pane, None));
             }
             // ".." row targets the parent; entries target real folders only.
@@ -11924,6 +12929,72 @@ impl Shuffle {
                         }),
                     )
             });
+        // Share the selection (the native share popover, at the button).
+        let share_btn = div()
+            .id(("tb-share", pane))
+            .flex_none()
+            .w(px(24.0))
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_md()
+            .when(has_sel, |d| d.text_color(rgb(t.text_dim)))
+            .when(!has_sel, |d| d.text_color(Theme::alpha(t.text_dim, 0x66)))
+            .child("⇪")
+            .tooltip(tip(if has_sel { "Share… (⇧⌘S)" } else { "Share (select an item first)" }))
+            .when(has_sel, |d| {
+                d.cursor_pointer()
+                    .hover(|s| s.bg(rgb(t.hover)).text_color(rgb(t.text)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                            this.active_pane = pane;
+                            let targets = this.action_targets(pane);
+                            if let Some(view) = ns_view_ptr(window) {
+                                let at = (f32::from(ev.position.x), f32::from(ev.position.y));
+                                show_share_picker(view, at, &targets);
+                            }
+                            cx.stop_propagation();
+                        }),
+                    )
+            });
+        // A narrow pane (split view) can't fit every button beside a useful
+        // breadcrumb: the four view buttons fold into one that opens a view
+        // menu, and in a very narrow pane the extras step aside too.
+        let w = pane_width(pane);
+        let compact = w > 0.0 && w < 640.0;
+        let tiny = w > 0.0 && w < 470.0;
+        let (cur_glyph, cur_name) = match view {
+            ViewMode::List => ("☰", "List"),
+            ViewMode::Icons => ("▦", "Icons"),
+            ViewMode::Columns => ("▥", "Columns"),
+            ViewMode::Gallery => ("▭", "Gallery"),
+        };
+        let view_menu_btn = div()
+            .id(("view-menu", pane))
+            .flex_none()
+            .px_1p5()
+            .h(px(22.0))
+            .flex()
+            .items_center()
+            .gap_0p5()
+            .rounded_md()
+            .cursor_pointer()
+            .text_color(rgb(t.text))
+            .bg(rgb(t.surface))
+            .hover(|s| s.bg(rgb(t.hover)))
+            .child(cur_glyph)
+            .child(div().text_xs().text_color(rgb(t.text_dim)).child("▾"))
+            .tooltip(tip(format!("View: {cur_name}")))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                    let (x, y) = (f32::from(ev.position.x), f32::from(ev.position.y));
+                    this.open_view_menu(pane, x, y, cx);
+                    cx.stop_propagation();
+                }),
+            );
         div()
             .flex_none()
             .flex()
@@ -11931,13 +13002,47 @@ impl Shuffle {
             .gap_1()
             .pl_2()
             // File actions (hidden on remote tabs, which can't create locally).
-            .when(!is_remote, |d| d.child(new_folder_btn).child(delete_btn))
-            .child(search_btn)
-            .child(btn("view-list", "☰", "List view", ViewMode::List, cx))
-            .child(btn("view-icons", "▦", "Icon view", ViewMode::Icons, cx))
-            .child(btn("view-columns", "▥", "Column view", ViewMode::Columns, cx))
-            .child(btn("view-gallery", "▭", "Gallery view", ViewMode::Gallery, cx))
+            .when(!is_remote && !tiny, |d| d.child(new_folder_btn))
+            .when(!is_remote, |d| d.child(share_btn).child(delete_btn))
+            .when(!tiny, |d| d.child(search_btn))
+            .when(compact, |d| d.child(view_menu_btn))
+            .when(!compact, |d| {
+                d.child(btn("view-list", "☰", "List view", ViewMode::List, cx))
+                    .child(btn("view-icons", "▦", "Icon view", ViewMode::Icons, cx))
+                    .child(btn("view-columns", "▥", "Column view", ViewMode::Columns, cx))
+                    .child(btn("view-gallery", "▭", "Gallery view", ViewMode::Gallery, cx))
+            })
             .child(sort_btn)
+    }
+
+    /// The compact toolbar's view picker, as a small menu at (x, y).
+    fn open_view_menu(&mut self, pane: usize, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.active_pane = pane;
+        let cur = self.tab(pane).view;
+        let nodes = [
+            (ViewMode::List, "as List"),
+            (ViewMode::Icons, "as Icons"),
+            (ViewMode::Columns, "as Columns"),
+            (ViewMode::Gallery, "as Gallery"),
+        ]
+        .into_iter()
+        .map(|(mode, label)| {
+            mi_check(label, cur == mode, move |this, _, cx| {
+                this.close_context_menu(cx);
+                this.set_view(pane, mode, cx);
+            })
+        })
+        .collect();
+        self.context_menu = Some(ContextMenu {
+            x,
+            y,
+            target: None,
+            nodes,
+            open_sub: None,
+            sel_root: None,
+            sel_sub: None,
+        });
+        cx.notify();
     }
 
     /// Clickable breadcrumb for a pane. Segments up to and including the current
@@ -12181,6 +13286,14 @@ impl Shuffle {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                    // Double-click puts the divider back in the middle.
+                    if ev.click_count >= 2 {
+                        this.divider_drag = None;
+                        this.split_ratio = 0.5;
+                        this.save_session();
+                        cx.notify();
+                        return;
+                    }
                     // Remember where the grab started and the ratio at that
                     // moment, so the drag continues from the current size rather
                     // than snapping the divider to the cursor.
@@ -12345,19 +13458,41 @@ impl Shuffle {
         };
 
         div()
+            .relative()
             .flex()
             .flex_col()
             .min_w_0()
             .h_full()
-            .when(split && active, |s| {
-                s.border_color(rgb(theme().accent))
+            // Measure the pane each frame (the toolbar compacts when narrow).
+            .child(
+                gpui::canvas(
+                    move |bounds, _, _| {
+                        PANE_W.with(|w| w.borrow_mut()[pane.min(1)] = f64::from(bounds.size.width) as f32)
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .size_full(),
+            )
+            // When split, a thin accent rule marks the pane that keystrokes
+            // go to (the other pane's rule is transparent so nothing shifts).
+            .when(split, |s| {
+                s.border_t_2().border_color(if active {
+                    rgb(theme().accent)
+                } else {
+                    rgba(0x00000000)
+                })
             })
-            // Clicking anywhere in the pane focuses it (and leaves terminal input).
+            // Clicking anywhere in the pane focuses it (and leaves terminal
+            // input) — repaint right away so the focus rule follows the click.
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, _, _| {
-                    this.active_pane = pane;
-                    this.term_focused = false;
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    if this.active_pane != pane || this.term_focused {
+                        this.active_pane = pane;
+                        this.term_focused = false;
+                        cx.notify();
+                    }
                 }),
             )
             .child(self.render_tab_strip(pane, cx))
@@ -12393,8 +13528,8 @@ impl Shuffle {
         let scroll = tab.scroll_handle.clone();
         let h_scroll = tab.h_scroll.clone();
         let pane_dir = tab.current_dir.clone();
-        let total_w =
-            self.widths.name + self.widths.kind + self.widths.date + self.widths.size + 24.0;
+        let fw = self.fitted_widths(pane);
+        let total_w = fw.name + fw.kind + fw.date + fw.size + 24.0;
         // Only engage horizontal scrolling when the columns genuinely overflow
         // the pane — otherwise the small x component of a trackpad flick
         // jiggles the listing sideways while scrolling vertically.
@@ -12486,7 +13621,7 @@ impl Shuffle {
                     ("file-list", pane),
                     item_count,
                     cx.processor(move |this, range: std::ops::Range<usize>, _window, cx| {
-                        let widths = this.widths;
+                        let widths = this.fitted_widths(pane);
                         let tab = this.tab(pane);
                         let find_active = tab.find_query.is_some();
                         let has_parent = !find_active && prefs().show_parent && tab.current_dir.parent().is_some();
@@ -12963,7 +14098,7 @@ impl Shuffle {
 
     /// The non-scrolling header row with labels and drag-to-resize handles.
     fn column_header(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
-        let w = self.widths;
+        let w = self.fitted_widths(pane);
         let key = self.tab(pane).sort_key;
         let asc = self.tab(pane).sort_asc;
         div()
@@ -12977,9 +14112,16 @@ impl Shuffle {
             .border_b_1()
             .border_color(rgb(theme().border))
             .child(header_cell(pane, "Name", w.name, Column::Name, SortKey::Name, ICON_W + 8.0, false, key, asc, cx))
-            .child(header_cell(pane, "Kind", w.kind, Column::Kind, SortKey::Kind, 0.0, false, key, asc, cx))
-            .child(header_cell(pane, "Date Modified", w.date, Column::Date, SortKey::Modified, 0.0, false, key, asc, cx))
-            .child(header_cell(pane, "Size", w.size, Column::Size, SortKey::Size, 0.0, true, key, asc, cx))
+            // Columns squeezed out of a narrow pane have width 0 → not drawn.
+            .when(w.kind > 0.0, |d| {
+                d.child(header_cell(pane, "Kind", w.kind, Column::Kind, SortKey::Kind, 0.0, false, key, asc, cx))
+            })
+            .when(w.date > 0.0, |d| {
+                d.child(header_cell(pane, "Date Modified", w.date, Column::Date, SortKey::Modified, 0.0, false, key, asc, cx))
+            })
+            .when(w.size > 0.0, |d| {
+                d.child(header_cell(pane, "Size", w.size, Column::Size, SortKey::Size, 0.0, true, key, asc, cx))
+            })
             // Slack space after the last column.
             .child(div().flex_1())
     }
@@ -13047,7 +14189,7 @@ fn header_cell(
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                        this.begin_resize(col, f64::from(ev.position.x) as f32);
+                        this.begin_resize(pane, col, f64::from(ev.position.x) as f32);
                         cx.notify();
                     }),
                 ),
@@ -13213,7 +14355,7 @@ impl Render for Shuffle {
         }
 
         // Cloud sync status (neutral; clears itself).
-        if let Some(msg) = self.cloud_notice.clone() {
+        if let Some(msg) = self.notice.clone() {
             root = root.child(
                 div()
                     .flex_none()
@@ -13237,6 +14379,9 @@ impl Render for Shuffle {
             root = root.child(self.render_terminal_bar(cx));
         }
 
+        if let Some(panel) = self.render_jobs_panel() {
+            root = root.child(panel);
+        }
         if self.palette_open {
             root = root.child(self.render_palette(cx));
         }
@@ -13248,6 +14393,12 @@ impl Render for Shuffle {
         }
         if self.confirm_delete.is_some() {
             root = root.child(self.render_confirm_delete(cx));
+        }
+        if self.info_panel.is_some() {
+            root = root.child(self.render_info_panel(cx));
+        }
+        if self.batch_rename.is_some() {
+            root = root.child(self.render_batch_rename(cx));
         }
         if self.ssh_ask {
             root = root.child(self.render_ssh_prompt(cx));
@@ -14190,11 +15341,345 @@ fn unique_child(dir: &Path, base: &str) -> PathBuf {
 }
 
 /// Move a path to the macOS Trash (recoverable). Returns whether it succeeded.
-fn trash_path(path: &Path) -> bool {
+// ----- Get Info / batch rename models ---------------------------------------
+
+/// The open Get Info card.
+struct InfoPanel {
+    path: PathBuf,
+    is_dir: bool,
+    info: FileInfo,
+    /// "rwxr-xr-x"-style, with the octal mode.
+    perms: String,
+    /// "user (group)", filled in off-thread.
+    owner: String,
+    /// (bytes, items); `None` while a folder is still being summed.
+    total: Option<(u64, u64)>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum BatchMode {
+    /// Find → replace within each name (extension untouched).
+    Replace,
+    /// Insert text before or after each name (before the extension).
+    Add,
+    /// "Name 1", "Name 2", … keeping each extension.
+    Number,
+}
+
+impl BatchMode {
+    fn field_count(self) -> usize {
+        match self {
+            BatchMode::Add => 1,
+            _ => 2,
+        }
+    }
+}
+
+/// The open "Rename N Items" dialog.
+struct BatchRename {
+    pane: usize,
+    targets: Vec<PathBuf>,
+    mode: BatchMode,
+    /// Find / Text / Name, depending on the mode.
+    a: String,
+    /// Replace with / Start at.
+    b: String,
+    /// Which text field has focus (0 = `a`, 1 = `b`).
+    field: usize,
+    /// Add mode: insert after the name (else before).
+    after: bool,
+}
+
+impl BatchRename {
+    fn field_mut(&mut self) -> &mut String {
+        if self.field == 0 { &mut self.a } else { &mut self.b }
+    }
+
+    /// The rename each target would get: (from, to, problem). A problem
+    /// (bad character, empty, or two items ending up with the same name /
+    /// clobbering an item not being renamed) blocks applying.
+    fn plan(&self) -> Vec<(PathBuf, PathBuf, Option<&'static str>)> {
+        let start: u64 = self.b.trim().parse().unwrap_or(1);
+        let mut out: Vec<(PathBuf, PathBuf, Option<&'static str>)> = self
+            .targets
+            .iter()
+            .enumerate()
+            .map(|(i, from)| {
+                let name = from.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                // Folders and dotfiles have no extension to protect.
+                let (stem, ext) = match name.rfind('.') {
+                    Some(dot) if dot > 0 && !from.is_dir() => (name[..dot].to_string(), name[dot..].to_string()),
+                    _ => (name.clone(), String::new()),
+                };
+                let new = match self.mode {
+                    BatchMode::Replace if self.a.is_empty() => name.clone(),
+                    BatchMode::Replace => format!("{}{ext}", stem.replace(&self.a, &self.b)),
+                    BatchMode::Add if self.after => format!("{stem}{}{ext}", self.a),
+                    BatchMode::Add => format!("{}{stem}{ext}", self.a),
+                    BatchMode::Number if self.a.trim().is_empty() => name.clone(),
+                    BatchMode::Number => format!("{} {}{ext}", self.a.trim(), start + i as u64),
+                };
+                let problem = if new.trim().is_empty() {
+                    Some("Name can't be empty")
+                } else if new.contains('/') || new.contains(':') {
+                    Some("Names can’t contain “/” or “:”")
+                } else {
+                    None
+                };
+                (from.clone(), from.with_file_name(new), problem)
+            })
+            .collect();
+        // Collisions: within the batch, or with an existing item that isn't
+        // itself being renamed away.
+        let mut seen: HashMap<String, usize> = HashMap::new();
+        for (from, to, _) in &out {
+            if from != to {
+                *seen.entry(to.to_string_lossy().to_lowercase()).or_default() += 1;
+            }
+        }
+        let renamed_away: HashSet<String> = out
+            .iter()
+            .filter(|(f, t, _)| f != t)
+            .map(|(f, _, _)| f.to_string_lossy().to_lowercase())
+            .collect();
+        for (from, to, problem) in out.iter_mut() {
+            if problem.is_some() || from == to {
+                continue;
+            }
+            let key = to.to_string_lossy().to_lowercase();
+            let case_only = key == from.to_string_lossy().to_lowercase();
+            if seen.get(&key).copied().unwrap_or(0) > 1
+                || (!case_only && to.exists() && !renamed_away.contains(&key))
+            {
+                *problem = Some("Name already taken");
+            }
+        }
+        out
+    }
+}
+
+/// `ls -l`-style permission string plus octal, e.g. "rwxr-xr-x (755)".
+fn mode_string(mode: u32, is_dir: bool) -> String {
+    let bits = ['r', 'w', 'x'];
+    let mut s = String::from(if is_dir { "d" } else { "-" });
+    for i in (0..9).rev() {
+        s.push(if mode & (1 << i) != 0 { bits[(8 - i) % 3] } else { '-' });
+    }
+    format!("{s} ({:o})", mode & 0o777)
+}
+
+/// Total bytes and item count under a folder (symlinks not followed).
+fn tree_size_count(p: &Path) -> (u64, u64) {
+    let (mut bytes, mut items) = (0u64, 0u64);
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for e in rd.flatten() {
+            items += 1;
+            match e.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(e.path()),
+                Ok(ft) if ft.is_file() => bytes += e.metadata().map(|m| m.len()).unwrap_or(0),
+                _ => {}
+            }
+        }
+    }
+    (bytes, items)
+}
+
+/// 1234567 → "1,234,567".
+fn group_digits(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// Dimmed full-window backdrop for a modal card; clicking it runs `on_dismiss`.
+fn modal_backdrop(on_dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static) -> gpui::Div {
+    div()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .bottom_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(rgba(0x00000066))
+        .occlude()
+        .on_mouse_down(MouseButton::Left, on_dismiss)
+}
+
+// ----- file operations: background copy/move with progress + undo ---------
+
+#[derive(Clone, Copy, PartialEq)]
+enum TransferKind {
+    Copy,
+    Move,
+}
+
+/// Live progress of one background copy/move, shared with its worker.
+#[derive(Default)]
+struct JobProgress {
+    /// Bytes that need copying (0 while sizing, and for pure renames).
+    total: AtomicU64,
+    done: AtomicU64,
+    cancel: AtomicBool,
+}
+
+/// A copy/move in flight, as the progress panel sees it.
+struct FileJob {
+    id: u64,
+    label: String,
+    started: Instant,
+    prog: Arc<JobProgress>,
+}
+
+/// A reversible file operation. Paths are (original, where it is now).
+enum UndoOp {
+    Transfer { kind: TransferKind, pairs: Vec<(PathBuf, PathBuf)> },
+    Renamed(Vec<(PathBuf, PathBuf)>),
+    Trashed(Vec<(PathBuf, PathBuf)>),
+    /// Items this app created (new folder/file, archive): undo trashes them.
+    Created(Vec<PathBuf>),
+}
+
+impl UndoOp {
+    fn label(&self) -> String {
+        match self {
+            UndoOp::Transfer { kind: TransferKind::Copy, pairs } => format!("Copy of {}", items_label(pairs.len())),
+            UndoOp::Transfer { kind: TransferKind::Move, pairs } => format!("Move of {}", items_label(pairs.len())),
+            UndoOp::Renamed(p) if p.len() == 1 => format!("Rename of “{}”", path_label(&p[0].1)),
+            UndoOp::Renamed(p) => format!("Rename of {}", items_label(p.len())),
+            UndoOp::Trashed(p) => format!("Move to Trash of {}", items_label(p.len())),
+            UndoOp::Created(p) if p.len() == 1 => format!("New “{}”", path_label(&p[0])),
+            UndoOp::Created(p) => format!("New {}", items_label(p.len())),
+        }
+    }
+}
+
+/// "1 item" / "3 items".
+fn items_label(n: usize) -> String {
+    if n == 1 { "1 item".to_string() } else { format!("{n} items") }
+}
+
+/// Copy or move each (src, dest) pair. Moves try a rename first (instant on
+/// the same volume) and fall back to copy + delete across volumes. Copies use
+/// `fs::copy`, which clones on APFS (instant, no extra space) and otherwise
+/// copies data + xattrs. Never overwrites: a pair whose destination exists is
+/// skipped. Stops after the current file when cancelled (the half-done item is
+/// removed). Returns the pairs that completed, and the last error if any.
+fn run_transfer(
+    pairs: &[(PathBuf, PathBuf)],
+    kind: TransferKind,
+    prog: &JobProgress,
+) -> (Vec<(PathBuf, PathBuf)>, Option<String>) {
+    const EXDEV: i32 = 18;
+    let mut done = Vec::new();
+    let mut err = None;
+    let mut to_copy = Vec::new();
+    for (src, dest) in pairs {
+        if fs::symlink_metadata(dest).is_ok() {
+            err = Some(format!("“{}” already exists there", path_label(dest)));
+            continue;
+        }
+        if kind == TransferKind::Move {
+            match fs::rename(src, dest) {
+                Ok(()) => {
+                    done.push((src.clone(), dest.clone()));
+                    continue;
+                }
+                Err(e) if e.raw_os_error() == Some(EXDEV) => {}
+                Err(e) => {
+                    err = Some(format!("Couldn't move “{}”: {e}", path_label(src)));
+                    continue;
+                }
+            }
+        }
+        to_copy.push((src.clone(), dest.clone()));
+    }
+    prog.total.store(to_copy.iter().map(|(s, _)| tree_size(s)).sum(), Ordering::Relaxed);
+    for (src, dest) in to_copy {
+        match copy_tree(&src, &dest, prog) {
+            Ok(()) => {
+                if kind == TransferKind::Move {
+                    let removed = if fs::symlink_metadata(&src).is_ok_and(|m| m.is_dir()) {
+                        fs::remove_dir_all(&src)
+                    } else {
+                        fs::remove_file(&src)
+                    };
+                    if let Err(e) = removed {
+                        err = Some(format!("Copied “{}” but couldn't remove the original: {e}", path_label(&src)));
+                    }
+                }
+                done.push((src, dest));
+            }
+            Err(e) => {
+                let _ = if fs::symlink_metadata(&dest).is_ok_and(|m| m.is_dir()) {
+                    fs::remove_dir_all(&dest)
+                } else {
+                    fs::remove_file(&dest)
+                };
+                if prog.cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                err = Some(format!("Couldn't copy “{}”: {e}", path_label(&src)));
+            }
+        }
+    }
+    (done, err)
+}
+
+/// Total bytes of regular files under `p` (symlinks not followed).
+fn tree_size(p: &Path) -> u64 {
+    match fs::symlink_metadata(p) {
+        Ok(m) if m.is_dir() => fs::read_dir(p)
+            .map(|rd| rd.flatten().map(|e| tree_size(&e.path())).sum())
+            .unwrap_or(0),
+        Ok(m) if m.is_file() => m.len(),
+        _ => 0,
+    }
+}
+
+/// Recursively copy `src` to `dest` (which must not exist), keeping symlinks
+/// as symlinks, permissions, and file modification dates.
+fn copy_tree(src: &Path, dest: &Path, prog: &JobProgress) -> std::io::Result<()> {
+    if prog.cancel.load(Ordering::Relaxed) {
+        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+    }
+    let md = fs::symlink_metadata(src)?;
+    if md.file_type().is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(src)?, dest)?;
+    } else if md.is_dir() {
+        fs::create_dir(dest)?;
+        for e in fs::read_dir(src)? {
+            let e = e?;
+            copy_tree(&e.path(), &dest.join(e.file_name()), prog)?;
+        }
+        fs::set_permissions(dest, md.permissions())?;
+    } else {
+        fs::copy(src, dest)?;
+        if let (Ok(f), Ok(t)) = (fs::File::options().write(true).open(dest), md.modified()) {
+            let _ = f.set_modified(t);
+        }
+        prog.done.fetch_add(md.len(), Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Move `path` to the Trash; returns where it landed there (for undo).
+fn trash_path(path: &Path) -> Option<PathBuf> {
     let ns_path = NSString::from_str(&path.to_string_lossy());
     let url = NSURL::fileURLWithPath(&ns_path);
     let fm = NSFileManager::defaultManager();
-    fm.trashItemAtURL_resultingItemURL_error(&url, None).is_ok()
+    let mut out = None;
+    fm.trashItemAtURL_resultingItemURL_error(&url, Some(&mut out)).ok()?;
+    Some(out.and_then(|u| u.path()).map(|p| PathBuf::from(p.to_string())).unwrap_or_default())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14399,8 +15884,8 @@ fn file_row(
                 )
                 .child(name_el),
         )
-        // Kind.
-        .child(
+        // Kind (hidden — width 0 — when a narrow pane squeezes it out).
+        .when(widths.kind > 0.0, |r| r.child(
             div()
                 .flex_none()
                 .w(px(widths.kind))
@@ -14408,9 +15893,9 @@ fn file_row(
                 .truncate()
                 .text_color(meta_color)
                 .child(kind),
-        )
+        ))
         // Date modified ("--" until the background metadata pass fills it in).
-        .child(
+        .when(widths.date > 0.0, |r| r.child(
             div()
                 .flex_none()
                 .w(px(widths.date))
@@ -14418,7 +15903,7 @@ fn file_row(
                 .truncate()
                 .text_color(meta_color)
                 .child(if loaded { format_date(modified) } else { "--".to_string() }),
-        )
+        ))
         // Size (right-aligned).
         .child(
             div()
@@ -15830,6 +17315,15 @@ fn ns_view_ptr(window: &Window) -> Option<*mut std::ffi::c_void> {
         RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
         _ => None,
     }
+}
+
+thread_local! {
+    /// Each pane's width as of the last paint (0 = not yet measured).
+    static PANE_W: RefCell<[f32; 2]> = const { RefCell::new([0.0; 2]) };
+}
+
+fn pane_width(pane: usize) -> f32 {
+    PANE_W.with(|w| w.borrow()[pane.min(1)])
 }
 
 thread_local! {
@@ -18544,8 +20038,12 @@ fn open_main_window(cx: &mut App) {
                 finder.build_index(cx);
                 // Quietly check GitHub for a newer release (shows a banner if so).
                 finder.check_for_update(cx);
-                // Fill the initial folder's metadata in the background.
-                finder.reload_pane(0, cx);
+                // Reopen last run's tabs + split (else the last folder), then
+                // fill each pane's metadata in the background.
+                finder.restore_session();
+                for pane in 0..finder.panes.len() {
+                    finder.reload_pane(pane, cx);
+                }
                 // Reconnect any SFTP servers marked "reconnect on launch".
                 for server in sftp_servers().into_iter().filter(|s| s.auto_reopen) {
                     finder.connect_sftp(server, cx);
@@ -18557,4 +20055,136 @@ fn open_main_window(cx: &mut App) {
             view
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("shuffle-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn fit_fills_wide_panes_with_name() {
+        let w = ColumnWidths::default().fit(1200.0);
+        assert_eq!((w.kind, w.date, w.size), (165.0, 185.0, 90.0));
+        assert_eq!(w.name, 1200.0 - 440.0);
+    }
+
+    #[test]
+    fn fit_shrinks_then_hides_columns() {
+        // Squeezed but everything still fits above minimums.
+        let w = ColumnWidths::default().fit(560.0);
+        assert!(w.kind > 0.0 && w.date > 0.0 && w.size > 0.0);
+        assert!((w.name + w.kind + w.date + w.size - 560.0).abs() < 0.01);
+        assert!(w.name >= 180.0 - 0.01);
+        // Narrower: Kind goes first, then Date.
+        let w = ColumnWidths::default().fit(400.0);
+        assert_eq!(w.kind, 0.0);
+        assert!(w.date > 0.0);
+        let w = ColumnWidths::default().fit(260.0);
+        assert_eq!((w.kind, w.date), (0.0, 0.0));
+        assert!(w.size > 0.0);
+        // Unmeasured pane: preferences untouched.
+        assert_eq!(ColumnWidths::default().fit(0.0).name, 320.0);
+    }
+
+    #[test]
+    fn batch_plan_modes_and_conflicts() {
+        let d = scratch("batch");
+        let a = d.join("IMG_001.jpg");
+        let b = d.join("IMG_002.jpg");
+        fs::write(&a, "a").unwrap();
+        fs::write(&b, "b").unwrap();
+        fs::write(d.join("taken.jpg"), "x").unwrap();
+        let mut br = BatchRename {
+            pane: 0,
+            targets: vec![a.clone(), b.clone()],
+            mode: BatchMode::Replace,
+            a: "IMG_".into(),
+            b: "Trip ".into(),
+            field: 0,
+            after: true,
+        };
+        let names: Vec<String> = br.plan().iter().map(|(_, t, _)| path_label(t)).collect();
+        assert_eq!(names, ["Trip 001.jpg", "Trip 002.jpg"]);
+
+        br.mode = BatchMode::Number;
+        br.a = "Beach".into();
+        br.b = "7".into();
+        let names: Vec<String> = br.plan().iter().map(|(_, t, _)| path_label(t)).collect();
+        assert_eq!(names, ["Beach 7.jpg", "Beach 8.jpg"]);
+
+        br.mode = BatchMode::Add;
+        br.a = "-v2".into();
+        let names: Vec<String> = br.plan().iter().map(|(_, t, _)| path_label(t)).collect();
+        assert_eq!(names, ["IMG_001-v2.jpg", "IMG_002-v2.jpg"]);
+
+        // Everything → the same name, or onto an existing file: blocked.
+        br.mode = BatchMode::Replace;
+        br.a = "IMG_00".into();
+        br.b = "".into();
+        br.targets = vec![a.clone()];
+        br.a = "IMG_001".into();
+        br.b = "taken".into();
+        assert!(br.plan()[0].2.is_some());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn transfer_copy_move_and_no_clobber() {
+        let d = scratch("xfer");
+        let src = d.join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("sub/f.txt"), "hello").unwrap();
+        std::os::unix::fs::symlink("sub/f.txt", src.join("link")).unwrap();
+        let dst = d.join("dst");
+        fs::create_dir(&dst).unwrap();
+
+        let prog = JobProgress::default();
+        let (done, err) = run_transfer(&[(src.clone(), dst.join("copy"))], TransferKind::Copy, &prog);
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(done.len(), 1);
+        assert_eq!(fs::read_to_string(dst.join("copy/sub/f.txt")).unwrap(), "hello");
+        assert!(fs::symlink_metadata(dst.join("copy/link")).unwrap().file_type().is_symlink());
+        assert_eq!(prog.done.load(Ordering::Relaxed), 5);
+
+        // Destination exists → skipped, nothing overwritten.
+        let (done, err) = run_transfer(&[(src.clone(), dst.join("copy"))], TransferKind::Copy, &prog);
+        assert!(done.is_empty() && err.is_some());
+
+        // Same-volume move is a rename.
+        let (done, _) = run_transfer(&[(src.clone(), dst.join("moved"))], TransferKind::Move, &prog);
+        assert_eq!(done.len(), 1);
+        assert!(!src.exists() && dst.join("moved/sub/f.txt").exists());
+
+        // Cancelled before starting: nothing copied, no partial left behind.
+        let cancelled = JobProgress::default();
+        cancelled.cancel.store(true, Ordering::Relaxed);
+        let (done, _) = run_transfer(&[(dst.join("moved"), dst.join("c2"))], TransferKind::Copy, &cancelled);
+        assert!(done.is_empty() && !dst.join("c2").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn mode_and_digits_formatting() {
+        assert_eq!(mode_string(0o755, true), "drwxr-xr-x (755)");
+        assert_eq!(mode_string(0o640, false), "-rw-r----- (640)");
+        assert_eq!(group_digits(1234567), "1,234,567");
+        assert_eq!(group_digits(12), "12");
+    }
+
+    #[test]
+    fn session_keys_roundtrip() {
+        for v in [ViewMode::List, ViewMode::Icons, ViewMode::Columns, ViewMode::Gallery] {
+            assert!(view_mode_from_key(view_mode_key(v)) == Some(v));
+        }
+        for k in [SortKey::None, SortKey::Name, SortKey::Kind, SortKey::Modified, SortKey::Created, SortKey::Size] {
+            assert!(sort_key_from_name(sort_key_name(k)) == Some(k));
+        }
+    }
 }
