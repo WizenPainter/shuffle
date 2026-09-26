@@ -3178,9 +3178,9 @@ impl ColumnWidths {
 
     /// Lay the preferred widths out in a pane whose rows are `avail` px wide.
     /// Name takes whatever is left (Finder / File Pilot style). When that would
-    /// squeeze it below a readable minimum, the other columns give way: first
-    /// shrinking toward their minimums, then Kind and then Date hide (width 0).
-    /// Only a pane too narrow even for Name + Size scrolls sideways. An
+    /// squeeze it below a readable minimum, the other columns shrink toward
+    /// their minimums; past that every column keeps its minimum and the list
+    /// scrolls sideways, so all columns stay reachable in a tiny pane. An
     /// unmeasured pane (`avail` ≤ 0, first frame) gets the preferences as-is.
     fn fit(self, avail: f32) -> ColumnWidths {
         const NAME_MIN: f32 = 180.0;
@@ -3189,7 +3189,8 @@ impl ColumnWidths {
         }
         let pref = [self.kind, self.date, self.size];
         let min = [70.0f32.min(self.kind), 110.0f32.min(self.date), 60.0f32.min(self.size)];
-        for visible in [[true, true, true], [false, true, true], [false, false, true]] {
+        {
+            let visible = [true, true, true];
             let pick = |v: [f32; 3]| (0..3).filter(|&i| visible[i]).map(|i| v[i]).sum::<f32>();
             let (pref_sum, min_sum) = (pick(pref), pick(min));
             let mut out = [0.0f32; 3];
@@ -3205,12 +3206,12 @@ impl ColumnWidths {
                     out[i] = if visible[i] { pref[i] - (pref[i] - min[i]) * need / give } else { 0.0 };
                 }
             } else {
-                continue;
+                // Too narrow: everything at its minimum; the rest scrolls.
+                return ColumnWidths { name: NAME_MIN, kind: min[0], date: min[1], size: min[2] };
             }
             let rest: f32 = out.iter().sum();
-            return ColumnWidths { name: avail - rest, kind: out[0], date: out[1], size: out[2] };
+            ColumnWidths { name: avail - rest, kind: out[0], date: out[1], size: out[2] }
         }
-        ColumnWidths { name: NAME_MIN, kind: 0.0, date: 0.0, size: min[2] }
     }
 
     fn set(&mut self, col: Column, w: f32) {
@@ -9512,21 +9513,12 @@ impl Shuffle {
     fn begin_resize(&mut self, pane: usize, col: Column, x: f32) {
         let f = self.fitted_widths(pane);
         let order = [Column::Kind, Column::Date, Column::Size];
-        // The next visible column to the right of `col`.
-        let next = |after: Column| {
-            order
-                .into_iter()
-                .skip_while(|c| *c != after)
-                .skip(1)
-                .find(|c| f.get(*c) > 0.0)
-        };
+        // The next column to the right of `col`.
+        let next = |after: Column| order.into_iter().skip_while(|c| *c != after).nth(1);
         let resize = match col {
             // Name has no width of its own (it fills): its edge shrinks/grows
             // the next column instead.
-            Column::Name => {
-                let n = order.into_iter().find(|c| f.get(*c) > 0.0).unwrap_or(Column::Size);
-                Resize { col: n, start_x: x, start_w: f.get(n), sign: -1.0, partner: None }
-            }
+            Column::Name => Resize { col: Column::Kind, start_x: x, start_w: f.get(Column::Kind), sign: -1.0, partner: None },
             c => Resize {
                 col: c,
                 start_x: x,
@@ -14212,16 +14204,9 @@ impl Shuffle {
             .border_b_1()
             .border_color(rgb(theme().border))
             .child(header_cell(pane, "Name", w.name, Column::Name, SortKey::Name, ICON_W + 8.0, false, key, asc, cx))
-            // Columns squeezed out of a narrow pane have width 0 → not drawn.
-            .when(w.kind > 0.0, |d| {
-                d.child(header_cell(pane, "Kind", w.kind, Column::Kind, SortKey::Kind, 0.0, false, key, asc, cx))
-            })
-            .when(w.date > 0.0, |d| {
-                d.child(header_cell(pane, "Date Modified", w.date, Column::Date, SortKey::Modified, 0.0, false, key, asc, cx))
-            })
-            .when(w.size > 0.0, |d| {
-                d.child(header_cell(pane, "Size", w.size, Column::Size, SortKey::Size, 0.0, true, key, asc, cx))
-            })
+            .child(header_cell(pane, "Kind", w.kind, Column::Kind, SortKey::Kind, 0.0, false, key, asc, cx))
+            .child(header_cell(pane, "Date Modified", w.date, Column::Date, SortKey::Modified, 0.0, false, key, asc, cx))
+            .child(header_cell(pane, "Size", w.size, Column::Size, SortKey::Size, 0.0, true, key, asc, cx))
             // Slack space after the last column.
             .child(div().flex_1())
     }
@@ -15993,8 +15978,8 @@ fn file_row(
                 )
                 .child(name_el),
         )
-        // Kind (hidden — width 0 — when a narrow pane squeezes it out).
-        .when(widths.kind > 0.0, |r| r.child(
+        // Kind.
+        .child(
             div()
                 .flex_none()
                 .w(px(widths.kind))
@@ -16002,9 +15987,9 @@ fn file_row(
                 .truncate()
                 .text_color(meta_color)
                 .child(kind),
-        ))
+        )
         // Date modified ("--" until the background metadata pass fills it in).
-        .when(widths.date > 0.0, |r| r.child(
+        .child(
             div()
                 .flex_none()
                 .w(px(widths.date))
@@ -16012,7 +15997,7 @@ fn file_row(
                 .truncate()
                 .text_color(meta_color)
                 .child(if loaded { format_date(modified) } else { "--".to_string() }),
-        ))
+        )
         // Size (right-aligned).
         .child(
             div()
@@ -20185,19 +20170,17 @@ mod tests {
     }
 
     #[test]
-    fn fit_shrinks_then_hides_columns() {
+    fn fit_shrinks_then_scrolls_never_hides() {
         // Squeezed but everything still fits above minimums.
         let w = ColumnWidths::default().fit(560.0);
         assert!(w.kind > 0.0 && w.date > 0.0 && w.size > 0.0);
         assert!((w.name + w.kind + w.date + w.size - 560.0).abs() < 0.01);
         assert!(w.name >= 180.0 - 0.01);
-        // Narrower: Kind goes first, then Date.
-        let w = ColumnWidths::default().fit(400.0);
-        assert_eq!(w.kind, 0.0);
-        assert!(w.date > 0.0);
+        // Narrower than the minimums: every column stays, at its minimum,
+        // and the total overflows the pane (horizontal scroll).
         let w = ColumnWidths::default().fit(260.0);
-        assert_eq!((w.kind, w.date), (0.0, 0.0));
-        assert!(w.size > 0.0);
+        assert_eq!((w.name, w.kind, w.date, w.size), (180.0, 70.0, 110.0, 60.0));
+        assert!(w.name + w.kind + w.date + w.size > 260.0);
         // Unmeasured pane: preferences untouched.
         assert_eq!(ColumnWidths::default().fit(0.0).name, 320.0);
     }
