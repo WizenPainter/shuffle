@@ -3731,6 +3731,9 @@ struct Shuffle {
     widths: ColumnWidths,
     resize: Option<Resize>,
     scroll_drag: Option<ScrollDrag>,
+    /// In-progress drag of a List view's horizontal scrollbar thumb:
+    /// (pane, cursor x at grab, columns scrolled at grab).
+    hbar_drag: Option<(usize, f32, f32)>,
     // Command palette (Cmd+P).
     focus: FocusHandle,
     palette_open: bool,
@@ -4087,6 +4090,7 @@ impl Shuffle {
             widths: ColumnWidths::default(),
             resize: None,
             scroll_drag: None,
+            hbar_drag: None,
             focus: cx.focus_handle(),
             palette_open: false,
             query: String::new(),
@@ -13534,10 +13538,12 @@ impl Shuffle {
         // the pane — otherwise the small x component of a trackpad flick
         // jiggles the listing sideways while scrolling vertically.
         let h_vw = f64::from(h_scroll.bounds().size.width) as f32;
-        let h_overflows = h_vw <= 1.0 || total_w > h_vw + 1.0;
-        if !h_overflows && h_scroll.offset().x < px(0.0) {
+        let h_overflows = h_vw > 1.0 && total_w > h_vw + 1.0;
+        let h_max = (total_w - h_vw).max(0.0);
+        let hx = f64::from(h_scroll.offset().x) as f32;
+        if hx < -h_max || hx > 0.0 {
             let y = h_scroll.offset().y;
-            h_scroll.set_offset(point(px(0.0), y));
+            h_scroll.set_offset(point(px(hx.clamp(-h_max, 0.0)), y));
         }
 
                 div()
@@ -13561,8 +13567,35 @@ impl Shuffle {
                         div()
                             .id(("hscroll", pane))
                             .size_full()
-                            .when(h_overflows, |d| d.overflow_x_scroll())
+                            // Horizontal scrolling is driven by hand, not by
+                            // overflow_x_scroll: gpui turns a plain vertical
+                            // wheel into a sideways scroll on an x-only
+                            // scroller, and trackpad drift nudged it too
+                            // (issue #13). Only a mostly-horizontal gesture
+                            // (or Shift+wheel) moves the columns sideways; the
+                            // offset still lives in `h_scroll` via track_scroll.
+                            .overflow_hidden()
                             .track_scroll(&h_scroll)
+                            .when(h_overflows, |d| {
+                                d.on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, window, cx| {
+                                    let delta = ev.delta.pixel_delta(window.line_height());
+                                    let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
+                                    let sideways = if ev.modifiers.shift && dx == 0.0 {
+                                        dy
+                                    } else if dx.abs() > dy.abs() * 1.5 {
+                                        dx
+                                    } else {
+                                        return;
+                                    };
+                                    let h = this.tab(pane).h_scroll.clone();
+                                    let vw = f64::from(h.bounds().size.width) as f32;
+                                    let max = (total_w - vw).max(0.0);
+                                    let cur = f64::from(h.offset().x) as f32;
+                                    let y = h.offset().y;
+                                    h.set_offset(point(px((cur + sideways).clamp(-max, 0.0)), y));
+                                    cx.notify();
+                                }))
+                            })
                             .child(
                                 div()
                                     .flex()
@@ -13812,7 +13845,10 @@ impl Shuffle {
                     this.active_pane = pane;
                     this.mark_scrolled(pane, cx);
                     cx.notify()
-                })),
+                }))
+                // Vertical only: gpui would otherwise feed a purely sideways
+                // swipe into the vertical scroll.
+                .map(restrict_scroll_axis),
                                             ) // close listing div .child(uniform_list)
                                     ) // close content flex_col .child(listing div)
                             ) // close hscroll .child(content)
@@ -13820,7 +13856,7 @@ impl Shuffle {
                     // Vertical scrollbar, pinned to the pane's right edge.
                     .children(self.scrollbar_thumb(pane, cx))
                     // Horizontal scrollbar, shown when columns overflow.
-                    .children(self.h_scrollbar_thumb(pane, total_w))
+                    .children(self.h_scrollbar_thumb(pane, total_w, cx))
                     // (The filter box is rendered once at the pane level.)
                     .into_any_element()
     }
@@ -14072,28 +14108,92 @@ impl Shuffle {
 
     /// Read-only horizontal scroll indicator for a pane's columns. Returns
     /// `None` when the columns fit (no horizontal overflow).
-    fn h_scrollbar_thumb(&self, pane: usize, _total_w: f32) -> Option<AnyElement> {
+    /// Geometry of a pane's horizontal scrollbar: (viewport, max scroll,
+    /// thumb width, thumb left) — `None` when the columns fit.
+    fn hbar_geometry(&self, pane: usize, total_w: f32) -> Option<(f32, f32, f32, f32)> {
         let base = &self.tab(pane).h_scroll;
         let viewport = f64::from(base.bounds().size.width) as f32;
-        let max = f64::from(base.max_offset().width) as f32;
+        let max = total_w - viewport;
         if viewport <= 1.0 || max <= 1.0 {
             return None;
         }
         let scrolled = (-(f64::from(base.offset().x) as f32)).clamp(0.0, max);
-        let content = viewport + max;
-        let thumb_w = (viewport * viewport / content).clamp(28.0, viewport);
+        let thumb_w = (viewport * viewport / total_w).clamp(28.0, viewport);
         let thumb_left = (viewport - thumb_w) * (scrolled / max);
+        Some((viewport, max, thumb_w, thumb_left))
+    }
+
+    /// The horizontal scrollbar: drag the thumb, or press the track to jump
+    /// there (and keep dragging).
+    fn h_scrollbar_thumb(&self, pane: usize, total_w: f32, cx: &Context<Self>) -> Option<AnyElement> {
+        let (_, _, thumb_w, thumb_left) = self.hbar_geometry(pane, total_w)?;
+        let dragging = self.hbar_drag.is_some_and(|d| d.0 == pane);
         Some(
             div()
+                .id(("hbar", pane))
                 .absolute()
-                .bottom(px(2.0))
-                .left(px(thumb_left))
-                .h(px(8.0))
-                .w(px(thumb_w))
-                .rounded_full()
-                .bg(Theme::alpha(theme().text, 0x33))
+                .left_0()
+                .right_0()
+                .bottom_0()
+                .h(px(12.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        this.begin_hbar_drag(pane, total_w, f32::from(ev.position.x), cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .bottom(px(2.0))
+                        .left(px(thumb_left))
+                        .h(px(8.0))
+                        .w(px(thumb_w))
+                        .rounded_full()
+                        .bg(Theme::alpha(theme().text, if dragging { 0x66 } else { 0x33 }))
+                        .hover(|s| s.bg(Theme::alpha(theme().text, 0x55))),
+                )
                 .into_any_element(),
         )
+    }
+
+    /// Press on the horizontal scrollbar: on the thumb, grab it where it is;
+    /// on the track, jump the thumb's center to the cursor first.
+    fn begin_hbar_drag(&mut self, pane: usize, total_w: f32, x: f32, cx: &mut Context<Self>) {
+        let Some((viewport, max, thumb_w, thumb_left)) = self.hbar_geometry(pane, total_w) else {
+            return;
+        };
+        self.active_pane = pane;
+        let h = self.tab(pane).h_scroll.clone();
+        let origin = f64::from(h.bounds().origin.x) as f32;
+        let local = x - origin;
+        let travel = (viewport - thumb_w).max(1.0);
+        let mut scrolled = (-(f64::from(h.offset().x) as f32)).clamp(0.0, max);
+        if local < thumb_left || local > thumb_left + thumb_w {
+            let left = (local - thumb_w / 2.0).clamp(0.0, travel);
+            scrolled = left / travel * max;
+            let y = h.offset().y;
+            h.set_offset(point(px(-scrolled), y));
+        }
+        self.hbar_drag = Some((pane, x, scrolled));
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn update_hbar_drag(&mut self, x: f32, cx: &mut Context<Self>) {
+        let Some((pane, start_x, start_scrolled)) = self.hbar_drag else { return };
+        if pane >= self.panes.len() {
+            return;
+        }
+        let fw = self.fitted_widths(pane);
+        let total_w = fw.name + fw.kind + fw.date + fw.size + 24.0;
+        let Some((viewport, max, thumb_w, _)) = self.hbar_geometry(pane, total_w) else { return };
+        let travel = (viewport - thumb_w).max(1.0);
+        let scrolled = (start_scrolled + (x - start_x) * (max / travel)).clamp(0.0, max);
+        let h = self.tab(pane).h_scroll.clone();
+        let y = h.offset().y;
+        h.set_offset(point(px(-scrolled), y));
+        cx.notify();
     }
 
     /// The non-scrolling header row with labels and drag-to-resize handles.
@@ -14295,6 +14395,7 @@ impl Render for Shuffle {
                 this.maybe_start_os_drag(x, y, window, cx);
                 this.update_resize(x, cx);
                 this.update_scroll_drag(y, cx);
+                this.update_hbar_drag(x, cx);
                 this.update_divider(x, cx);
                 this.update_marquee(x, y, cx);
                 this.update_drop_hover(x, y, cx);
@@ -14305,6 +14406,7 @@ impl Render for Shuffle {
                     this.drag_candidate = None;
                     this.end_resize();
                     this.end_scroll_drag(cx);
+                    this.hbar_drag = None;
                     this.divider_drag = None;
                     this.end_marquee(cx);
                     // A native file drag ends as a synthesized mouse-up.
@@ -15497,6 +15599,13 @@ fn group_digits(n: u64) -> String {
         out.push(c);
     }
     out
+}
+
+/// Make a scroller ignore the other axis's wheel delta (gpui maps a pure
+/// x-swipe onto y — and vice versa — for single-axis scrollers by default).
+fn restrict_scroll_axis<E: Styled>(mut e: E) -> E {
+    e.style().restrict_scroll_to_axis = Some(true);
+    e
 }
 
 /// Dimmed full-window backdrop for a modal card; clicking it runs `on_dismiss`.
