@@ -9,7 +9,8 @@
 //! highlighted. State lives in ~/Library/Application Support/Shuffle/.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -755,6 +756,7 @@ enum KeyAction {
     MoveToTrash,
     RevealInFinder,
     Open,
+    Refresh,
     // Command-palette (Cmd+P) text editing. These act only while the palette is
     // open, so they're excluded from the normal (global) key dispatch.
     PaletteCursorStart,
@@ -782,6 +784,7 @@ impl KeyAction {
         KeyAction::MoveToTrash,
         KeyAction::RevealInFinder,
         KeyAction::Open,
+        KeyAction::Refresh,
         KeyAction::PaletteCursorStart,
         KeyAction::PaletteCursorEnd,
         KeyAction::PaletteSelectAll,
@@ -826,6 +829,7 @@ impl KeyAction {
             KeyAction::MoveToTrash => "move_to_trash",
             KeyAction::RevealInFinder => "reveal_in_finder",
             KeyAction::Open => "open",
+            KeyAction::Refresh => "refresh",
             KeyAction::PaletteCursorStart => "palette_cursor_start",
             KeyAction::PaletteCursorEnd => "palette_cursor_end",
             KeyAction::PaletteSelectAll => "palette_select_all",
@@ -853,6 +857,7 @@ impl KeyAction {
             KeyAction::MoveToTrash => "Move to Trash",
             KeyAction::RevealInFinder => "Reveal in Finder",
             KeyAction::Open => "Open",
+            KeyAction::Refresh => "Refresh (syncs cloud folders)",
             KeyAction::PaletteCursorStart => "Palette: cursor to start",
             KeyAction::PaletteCursorEnd => "Palette: cursor to end",
             KeyAction::PaletteSelectAll => "Palette: select all",
@@ -870,6 +875,7 @@ impl KeyAction {
             KeyAction::CloseTab => Some("cmd-w"),
             KeyAction::Find => Some("/"),
             KeyAction::SelectAll => Some("cmd-a"),
+            KeyAction::Refresh => Some("cmd-r"),
             KeyAction::PaletteCursorStart => Some("cmd-left"),
             KeyAction::PaletteCursorEnd => Some("cmd-right"),
             KeyAction::PaletteSelectAll => Some("cmd-a"),
@@ -3682,6 +3688,12 @@ struct Shuffle {
     /// Cloud files with a download/evict in flight — shown with the syncing
     /// badge until the operation finishes and the listing is re-read.
     cloud_busy: HashSet<PathBuf>,
+    /// Status of the last cloud "Sync Now", shown as a neutral banner; the
+    /// generation lets a stale auto-dismiss leave a newer notice alone.
+    cloud_notice: Option<String>,
+    cloud_notice_gen: u64,
+    /// Bumped per Sync Now; the running sync watch stops when it's stale.
+    cloud_sync_gen: u64,
 }
 
 /// Which cloud store a path belongs to, for routing download/evict.
@@ -3950,6 +3962,9 @@ impl Shuffle {
             waterfall_pending: HashSet::new(),
             waterfall_mtime: HashMap::new(),
             cloud_busy: HashSet::new(),
+            cloud_notice: None,
+            cloud_notice_gen: 0,
+            cloud_sync_gen: 0,
         }
     }
 
@@ -5189,6 +5204,151 @@ impl Shuffle {
         .detach();
     }
 
+    /// "Sync Now" for a cloud folder: start the provider's sync app if it's
+    /// quit (a File Provider store only syncs while it runs) and have the File
+    /// Provider daemon re-enumerate the folder, then watch it until the sync
+    /// settles and reload once to show the result. The regular folder watcher
+    /// can't be relied on here: providers apply remote changes without bumping
+    /// the folder's mtime, so without this you'd have to leave and come back.
+    fn cloud_sync(&mut self, pane: usize, dir: PathBuf, cx: &mut Context<Self>) {
+        self.close_context_menu(cx);
+        let Some(tool) = cloudctl_path() else { return };
+        let name = cloud_provider_name(&dir);
+        // A newer Sync Now (or leaving the folder) retires this session's watch.
+        self.cloud_sync_gen += 1;
+        let sync_gen = self.cloud_sync_gen;
+        self.set_cloud_notice_sticky(format!("Syncing changes with {name}…"), cx);
+        cx.spawn(async move |this, cx| {
+            let d = dir.clone();
+            let t = tool.clone();
+            let (out, base) = cx
+                .background_spawn(async move {
+                    // Snapshot before the nudge so changes it triggers count.
+                    let base = cloud_fingerprint(&d);
+                    (Command::new(&t).arg("sync").arg(&d).output(), base)
+                })
+                .await;
+            let launched = match out {
+                Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().starts_with("launched"),
+                other => {
+                    let err = match other {
+                        Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                        Err(e) => format!("Sync failed: {e}"),
+                    };
+                    let _ = this.update(cx, |this, cx| {
+                        if this.cloud_sync_gen == sync_gen {
+                            this.cloud_notice = None;
+                            this.remote_error = Some(err);
+                            cx.notify();
+                        }
+                    });
+                    return;
+                }
+            };
+            if launched {
+                let _ = this.update(cx, |this, cx| {
+                    if this.cloud_sync_gen == sync_gen {
+                        this.set_cloud_notice_sticky(format!("Started {name} — syncing changes…"), cx);
+                    }
+                });
+            }
+
+            // Watch: poll the listing + in-flight transfers once a second. It's
+            // settled once nothing is transferring and the listing has held
+            // still for a couple of seconds after a change; with no change at
+            // all, give up after a quiet spell (longer when the app just
+            // started and has to catch up). Hard cap so it can't run forever.
+            let started = Instant::now();
+            let quiet = Duration::from_secs(if launched { 30 } else { 8 });
+            const SETTLE: Duration = Duration::from_secs(2);
+            const CAP: Duration = Duration::from_secs(300);
+            let mut last = base.clone();
+            let mut last_change: Option<Instant> = None;
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                // Still the live session, still looking at this folder?
+                let live = this.update(cx, |this, cx| {
+                    let ok = this.cloud_sync_gen == sync_gen
+                        && pane < this.panes.len()
+                        && this.tab(pane).current_dir == dir;
+                    if !ok && this.cloud_sync_gen == sync_gen {
+                        this.cloud_notice = None;
+                        cx.notify();
+                    }
+                    ok
+                });
+                if !matches!(live, Ok(true)) {
+                    return;
+                }
+                let d = dir.clone();
+                let t = tool.clone();
+                let (fp, busy) = cx
+                    .background_spawn(async move { (cloud_fingerprint(&d), cloud_busy_count(&t, &d)) })
+                    .await;
+                if fp != last {
+                    last = fp;
+                    last_change = Some(Instant::now());
+                }
+                let changes = fingerprint_diff(&base, &last);
+                let settled = busy == 0 && last_change.is_some_and(|t| t.elapsed() >= SETTLE);
+                let idle = busy == 0 && last_change.is_none() && started.elapsed() >= quiet;
+                let timed_out = started.elapsed() >= CAP;
+                let _ = this.update(cx, |this, cx| {
+                    if settled || idle || timed_out {
+                        this.refresh_pane(pane, cx);
+                        let msg = if timed_out && (busy > 0 || !settled) {
+                            format!("{name} is still syncing in the background — folder reloaded with what's arrived so far.")
+                        } else if changes == 0 {
+                            format!("Up to date with {name}.")
+                        } else {
+                            let s = if changes == 1 { "" } else { "s" };
+                            format!("Synced {changes} change{s} from {name} — folder updated.")
+                        };
+                        this.set_cloud_notice(msg, cx);
+                    } else {
+                        let mut msg = format!("Syncing changes with {name}…");
+                        if busy > 0 {
+                            msg.push_str(&format!(" {busy} item{} transferring", if busy == 1 { "" } else { "s" }));
+                        } else if changes > 0 {
+                            msg.push_str(&format!(" {changes} so far"));
+                        }
+                        this.set_cloud_notice_sticky(msg, cx);
+                    }
+                });
+                if settled || idle || timed_out {
+                    return;
+                }
+            }
+        })
+        .detach();
+    }
+
+    /// Show a cloud status banner that clears itself after a few seconds.
+    fn set_cloud_notice(&mut self, msg: String, cx: &mut Context<Self>) {
+        self.set_cloud_notice_sticky(msg, cx);
+        let gen_ = self.cloud_notice_gen;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(6)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.cloud_notice_gen == gen_ {
+                    this.cloud_notice = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Show a cloud status banner that stays until replaced (cancels any
+    /// pending auto-dismiss of the previous one).
+    fn set_cloud_notice_sticky(&mut self, msg: String, cx: &mut Context<Self>) {
+        self.cloud_notice_gen += 1;
+        if self.cloud_notice.as_deref() != Some(msg.as_str()) {
+            self.cloud_notice = Some(msg);
+            cx.notify();
+        }
+    }
+
     /// Free up space: evict downloaded cloud files back to online-only. iCloud
     /// only (third-party eviction is driven by the provider's own app). `path`
     /// may be a file or a folder (evicts its materialized descendants).
@@ -5268,6 +5428,7 @@ impl Shuffle {
     fn menu_nodes_root(&self, pane: usize, target: Option<(PathBuf, bool)>) -> Vec<MenuNode> {
         let mut nodes: Vec<MenuNode> = Vec::new();
         let paste_n = pasteboard_file_paths().len();
+        let on_background = target.is_none();
         if let Some((path, is_dir)) = target {
             // Clicking inside a multi-selection acts on the whole selection
             // (Finder semantics); clicking outside it acts on just that item.
@@ -5319,6 +5480,12 @@ impl Shuffle {
                 // Cloud storage: download-on-demand / free up space. Offered for
                 // files/folders in a cloud store, when the helper is present.
                 if let (Some(kind), true) = (cloud_kind(&path), cloudctl_path().is_some()) {
+                    if is_dir {
+                        let p = path.clone();
+                        nodes.push(mi("Sync Now", move |this, _, cx| {
+                            this.cloud_sync(pane, p.clone(), cx);
+                        }));
+                    }
                     let has_online = collect_cloud_files(&path, true, 1).len() == 1;
                     let has_local = collect_cloud_files(&path, false, 1).len() == 1;
                     if has_online {
@@ -5516,6 +5683,17 @@ impl Shuffle {
                 this.paste_into(pane, dir, cx);
             }));
             push_menu_sep(&mut nodes);
+        }
+        // Background of a cloud folder: ask the provider to sync it.
+        if on_background {
+            let dir = self.tab(pane).current_dir.clone();
+            if cloud_kind(&dir).is_some() && cloudctl_path().is_some() {
+                let label = format!("Sync Now with {}", cloud_provider_name(&dir));
+                nodes.push(mi_hint(label, "⌘R", move |this, _, cx| {
+                    this.cloud_sync(pane, dir.clone(), cx);
+                }));
+                push_menu_sep(&mut nodes);
+            }
         }
         nodes.push(mi("New Folder", move |this, window, cx| {
             this.close_context_menu(cx);
@@ -7575,6 +7753,14 @@ impl Shuffle {
                 if let Some(p) = anchor {
                     let is_dir = p.is_dir();
                     self.open_path(pane, p, is_dir, cx);
+                }
+            }
+            KeyAction::Refresh => {
+                let dir = self.tab(pane).current_dir.clone();
+                if self.tab(pane).remote.is_none() && cloud_kind(&dir).is_some() && cloudctl_path().is_some() {
+                    self.cloud_sync(pane, dir, cx);
+                } else {
+                    self.refresh_pane(pane, cx);
                 }
             }
             // Palette editing actions run inside the palette handler, not here.
@@ -12977,6 +13163,24 @@ impl Render for Shuffle {
             );
         }
 
+        // Cloud sync status (neutral; clears itself).
+        if let Some(msg) = self.cloud_notice.clone() {
+            root = root.child(
+                div()
+                    .flex_none()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .py_1p5()
+                    .bg(rgb(t.accent))
+                    .text_color(rgb(0xffffff))
+                    .child(div().flex_none().child("↻"))
+                    .child(div().flex_1().min_w_0().truncate().child(msg)),
+            );
+        }
+
         root = root.child(main_row);
 
         // Terminal-mode command bar at the bottom.
@@ -13712,6 +13916,56 @@ fn cloudctl_path() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let cand = exe.parent()?.join("cloudctl");
     cand.exists().then_some(cand)
+}
+
+/// A folder's visible entries → (size, mtime, online-only), for spotting when
+/// a cloud provider has changed anything in it. Hidden files are skipped
+/// (`.DS_Store` churns on its own and providers don't sync it).
+type CloudFingerprint = BTreeMap<OsString, (u64, Option<SystemTime>, bool)>;
+
+fn cloud_fingerprint(dir: &Path) -> CloudFingerprint {
+    use std::os::macos::fs::MetadataExt;
+    let mut out = BTreeMap::new();
+    if let Ok(rd) = fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            if name.as_encoded_bytes().first() == Some(&b'.') || name == "Icon\r" {
+                continue;
+            }
+            if let Ok(m) = fs::symlink_metadata(e.path()) {
+                out.insert(name, (m.len(), m.modified().ok(), m.st_flags() & SF_DATALESS != 0));
+            }
+        }
+    }
+    out
+}
+
+/// How many entries differ (added, removed, or changed) between two snapshots.
+fn fingerprint_diff(a: &CloudFingerprint, b: &CloudFingerprint) -> usize {
+    let changed = a.iter().filter(|(k, v)| b.get(*k) != Some(v)).count();
+    changed + b.keys().filter(|k| !a.contains_key(*k)).count()
+}
+
+/// Items in `dir` mid-download/upload, per the `cloudctl status` helper.
+fn cloud_busy_count(tool: &Path, dir: &Path) -> usize {
+    Command::new(tool)
+        .arg("status")
+        .arg(dir)
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().strip_prefix("busy ").and_then(|n| n.parse().ok()))
+        .unwrap_or(0)
+}
+
+/// Friendly name of the cloud store holding `path` ("Dropbox", "OneDrive",
+/// "iCloud Drive", …), for menu labels and sync notices.
+fn cloud_provider_name(path: &Path) -> String {
+    let cs = home_dir().join("Library/CloudStorage");
+    match path.strip_prefix(&cs).ok().and_then(|r| r.components().next()) {
+        Some(c) => pretty_cloud_name(&c.as_os_str().to_string_lossy()),
+        None => "iCloud Drive".to_string(),
+    }
 }
 
 /// Which cloud store `path` lives in, or `None` if it isn't under one. iCloud
