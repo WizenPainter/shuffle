@@ -3464,9 +3464,12 @@ struct Tab {
     last_scroll: Instant,
     /// Bumped per scroll so the fade-out animation restarts from opaque.
     scroll_epoch: u64,
-    /// The directory's mtime as of the last load; the watcher reloads the tab
-    /// when the folder changes underneath us (new download, deletion, …).
-    dir_mtime: Option<SystemTime>,
+    /// The directory's signature as of the last load; the watcher reloads the
+    /// tab when the folder changes underneath us (new download, deletion, …).
+    dir_sig: Option<DirSig>,
+    /// Same, for the deeper Column-view folders (`col_chain`), so a column
+    /// showing e.g. Downloads picks up new files too.
+    col_sigs: HashMap<PathBuf, DirSig>,
     /// When `Some`, this tab browses a remote SFTP server; `current_dir` is a
     /// remote absolute path on that host. `None` = a normal local tab.
     remote: Option<SftpServer>,
@@ -3504,7 +3507,8 @@ impl Tab {
             load_gen: 0,
             last_scroll: Instant::now(),
             scroll_epoch: 0,
-            dir_mtime: None,
+            dir_sig: None,
+            col_sigs: HashMap::new(),
             remote: None,
         }
     }
@@ -3793,51 +3797,84 @@ impl Shuffle {
         })
         .detach();
         // Watch the visible folders for outside changes (a finishing download,
-        // files created/deleted by other apps): poll each pane's directory
-        // mtime once a second — off-thread, so a slow network mount can't
-        // stall a frame — and reload the pane when it changes. The reload
-        // re-applies the tab's sort and any active filter, so new files land
-        // in the right spot immediately.
+        // files created/deleted by other apps): poll each pane's directory —
+        // and in Column view every open column — once a second, off-thread so
+        // a slow network mount can't stall a frame, and reload whatever
+        // changed. The reload re-applies the tab's sort and any active filter,
+        // so new files land in the right spot immediately. Background tabs are
+        // caught the moment they're shown (their stored signature is stale).
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(1000))
                     .await;
+                // Per pane: (root dir, deeper column dirs). Remote tabs aren't
+                // on the local filesystem, so they're skipped.
                 let dirs = match this.update(cx, |this, _| {
                     this.panes
                         .iter()
-                        .map(|p| p.active_tab().current_dir.clone())
+                        .map(|p| {
+                            let t = p.active_tab();
+                            if t.remote.is_some() {
+                                return None;
+                            }
+                            let chain = if t.view == ViewMode::Columns { t.col_chain.clone() } else { Vec::new() };
+                            Some((t.current_dir.clone(), chain))
+                        })
                         .collect::<Vec<_>>()
                 }) {
                     Ok(d) => d,
                     Err(_) => break,
                 };
                 let sampled = dirs.clone();
-                let stats = cx
+                let sigs = cx
                     .background_spawn(async move {
                         sampled
                             .iter()
-                            .map(|d| fs::metadata(d).ok().and_then(|m| m.modified().ok()))
-                            .collect::<Vec<Option<SystemTime>>>()
+                            .map(|d| {
+                                d.as_ref().map(|(root, chain)| {
+                                    (dir_sig(root), chain.iter().map(|c| dir_sig(c)).collect::<Vec<_>>())
+                                })
+                            })
+                            .collect::<Vec<_>>()
                     })
                     .await;
                 let alive = this.update(cx, |this, cx| {
-                    for (pane, (dir, cur)) in dirs.into_iter().zip(stats).enumerate() {
+                    for (pane, (d, sig)) in dirs.into_iter().zip(sigs).enumerate() {
+                        let (Some((dir, chain)), Some((root_sig, chain_sigs))) = (d, sig) else {
+                            continue;
+                        };
                         // Skip if the pane went away or navigated meanwhile.
                         if pane >= this.panes.len() || this.tab(pane).current_dir != dir {
                             continue;
                         }
-                        // Remote tabs aren't on the local filesystem — the mtime
-                        // stat is meaningless (and would reload constantly).
-                        if this.tab(pane).remote.is_some() {
-                            continue;
-                        }
-                        match (this.tab(pane).dir_mtime, cur) {
+                        match (this.tab(pane).dir_sig, root_sig) {
                             (Some(prev), Some(now)) if prev != now => {
+                                forget_column_listing(&dir);
                                 this.reload_pane(pane, cx);
                             }
-                            (None, Some(now)) => this.tab_mut(pane).dir_mtime = Some(now),
+                            (None, Some(now)) => this.tab_mut(pane).dir_sig = Some(now),
                             _ => {}
+                        }
+                        // Column view: re-list any deeper column that changed.
+                        if this.tab(pane).col_chain != chain {
+                            continue;
+                        }
+                        let mut changed = false;
+                        let tab = this.tab_mut(pane);
+                        tab.col_sigs.retain(|k, _| chain.contains(k));
+                        for (c, now) in chain.iter().zip(chain_sigs) {
+                            let Some(now) = now else { continue };
+                            match tab.col_sigs.insert(c.clone(), now) {
+                                Some(prev) if prev != now => {
+                                    forget_column_listing(c);
+                                    changed = true;
+                                }
+                                _ => {}
+                            }
+                        }
+                        if changed {
+                            cx.notify();
                         }
                     }
                     // Same tick: live-refresh the waterfall tree's folders.
@@ -4145,7 +4182,7 @@ impl Shuffle {
         ensure_dynamic_sidebar_icons(); // pick up newly-mounted volumes/cloud
         // Stamp the mtime *before* reading so a change racing the read bumps
         // it again and the watcher catches it on the next tick.
-        self.tab_mut(pane).dir_mtime = fs::metadata(&dir).ok().and_then(|m| m.modified().ok());
+        self.tab_mut(pane).dir_sig = dir_sig(&dir);
         self.tab_mut(pane).entries = read_entries_fast(&dir);
         self.next_load_gen += 1;
         let gen = self.next_load_gen;
@@ -16338,6 +16375,39 @@ fn column_entries(dir: &Path) -> Vec<Entry> {
 
 fn clear_column_cache() {
     COL_ENTRIES.with(|c| c.borrow_mut().clear());
+}
+
+/// Drop one folder's cached column listing so the next frame re-reads it.
+fn forget_column_listing(dir: &Path) {
+    COL_ENTRIES.with(|c| c.borrow_mut().remove(dir));
+}
+
+/// What the folder watcher compares to spot outside changes. The folder's
+/// mtime covers local disks (any create/delete/rename bumps it); cloud stores
+/// (Dropbox, OneDrive, iCloud…) add files without touching it, so for those a
+/// hash of the entry names is folded in too. `None` if the folder can't be
+/// stat'd (gone, or no permission).
+#[derive(Clone, Copy, PartialEq)]
+struct DirSig {
+    mtime: Option<SystemTime>,
+    names: u64,
+}
+
+fn dir_sig(dir: &Path) -> Option<DirSig> {
+    use std::hash::{Hash, Hasher};
+    let mtime = fs::metadata(dir).ok()?.modified().ok();
+    let mut names = 0u64;
+    if cloud_kind(dir).is_some() {
+        if let Ok(rd) = fs::read_dir(dir) {
+            // Order-independent: sum of per-name hashes, plus the count.
+            for e in rd.flatten() {
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                e.file_name().hash(&mut h);
+                names = names.wrapping_add(h.finish()).wrapping_add(1);
+            }
+        }
+    }
+    Some(DirSig { mtime, names })
 }
 
 /// Sort a directory listing in place by the given criterion/direction. Uses
