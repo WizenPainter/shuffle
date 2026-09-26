@@ -5650,6 +5650,18 @@ impl Shuffle {
                     this.compress_targets(pane, ts.clone(), cx);
                 }));
             }
+            {
+                // The native share popover (AirDrop, Messages, Mail, Notes, …),
+                // anchored where the menu was opened — same as Finder's Share….
+                let ts = targets.clone();
+                nodes.push(mi("Share…", move |this, window, cx| {
+                    let at = this.context_menu.as_ref().map(|m| (m.x, m.y)).unwrap_or_default();
+                    this.close_context_menu(cx);
+                    if let Some(view) = ns_view_ptr(window) {
+                        show_share_picker(view, at, &ts);
+                    }
+                }));
+            }
             if !many {
                 let p = path.clone();
                 nodes.push(mi("Reveal in Finder", move |this, _, cx| {
@@ -15818,6 +15830,44 @@ fn ns_view_ptr(window: &Window) -> Option<*mut std::ffi::c_void> {
         RawWindowHandle::AppKit(h) => Some(h.ns_view.as_ptr()),
         _ => None,
     }
+}
+
+thread_local! {
+    /// The open share picker, kept alive while its popover is showing.
+    static SHARE_PICKER: RefCell<Option<objc2::rc::Retained<objc2_app_kit::NSSharingServicePicker>>> =
+        const { RefCell::new(None) };
+}
+
+/// Show macOS's share popover (AirDrop, Messages, Mail, Notes, share
+/// extensions…) for `paths`, pointing at `at` (window coords, top-left origin).
+/// Picking a service runs it; the system handles everything from there.
+fn show_share_picker(view_ptr: *mut std::ffi::c_void, at: (f32, f32), paths: &[PathBuf]) {
+    use objc2::rc::Retained;
+    use objc2::runtime::AnyObject;
+    use objc2_app_kit::{NSSharingServicePicker, NSView};
+    use objc2_foundation::{NSArray, NSPoint, NSRect, NSRectEdge, NSSize};
+
+    if paths.is_empty() || view_ptr.is_null() || objc2::MainThreadMarker::new().is_none() {
+        return;
+    }
+    // SAFETY: the GPUI content view is a live NSView on the main thread.
+    let view: &NSView = unsafe { &*(view_ptr as *const NSView) };
+    let urls: Vec<Retained<AnyObject>> = paths
+        .iter()
+        .filter_map(|p| p.to_str())
+        .map(|s| Retained::into_super(Retained::into_super(NSURL::fileURLWithPath(&NSString::from_str(s)))))
+        .collect();
+    if urls.is_empty() {
+        return;
+    }
+    let items = NSArray::from_retained_slice(&urls);
+    // SAFETY: file NSURLs conform to NSPasteboardWriting, as the picker requires.
+    let picker = unsafe { NSSharingServicePicker::initWithItems(NSSharingServicePicker::alloc(), &items) };
+    let (x, y) = (at.0 as f64, at.1 as f64);
+    let y = if view.isFlipped() { y } else { view.bounds().size.height - y };
+    let rect = NSRect { origin: NSPoint { x, y }, size: NSSize { width: 1.0, height: 1.0 } };
+    picker.showRelativeToRect_ofView_preferredEdge(rect, view, NSRectEdge::MinY);
+    SHARE_PICKER.with(|p| *p.borrow_mut() = Some(picker));
 }
 
 /// Start a native macOS drag session carrying `paths` as file URLs. macOS then
