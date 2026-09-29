@@ -3228,6 +3228,8 @@ impl ColumnWidths {
 /// An in-progress column drag.
 #[derive(Clone, Copy)]
 struct Resize {
+    /// The pane whose columns are being resized.
+    pane: usize,
     /// The column whose preferred width the drag changes.
     col: Column,
     start_x: f32,
@@ -3557,6 +3559,11 @@ struct Tab {
     scroll_handle: UniformListScrollHandle,
     /// Horizontal scroll of the columns (when they're wider than the pane).
     h_scroll: ScrollHandle,
+    /// The path bar's horizontal scroll, and the (shown path, current dir)
+    /// it was last pinned for — it re-pins to the current folder's crumb
+    /// whenever that changes, so a long path shows where you are.
+    crumb_scroll: ScrollHandle,
+    crumb_pinned: RefCell<Option<(PathBuf, PathBuf)>>,
     /// The set of selected items.
     selection: HashSet<PathBuf>,
     /// The focused item (last clicked): used for shift-range and the inspector.
@@ -3610,6 +3617,8 @@ impl Tab {
             content_gen: 0,
             scroll_handle: UniformListScrollHandle::new(),
             h_scroll: ScrollHandle::new(),
+            crumb_scroll: ScrollHandle::new(),
+            crumb_pinned: RefCell::new(None),
             selection: HashSet::new(),
             anchor: None,
             sort_key: SortKey::None,
@@ -3631,12 +3640,16 @@ impl Tab {
 struct Pane {
     tabs: Vec<Tab>,
     active: usize,
+    /// This pane's List-view column preferences. Per pane, so resizing a
+    /// column in one half of a split leaves the other half alone.
+    widths: ColumnWidths,
 }
 
 impl Pane {
     fn new(dir: PathBuf) -> Self {
         Pane {
             tabs: vec![Tab::new(dir)],
+            widths: ColumnWidths::default(),
             active: 0,
         }
     }
@@ -3729,7 +3742,6 @@ struct Shuffle {
     group_dialog: Option<String>,
     /// Sidebar section titles the user has collapsed (hidden their items).
     collapsed_sections: HashSet<String>,
-    widths: ColumnWidths,
     resize: Option<Resize>,
     scroll_drag: Option<ScrollDrag>,
     /// In-progress drag of a List view's horizontal scrollbar thumb:
@@ -4088,7 +4100,6 @@ impl Shuffle {
             sidebar_menu: None,
             group_dialog: None,
             collapsed_sections: read_string_list("collapsed_sections.txt").into_iter().collect(),
-            widths: ColumnWidths::default(),
             resize: None,
             scroll_drag: None,
             hbar_drag: None,
@@ -4932,7 +4943,7 @@ impl Shuffle {
                 ["ratio", v] => ratio = v.parse().unwrap_or(0.5),
                 ["active", v] => active_pane = v.parse().unwrap_or(0),
                 ["pane", v] => {
-                    panes.push(Pane { tabs: Vec::new(), active: 0 });
+                    panes.push(Pane { tabs: Vec::new(), active: 0, widths: ColumnWidths::default() });
                     wanted_active.push(v.parse().unwrap_or(0));
                 }
                 ["tab", view, sort, asc, path] => {
@@ -9518,8 +9529,9 @@ impl Shuffle {
         let resize = match col {
             // Name has no width of its own (it fills): its edge shrinks/grows
             // the next column instead.
-            Column::Name => Resize { col: Column::Kind, start_x: x, start_w: f.get(Column::Kind), sign: -1.0, partner: None },
+            Column::Name => Resize { pane, col: Column::Kind, start_x: x, start_w: f.get(Column::Kind), sign: -1.0, partner: None },
             c => Resize {
+                pane,
                 col: c,
                 start_x: x,
                 start_w: f.get(c),
@@ -9534,10 +9546,14 @@ impl Shuffle {
 
     fn update_resize(&mut self, x: f32, cx: &mut Context<Self>) {
         if let Some(resize) = self.resize {
+            if resize.pane >= self.panes.len() {
+                return;
+            }
             let dx = x - resize.start_x;
-            self.widths.set(resize.col, resize.start_w + resize.sign * dx);
+            let widths = &mut self.panes[resize.pane].widths;
+            widths.set(resize.col, resize.start_w + resize.sign * dx);
             if let Some((p, w)) = resize.partner {
-                self.widths.set(p, w - dx);
+                widths.set(p, w - dx);
             }
             cx.notify();
         }
@@ -9547,7 +9563,7 @@ impl Shuffle {
     fn fitted_widths(&self, pane: usize) -> ColumnWidths {
         let vw = f64::from(self.tab(pane).h_scroll.bounds().size.width) as f32;
         // Rows are padded px_3 on both sides.
-        self.widths.fit(vw - 24.0)
+        self.pane(pane).widths.fit(vw - 24.0)
     }
 
     fn end_resize(&mut self) {
@@ -10430,7 +10446,9 @@ impl Shuffle {
 
         if splitting {
             // New pane on the right with just this tab.
-            self.panes.push(Pane { tabs: vec![tab], active: 0 });
+            // The new pane starts with the source pane's column widths.
+            let widths = self.panes[from.pane].widths;
+            self.panes.push(Pane { tabs: vec![tab], active: 0, widths });
             self.split_ratio = 0.5;
             self.split_epoch += 1;
             self.collapse_anim = None;
@@ -13061,6 +13079,7 @@ impl Shuffle {
             None => "Macintosh HD".to_string(),
         };
         let mut segs: Vec<AnyElement> = Vec::new();
+        let mut current_child = None;
         let mut acc = PathBuf::new();
         let mut idx = 0usize;
         for comp in display.components() {
@@ -13083,19 +13102,33 @@ impl Shuffle {
             // on local tabs (Reveal in Finder etc. make no sense for a remote
             // path — there the crumb keeps its refresh/navigate behavior).
             let is_current = full == current_dir && tab.remote.is_none();
+            if full == current_dir {
+                current_child = Some(segs.len());
+            }
             segs.push(breadcrumb_seg(pane * 4096 + idx, pane, label, full, active, is_current, cx));
             idx += 1;
         }
 
+        // A long path scrolls sideways (trackpad, or the mouse wheel — which
+        // gpui maps onto x for an x-only scroller). On navigation it jumps to
+        // keep the current folder's crumb in view.
+        let key = (display.clone(), current_dir.clone());
+        if tab.crumb_pinned.borrow().as_ref() != Some(&key) {
+            if let Some(ix) = current_child {
+                tab.crumb_scroll.scroll_to_item(ix);
+            }
+            *tab.crumb_pinned.borrow_mut() = Some(key);
+        }
         div()
             .id(("breadcrumb", pane))
             .flex()
             .items_center()
             .flex_1()
             .min_w_0()
-            // Clip so long paths can't paint over the view/sort toolbar (or
-            // bleed into the neighbouring pane) when a pane is narrow.
-            .overflow_hidden()
+            // Scroll (and clip) so long paths can't paint over the toolbar or
+            // bleed into the neighbouring pane when a pane is narrow.
+            .overflow_x_scroll()
+            .track_scroll(&tab.crumb_scroll)
             .h(px(22.0))
             .children(segs)
             // Filler captures clicks on the empty part of the bar → edit mode.
