@@ -20,6 +20,10 @@ objc2-foundation = { version = "0.3", features = ["NSString", "NSData", "NSFileM
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPDFImageRep", "NSGraphics", "NSGraphicsContext", "NSResponder", "NSView", "NSEvent", "NSApplication", "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSSharingService"] }
 # Reach the underlying NSView so we can start native OS drag sessions (drag files out to Finder/other apps).
 raw-window-handle = "0.6"
+# Inspector / Gallery previews via QLThumbnailGenerator (fails fast on file
+# types QuickLook can't thumbnail, where `qlmanage -t` hangs forever).
+objc2-quick-look-thumbnailing = { version = "0.3", default-features = false, features = ["std", "QLThumbnailGenerator", "QLThumbnailGenerationRequest", "QLThumbnailRepresentation", "bitflags", "block2", "objc2-app-kit", "objc2-core-foundation"] }
+block2 = "0.6"
 
 # Ships as a universal binary (arm64 + x86_64) via release.sh so it runs on
 # both Apple Silicon and Intel Macs. Build with a thin release profile while
