@@ -11152,6 +11152,11 @@ impl Shuffle {
         self.tab(pane).scroll_handle.scroll_to_item(item, ScrollStrategy::Center);
         // Keyboard scrolling shows the overlay scrollbar too.
         self.mark_scrolled(pane, cx);
+        // Repaint now. Don't lean on the scrollbar fade ticker: its timer
+        // shares GPUI's background thread pool, so if that pool is saturated
+        // (e.g. by hung QuickLook calls) the ticker never fires and the new
+        // selection doesn't show until something else (a mouse move) repaints.
+        cx.notify();
         self.focus_entry(pane, target, cx);
     }
 
