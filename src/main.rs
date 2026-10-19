@@ -3973,7 +3973,9 @@ struct Shuffle {
     jobs: Vec<FileJob>,
     next_job_id: u64,
     /// File operations that ⌘Z can reverse, newest last.
-    undo_stack: Vec<UndoOp>,
+    undo_stack: Vec<UndoEntry>,
+    /// Inverses of undone operations, for redo (cleared by a fresh action).
+    redo_stack: Vec<UndoEntry>,
     /// The tabs/split layout as last written to session.txt (skip rewrites).
     saved_session: String,
     /// The open Get Info card, if any.
@@ -4306,6 +4308,7 @@ impl Shuffle {
             jobs: Vec::new(),
             next_job_id: 0,
             undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             saved_session: String::new(),
             info_panel: None,
             batch_rename: None,
@@ -4991,26 +4994,19 @@ impl Shuffle {
             return;
         }
         let label = format!("Moving {} to {}", items_label(pairs.len()), path_label(&dest_dir));
-        self.start_transfer(pairs, TransferKind::Move, label, true, cx);
+        self.start_transfer(pairs, TransferKind::Move, ConflictPolicy::Skip, label, Record::Fresh, cx);
     }
 
     /// Copy `srcs` into `dest_dir` as one undoable background job; a taken
-    /// name gets a Finder-style " 2" suffix instead of overwriting.
+    /// name gets a Finder-style " 2" suffix instead of overwriting (picked
+    /// atomically at publish time, so same-named sources in one batch and
+    /// racing writers can't collide).
     fn copy_items(&mut self, dest_dir: PathBuf, srcs: Vec<PathBuf>, cx: &mut Context<Self>) {
-        let mut taken: HashSet<PathBuf> = HashSet::new();
         let pairs: Vec<(PathBuf, PathBuf)> = srcs
             .into_iter()
             .filter(|src| !dest_dir.starts_with(src))
             .filter_map(|src| {
-                let name = src.file_name()?.to_string_lossy().into_owned();
-                let mut dest = unique_dest(&dest_dir, &name);
-                // Two sources with the same name in one batch.
-                let mut n = 2;
-                while taken.contains(&dest) {
-                    dest = unique_dest(&dest_dir, &format!("{name} {n}"));
-                    n += 1;
-                }
-                taken.insert(dest.clone());
+                let dest = dest_dir.join(src.file_name()?);
                 Some((src, dest))
             })
             .collect();
@@ -5018,18 +5014,19 @@ impl Shuffle {
             return;
         }
         let label = format!("Copying {} to {}", items_label(pairs.len()), path_label(&dest_dir));
-        self.start_transfer(pairs, TransferKind::Copy, label, true, cx);
+        self.start_transfer(pairs, TransferKind::Copy, ConflictPolicy::KeepBoth, label, Record::Fresh, cx);
     }
 
     /// Run a copy/move off the main thread. The progress panel shows it once
     /// it has taken longer than a blink; when it finishes the panes reload and
-    /// (if `undoable`) the completed part lands on the undo stack.
+    /// the completed part lands on the undo (or, per `record`, redo) stack.
     fn start_transfer(
         &mut self,
         pairs: Vec<(PathBuf, PathBuf)>,
         kind: TransferKind,
+        policy: ConflictPolicy,
         label: String,
-        undoable: bool,
+        record: Record,
         cx: &mut Context<Self>,
     ) {
         let prog = Arc::new(JobProgress::default());
@@ -5052,13 +5049,35 @@ impl Shuffle {
             .detach();
         }
         cx.spawn(async move |this, cx| {
-            let (done, err) = cx.background_spawn(async move { run_transfer(&pairs, kind, &prog) }).await;
+            let as_placed = matches!(record, Record::Revert { as_placed: true, .. });
+            let out = cx
+                .background_spawn(async move {
+                    let mut out = run_transfer(&pairs, kind, policy, &prog);
+                    if as_placed {
+                        for p in &mut out.placed {
+                            p.stamp.get_or_insert_with(|| tree_stamp(&p.dest));
+                        }
+                    }
+                    out
+                })
+                .await;
             let _ = this.update(cx, |this, cx| {
                 this.jobs.retain(|j| j.id != id);
-                if undoable && !done.is_empty() {
-                    this.push_undo(UndoOp::Transfer { kind, pairs: done });
+                if !out.placed.is_empty() {
+                    let n = out.placed.len();
+                    let op = transfer_undo_op(kind, out.placed, as_placed);
+                    match record {
+                        Record::Fresh => {
+                            let label = match kind {
+                                TransferKind::Copy => format!("Copy of {}", items_label(n)),
+                                TransferKind::Move => format!("Move of {}", items_label(n)),
+                            };
+                            this.push_entry(UndoEntry { label, op }, true);
+                        }
+                        Record::Revert { label, to_redo, .. } => this.record_inverse(UndoEntry { label, op }, to_redo),
+                    }
                 }
-                if let Some(e) = err {
+                if let Some(e) = out.err {
                     this.remote_error = Some(e);
                 }
                 this.refresh_all_panes(cx);
@@ -5570,16 +5589,16 @@ impl Shuffle {
         let mut staged: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::new();
         for (i, (from, to)) in moves.iter().enumerate() {
             let tmp = from.with_file_name(format!(".shuffle-rename-{}-{i}", std::process::id()));
-            if fs::rename(from, &tmp).is_ok() {
+            if rename_excl(from, &tmp).is_ok() {
                 staged.push((from.clone(), tmp, to.clone()));
             }
         }
         let mut done = Vec::new();
         for (from, tmp, to) in staged {
-            if fs::rename(&tmp, &to).is_ok() {
+            if rename_excl(&tmp, &to).is_ok() {
                 done.push((from, to));
             } else {
-                let _ = fs::rename(&tmp, &from);
+                let _ = rename_excl(&tmp, &from);
             }
         }
         if !done.is_empty() {
@@ -5790,74 +5809,110 @@ impl Shuffle {
         )
     }
 
+    /// Record a fresh user action (drops anything redoable). New items are
+    /// fingerprinted now, so undo won't trash them once they've been edited.
     fn push_undo(&mut self, op: UndoOp) {
-        self.undo_stack.push(op);
-        if self.undo_stack.len() > 100 {
-            self.undo_stack.remove(0);
+        let label = op.label();
+        let op = match op {
+            UndoOp::Created(paths) => UndoOp::Placed(
+                paths
+                    .into_iter()
+                    .map(|p| {
+                        let s = tree_stamp(&p);
+                        (p, Some(s))
+                    })
+                    .collect(),
+            ),
+            op => op,
+        };
+        self.push_entry(UndoEntry { label, op }, true);
+    }
+
+    fn push_entry(&mut self, entry: UndoEntry, fresh: bool) {
+        if fresh {
+            self.redo_stack.clear();
         }
+        push_capped(&mut self.undo_stack, entry);
+    }
+
+    /// File an undo's inverse for redo, or a redo's back for undo.
+    fn record_inverse(&mut self, entry: UndoEntry, to_redo: bool) {
+        push_capped(if to_redo { &mut self.redo_stack } else { &mut self.undo_stack }, entry);
     }
 
     /// ⌘Z: reverse the most recent file operation, if everything it touched
     /// is still where it left it (otherwise say why and leave it alone).
     fn undo_last(&mut self, cx: &mut Context<Self>) {
-        let Some(op) = self.undo_stack.pop() else {
+        let Some(entry) = self.undo_stack.pop() else {
             self.set_notice("Nothing to undo".into(), cx);
             return;
         };
-        let what = op.label();
+        self.revert(entry, true, cx);
+    }
+
+    /// ⇧⌘Z: redo the most recently undone file operation.
+    #[allow(dead_code)] // bound by the keyboard layer
+    fn redo_last(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.redo_stack.pop() else {
+            self.set_notice("Nothing to redo".into(), cx);
+            return;
+        };
+        self.revert(entry, false, cx);
+    }
+
+    /// Carry out `entry`'s reversal; its own inverse goes on the redo stack
+    /// (`to_redo`: this is an undo) or back on the undo stack (a redo).
+    fn revert(&mut self, entry: UndoEntry, to_redo: bool, cx: &mut Context<Self>) {
+        let (did, doing, verb) = if to_redo { ("Undid", "Undoing", "undo") } else { ("Redid", "Redoing", "redo") };
+        let UndoEntry { label, op } = entry;
         let gone = |p: &Path| fs::symlink_metadata(p).is_err();
+        let from_trash = matches!(op, UndoOp::Trashed(_));
         match op {
-            UndoOp::Transfer { kind: TransferKind::Copy, pairs } => {
-                for (_, c) in pairs.iter().filter(|(_, d)| !gone(d)) {
-                    trash_path(c);
-                }
-            }
             UndoOp::Created(paths) => {
-                for p in paths.iter().filter(|p| !gone(p)) {
-                    trash_path(p);
-                }
+                let op = UndoOp::Placed(paths.into_iter().map(|p| (p, None)).collect());
+                return self.revert(UndoEntry { label, op }, to_redo, cx);
             }
-            UndoOp::Transfer { kind: TransferKind::Move, pairs } | UndoOp::Trashed(pairs) => {
-                // Move each item back from where it went (pairs are
-                // (original, current)); skip any that moved on since or whose
-                // original spot has been taken.
+            UndoOp::Placed(items) => {
+                let (trashed, changed) = trash_unchanged(items);
+                let any = !trashed.is_empty();
+                if any {
+                    self.record_inverse(UndoEntry { label: label.clone(), op: UndoOp::Trashed(trashed) }, to_redo);
+                }
+                let note = match (any, changed.len()) {
+                    (_, 0) => format!("{did} {label}"),
+                    (false, _) => format!("Couldn't {verb} {label} — changed since, so left in place"),
+                    (true, n) => format!("{did} {label}; left {} changed since in place", items_label(n)),
+                };
+                self.set_notice(note, cx);
+                self.refresh_all_panes(cx);
+                return;
+            }
+            UndoOp::Moved(pairs) | UndoOp::Trashed(pairs) => {
+                // Move each item back from where it went; skip any that moved
+                // on since or whose original spot has been taken.
                 let back: Vec<(PathBuf, PathBuf)> = pairs
                     .into_iter()
                     .filter(|(orig, now)| !gone(now) && gone(orig))
                     .map(|(orig, now)| (now, orig))
                     .collect();
                 if back.is_empty() {
-                    self.set_notice(format!("Couldn't undo {what} — the items have moved since"), cx);
+                    self.set_notice(format!("Couldn't {verb} {label} — the items have moved since"), cx);
                     return;
                 }
-                self.start_transfer(back, TransferKind::Move, format!("Undoing {what}"), false, cx);
+                let record = Record::Revert { label: label.clone(), to_redo, as_placed: from_trash };
+                self.start_transfer(back, TransferKind::Move, ConflictPolicy::Skip, format!("{doing} {label}"), record, cx);
             }
             UndoOp::Renamed(pairs) => {
-                // Rename back in reverse order (via temporary names, so a
-                // batch that swapped names undoes cleanly too).
-                let mut staged = Vec::new();
-                for (i, (from, to)) in pairs.iter().enumerate().rev() {
-                    let case_only = from.to_string_lossy().to_lowercase() == to.to_string_lossy().to_lowercase();
-                    if gone(to) || (!case_only && !gone(from) && !pairs.iter().any(|(_, t)| t == from)) {
-                        continue;
-                    }
-                    let tmp = to.with_file_name(format!(".shuffle-undo-{}-{i}", std::process::id()));
-                    if fs::rename(to, &tmp).is_ok() {
-                        staged.push((tmp, from.clone(), to.clone()));
-                    }
-                }
-                if staged.is_empty() {
-                    self.set_notice(format!("Couldn't undo {what}"), cx);
+                let done = revert_renames(&pairs);
+                if done.is_empty() {
+                    self.set_notice(format!("Couldn't {verb} {label}"), cx);
                     return;
                 }
-                for (tmp, from, to) in staged {
-                    if fs::rename(&tmp, &from).is_err() {
-                        let _ = fs::rename(&tmp, &to);
-                    }
-                }
+                let inverse = UndoOp::Renamed(done.into_iter().map(|(from, to)| (to, from)).collect());
+                self.record_inverse(UndoEntry { label: label.clone(), op: inverse }, to_redo);
             }
         }
-        self.set_notice(format!("Undid {what}"), cx);
+        self.set_notice(format!("{did} {label}"), cx);
         self.refresh_all_panes(cx);
     }
 
@@ -6036,13 +6091,9 @@ impl Shuffle {
                         cx.notify();
                         return;
                     }
-                    // Case-only renames are legal even though the destination
-                    // "exists" on APFS's case-insensitive default.
-                    let case_only = r
-                        .path
-                        .file_name()
-                        .is_some_and(|n| n.to_string_lossy().eq_ignore_ascii_case(new));
-                    if (case_only || !dest.exists()) && fs::rename(&r.path, &dest).is_ok() {
+                    // Never clobbers; case-only renames (legal even though the
+                    // destination "exists" on case-insensitive APFS) are staged.
+                    if rename_no_clobber(&r.path, &dest).is_ok() {
                         self.push_undo(UndoOp::Renamed(vec![(r.path.clone(), dest.clone())]));
                         let tab = self.tab_mut(r.pane);
                         if tab.selection.remove(&r.path) {
@@ -6264,7 +6315,7 @@ impl Shuffle {
         let dest = unique_child(parent, &base);
         let _ = pane;
         let label = format!("Duplicating {}", path_label(&path));
-        self.start_transfer(vec![(path, dest)], TransferKind::Copy, label, true, cx);
+        self.start_transfer(vec![(path, dest)], TransferKind::Copy, ConflictPolicy::KeepBoth, label, Record::Fresh, cx);
     }
 
     /// Make a Finder alias of `path` in the same folder.
@@ -16389,31 +16440,6 @@ fn apps_for_file(path: &Path) -> Vec<(String, PathBuf)> {
 }
 
 /// A non-existing child path under `dir` based on `base` (adds " 2", " 3" …).
-/// Like [`unique_child`], but keeps the extension at the end: pasting
-/// "alpha.txt" beside itself yields "alpha 2.txt", not "alpha.txt 2".
-fn unique_dest(dir: &Path, name: &str) -> PathBuf {
-    let first = dir.join(name);
-    if !first.exists() {
-        return first;
-    }
-    let (stem, ext) = match name.rsplit_once('.') {
-        Some((s, e)) if !s.is_empty() => (s.to_string(), Some(e.to_string())),
-        _ => (name.to_string(), None),
-    };
-    let mut n = 2;
-    loop {
-        let candidate = match &ext {
-            Some(e) => format!("{stem} {n}.{e}"),
-            None => format!("{stem} {n}"),
-        };
-        let path = dir.join(candidate);
-        if !path.exists() {
-            return path;
-        }
-        n += 1;
-    }
-}
-
 fn unique_child(dir: &Path, base: &str) -> PathBuf {
     let mut path = dir.join(base);
     let mut n = 2;
@@ -16607,17 +16633,39 @@ fn modal_backdrop(on_dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 
 }
 
 // ----- file operations: background copy/move with progress + undo ---------
+//
+// The engine never overwrites and never shows a half-written item under its
+// final name:
+// - every placement goes through the kernel's own exclusive check
+//   (`renamex_np(RENAME_EXCL)`, `copyfile(COPYFILE_EXCL)`), so there is no
+//   window between "is the name free?" and "take it";
+// - copies are written to a hidden `.shuffle-partial-…` sibling in the
+//   destination folder and published with one exclusive rename, so a crash or
+//   cancel leaves at most a hidden dotfile (swept once it's a day old);
+// - a move that has to copy (another volume) flushes the copy to disk, then
+//   deletes only the sources that are still exactly as it read them.
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum TransferKind {
     Copy,
     Move,
 }
 
+/// What to do when the destination name is taken. Nothing ever overwrites; a
+/// future "Replace" would stage the new item and `RENAME_SWAP` it in.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum ConflictPolicy {
+    /// Leave the existing item alone and report it.
+    Skip,
+    /// Take the next free Finder-style name ("name 2.ext").
+    KeepBoth,
+}
+
 /// Live progress of one background copy/move, shared with its worker.
 #[derive(Default)]
 struct JobProgress {
-    /// Bytes that need copying (0 while sizing, and for pure renames).
+    /// Bytes that need copying; grows while a size walk runs alongside the
+    /// copy (0 for pure renames).
     total: AtomicU64,
     done: AtomicU64,
     cancel: AtomicBool,
@@ -16631,26 +16679,87 @@ struct FileJob {
     prog: Arc<JobProgress>,
 }
 
-/// A reversible file operation. Paths are (original, where it is now).
+/// Cheap fingerprint of an item tree — bytes, entries, newest mtime — enough
+/// to tell whether a copy has been edited since it was placed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct TreeStamp {
+    bytes: u64,
+    items: u64,
+    newest: i128,
+}
+
+/// One item a transfer put in place (`stamp` only where undo needs it).
+struct Placed {
+    src: PathBuf,
+    dest: PathBuf,
+    stamp: Option<TreeStamp>,
+}
+
+struct TransferOutcome {
+    placed: Vec<Placed>,
+    /// What went wrong or was kept, for the status line.
+    err: Option<String>,
+}
+
+/// A reversible file operation. Pairs are (original, where it is now).
 enum UndoOp {
-    Transfer { kind: TransferKind, pairs: Vec<(PathBuf, PathBuf)> },
+    Moved(Vec<(PathBuf, PathBuf)>),
     Renamed(Vec<(PathBuf, PathBuf)>),
     Trashed(Vec<(PathBuf, PathBuf)>),
     /// Items this app created (new folder/file, archive): undo trashes them.
     Created(Vec<PathBuf>),
+    /// Items an operation brought into being (copies, things put back from
+    /// the Trash) and how they looked then: undo trashes only the unchanged.
+    Placed(Vec<(PathBuf, Option<TreeStamp>)>),
 }
 
 impl UndoOp {
     fn label(&self) -> String {
         match self {
-            UndoOp::Transfer { kind: TransferKind::Copy, pairs } => format!("Copy of {}", items_label(pairs.len())),
-            UndoOp::Transfer { kind: TransferKind::Move, pairs } => format!("Move of {}", items_label(pairs.len())),
+            UndoOp::Moved(p) => format!("Move of {}", items_label(p.len())),
             UndoOp::Renamed(p) if p.len() == 1 => format!("Rename of “{}”", path_label(&p[0].1)),
             UndoOp::Renamed(p) => format!("Rename of {}", items_label(p.len())),
             UndoOp::Trashed(p) => format!("Move to Trash of {}", items_label(p.len())),
             UndoOp::Created(p) if p.len() == 1 => format!("New “{}”", path_label(&p[0])),
             UndoOp::Created(p) => format!("New {}", items_label(p.len())),
+            UndoOp::Placed(p) => format!("Copy of {}", items_label(p.len())),
         }
+    }
+}
+
+/// An undo/redo stack entry. Undoing one records its inverse on the redo
+/// stack (and vice versa) under the same label.
+struct UndoEntry {
+    label: String,
+    op: UndoOp,
+}
+
+/// Undo generations kept (each stack).
+const UNDO_DEPTH: usize = 64;
+
+fn push_capped(stack: &mut Vec<UndoEntry>, entry: UndoEntry) {
+    stack.push(entry);
+    if stack.len() > UNDO_DEPTH {
+        stack.remove(0);
+    }
+}
+
+/// What a finished transfer leaves on the undo/redo stacks.
+enum Record {
+    /// A fresh user action: onto the undo stack (clears redo).
+    Fresh,
+    /// Undoing (`to_redo`) or redoing the entry `label`; its inverse goes on
+    /// the other stack. `as_placed`: the items came back from the Trash, so
+    /// the inverse trashes them again (only if unchanged).
+    Revert { label: String, to_redo: bool, as_placed: bool },
+}
+
+/// The undo op for what a transfer placed.
+fn transfer_undo_op(kind: TransferKind, placed: Vec<Placed>, as_placed: bool) -> UndoOp {
+    if kind == TransferKind::Copy || as_placed {
+        UndoOp::Placed(placed.into_iter().map(|p| (p.dest, p.stamp)).collect())
+    } else {
+        UndoOp::Moved(placed.into_iter().map(|p| (p.src, p.dest)).collect())
     }
 }
 
@@ -16659,109 +16768,656 @@ fn items_label(n: usize) -> String {
     if n == 1 { "1 item".to_string() } else { format!("{n} items") }
 }
 
-/// Copy or move each (src, dest) pair. Moves try a rename first (instant on
-/// the same volume) and fall back to copy + delete across volumes. Copies use
-/// `fs::copy`, which clones on APFS (instant, no extra space) and otherwise
-/// copies data + xattrs. Never overwrites: a pair whose destination exists is
-/// skipped. Stops after the current file when cancelled (the half-done item is
-/// removed). Returns the pairs that completed, and the last error if any.
-fn run_transfer(
-    pairs: &[(PathBuf, PathBuf)],
-    kind: TransferKind,
-    prog: &JobProgress,
-) -> (Vec<(PathBuf, PathBuf)>, Option<String>) {
-    const EXDEV: i32 = 18;
-    let mut done = Vec::new();
-    let mut err = None;
-    let mut to_copy = Vec::new();
-    for (src, dest) in pairs {
-        if fs::symlink_metadata(dest).is_ok() {
-            err = Some(format!("“{}” already exists there", path_label(dest)));
-            continue;
-        }
-        if kind == TransferKind::Move {
-            match fs::rename(src, dest) {
-                Ok(()) => {
-                    done.push((src.clone(), dest.clone()));
-                    continue;
-                }
-                Err(e) if e.raw_os_error() == Some(EXDEV) => {}
-                Err(e) => {
-                    err = Some(format!("Couldn't move “{}”: {e}", path_label(src)));
-                    continue;
-                }
-            }
-        }
-        to_copy.push((src.clone(), dest.clone()));
-    }
-    prog.total.store(to_copy.iter().map(|(s, _)| tree_size(s)).sum(), Ordering::Relaxed);
-    for (src, dest) in to_copy {
-        match copy_tree(&src, &dest, prog) {
-            Ok(()) => {
-                if kind == TransferKind::Move {
-                    let removed = if fs::symlink_metadata(&src).is_ok_and(|m| m.is_dir()) {
-                        fs::remove_dir_all(&src)
-                    } else {
-                        fs::remove_file(&src)
-                    };
-                    if let Err(e) = removed {
-                        err = Some(format!("Copied “{}” but couldn't remove the original: {e}", path_label(&src)));
-                    }
-                }
-                done.push((src, dest));
-            }
-            Err(e) => {
-                let _ = if fs::symlink_metadata(&dest).is_ok_and(|m| m.is_dir()) {
-                    fs::remove_dir_all(&dest)
-                } else {
-                    fs::remove_file(&dest)
-                };
-                if prog.cancel.load(Ordering::Relaxed) {
-                    break;
-                }
-                err = Some(format!("Couldn't copy “{}”: {e}", path_label(&src)));
-            }
-        }
-    }
-    (done, err)
+// --- no-clobber primitives (macOS) ---
+
+/// Prefix of staged, not-yet-published copies.
+const STAGE_PREFIX: &str = ".shuffle-partial-";
+/// Publish in-file progress at most every this many bytes per file.
+const PROGRESS_STEP: u64 = 1 << 20;
+
+fn next_serial() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Total bytes of regular files under `p` (symlinks not followed).
-fn tree_size(p: &Path) -> u64 {
-    match fs::symlink_metadata(p) {
-        Ok(m) if m.is_dir() => fs::read_dir(p)
-            .map(|rd| rd.flatten().map(|e| tree_size(&e.path())).sum())
-            .unwrap_or(0),
-        Ok(m) if m.is_file() => m.len(),
-        _ => 0,
+fn c_path(p: &Path) -> std::io::Result<std::ffi::CString> {
+    use std::os::unix::ffi::OsStrExt;
+    std::ffi::CString::new(p.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "path contains NUL"))
+}
+
+fn cancelled_error() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled")
+}
+
+/// rename(2) that fails with `AlreadyExists` instead of replacing whatever is
+/// at `to` — the kernel checks and renames in one step.
+fn rename_excl(from: &Path, to: &Path) -> std::io::Result<()> {
+    let (f, t) = (c_path(from)?, c_path(to)?);
+    if unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) } == 0 {
+        return Ok(());
+    }
+    let e = std::io::Error::last_os_error();
+    if e.raw_os_error() == Some(libc::ENOTSUP) {
+        // Volumes without exclusive rename (some network/FAT disks): best effort.
+        if fs::symlink_metadata(to).is_ok() {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        return fs::rename(from, to);
+    }
+    Err(e)
+}
+
+/// Rename without clobbering; a case-only change ("a" → "A", which "exists"
+/// on case-insensitive APFS) goes via a hidden temporary name.
+fn rename_no_clobber(from: &Path, to: &Path) -> std::io::Result<()> {
+    let case_only = from != to
+        && from.parent() == to.parent()
+        && from.to_string_lossy().to_lowercase() == to.to_string_lossy().to_lowercase();
+    if !case_only {
+        return rename_excl(from, to);
+    }
+    let tmp = from.with_file_name(format!(".shuffle-rename-{}-{}", std::process::id(), next_serial()));
+    rename_excl(from, &tmp)?;
+    rename_excl(&tmp, to).inspect_err(|_| {
+        let _ = rename_excl(&tmp, from);
+    })
+}
+
+/// Put something at `dest` via `put` (which must fail with `AlreadyExists`
+/// rather than overwrite). KeepBoth retries at "name 2.ext", "name 3.ext"…
+/// Returns where it landed.
+fn place(
+    dest: &Path,
+    policy: ConflictPolicy,
+    mut put: impl FnMut(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    let mut k = 0;
+    loop {
+        let candidate = match (k, dest.file_name()) {
+            (0, _) | (_, None) => dest.to_path_buf(),
+            (k, Some(name)) => dest.with_file_name(keep_both_name(&name.to_string_lossy(), k)),
+        };
+        match put(&candidate) {
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && policy == ConflictPolicy::KeepBoth && k < 10_000 => {
+                k += 1
+            }
+            r => return r.map(|()| candidate),
+        }
     }
 }
 
-/// Recursively copy `src` to `dest` (which must not exist), keeping symlinks
-/// as symlinks, permissions, and file modification dates.
-fn copy_tree(src: &Path, dest: &Path, prog: &JobProgress) -> std::io::Result<()> {
-    if prog.cancel.load(Ordering::Relaxed) {
-        return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "cancelled"));
+/// The `k`-th Finder-style alternative to `name`: "a.txt" → "a 2.txt",
+/// "a 3.txt"…; an already-numbered "a 2.txt" continues at "a 3.txt".
+fn keep_both_name(name: &str, k: u32) -> String {
+    let (stem, ext) = match name.rsplit_once('.') {
+        Some((s, e)) if !s.is_empty() => (s, Some(e)),
+        _ => (name, None),
+    };
+    let (base, start) = match stem.rsplit_once(' ') {
+        Some((b, n)) if !b.is_empty() && !n.starts_with('0') => match n.parse::<u32>() {
+            Ok(n) if n >= 2 => (b, n),
+            _ => (stem, 1),
+        },
+        _ => (stem, 1),
+    };
+    let n = start.saturating_add(k);
+    match ext {
+        Some(e) => format!("{base} {n}.{e}"),
+        None => format!("{base} {n}"),
     }
-    let md = fs::symlink_metadata(src)?;
-    if md.file_type().is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(src)?, dest)?;
-    } else if md.is_dir() {
-        fs::create_dir(dest)?;
-        for e in fs::read_dir(src)? {
-            let e = e?;
-            copy_tree(&e.path(), &dest.join(e.file_name()), prog)?;
-        }
-        fs::set_permissions(dest, md.permissions())?;
-    } else {
-        fs::copy(src, dest)?;
-        if let (Ok(f), Ok(t)) = (fs::File::options().write(true).open(dest), md.modified()) {
-            let _ = f.set_modified(t);
-        }
-        prog.done.fetch_add(md.len(), Ordering::Relaxed);
+}
+
+fn fsync_path(p: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let f = fs::File::open(p)?;
+    if unsafe { libc::fsync(f.as_raw_fd()) } == 0 { Ok(()) } else { Err(std::io::Error::last_os_error()) }
+}
+
+/// fsync `dir`, then one F_FULLFSYNC so the drive's own cache reaches the
+/// platter/flash too (plain fsync on macOS stops at the drive).
+fn full_barrier(dir: &Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let f = fs::File::open(dir)?;
+    if unsafe { libc::fcntl(f.as_raw_fd(), libc::F_FULLFSYNC) } == -1
+        && unsafe { libc::fsync(f.as_raw_fd()) } != 0
+    {
+        return Err(std::io::Error::last_os_error());
     }
     Ok(())
 }
+
+// --- test hooks (compiled out of the app) ---
+
+#[cfg(test)]
+thread_local! {
+    /// Treat every move as crossing volumes (copy + verified delete).
+    static TEST_FORCE_EXDEV: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Never clone (forces real byte copies, so progress/cancel are visible).
+    static TEST_NO_CLONE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Runs after a copy-based move's copy is published, before sources go.
+    static TEST_BEFORE_DELETE: RefCell<Option<Box<dyn Fn()>>> = const { RefCell::new(None) };
+    /// Undo "trashes" into this folder instead of the real Trash.
+    static TEST_TRASH: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn hook_force_exdev() -> bool {
+    TEST_FORCE_EXDEV.get()
+}
+#[cfg(not(test))]
+fn hook_force_exdev() -> bool {
+    false
+}
+#[cfg(test)]
+fn hook_no_clone() -> bool {
+    TEST_NO_CLONE.get()
+}
+#[cfg(not(test))]
+fn hook_no_clone() -> bool {
+    false
+}
+#[cfg(test)]
+fn hook_before_delete() {
+    TEST_BEFORE_DELETE.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f()
+        }
+    });
+}
+#[cfg(not(test))]
+fn hook_before_delete() {}
+
+// --- copying ---
+
+/// Settings shared by every file of one transfer (Sync: files copy in parallel).
+struct CopyCtx<'a> {
+    prog: &'a JobProgress,
+    /// Try APFS clones (instant, no extra space) before copying bytes.
+    clone: bool,
+    /// fsync everything written (moves, before their sources are deleted).
+    durable: bool,
+}
+
+/// A source entry as a copy-based move read it.
+#[derive(PartialEq)]
+struct SrcStamp {
+    path: PathBuf,
+    dev: u64,
+    ino: u64,
+    size: u64,
+    mtime: (i64, i64),
+    ctime: (i64, i64),
+    is_dir: bool,
+}
+
+impl SrcStamp {
+    fn of(path: &Path, md: &fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        SrcStamp {
+            path: path.to_path_buf(),
+            dev: md.dev() as u64,
+            ino: md.ino(),
+            size: md.size(),
+            mtime: (md.mtime(), md.mtime_nsec()),
+            ctime: (md.ctime(), md.ctime_nsec()),
+            is_dir: md.is_dir(),
+        }
+    }
+}
+
+/// Small pool for copying a folder's files side by side (small-file-heavy
+/// trees are latency-bound, not bandwidth-bound).
+fn copy_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .thread_name(|i| format!("shuffle-copy-{i}"))
+            .build()
+            .expect("copy thread pool")
+    })
+}
+
+/// copyfile's per-file callback state: in-file progress and cancel.
+struct CopyStatus<'a> {
+    prog: &'a JobProgress,
+    /// Bytes of this file already added to `prog.done`.
+    counted: u64,
+}
+
+extern "C" fn copy_status_cb(
+    what: libc::c_int,
+    stage: libc::c_int,
+    state: libc::copyfile_state_t,
+    _src: *const libc::c_char,
+    _dst: *const libc::c_char,
+    ctx: *mut libc::c_void,
+) -> libc::c_int {
+    // SAFETY: ctx is the `CopyStatus` that `copy_file` keeps alive across the call.
+    let st = unsafe { &mut *(ctx as *mut CopyStatus) };
+    if st.prog.cancel.load(Ordering::Relaxed) {
+        return libc::COPYFILE_QUIT;
+    }
+    if what == libc::COPYFILE_COPY_DATA && stage == libc::COPYFILE_PROGRESS {
+        let mut copied: libc::off_t = 0;
+        let ok = unsafe {
+            libc::copyfile_state_get(
+                state,
+                libc::COPYFILE_STATE_COPIED as u32,
+                &mut copied as *mut libc::off_t as *mut libc::c_void,
+            )
+        } == 0;
+        let copied = copied.max(0) as u64;
+        if ok && copied >= st.counted + PROGRESS_STEP {
+            st.prog.done.fetch_add(copied - st.counted, Ordering::Relaxed);
+            st.counted = copied;
+        }
+    }
+    libc::COPYFILE_CONTINUE
+}
+
+/// Copy one regular file to `dst` (which must not exist) with all metadata,
+/// cloning where the volume can. Progress lands inside the file and a cancel
+/// stops it within a chunk.
+fn copy_file(src: &Path, dst: &Path, len: u64, cx: &CopyCtx) -> std::io::Result<()> {
+    let (s, d) = (c_path(src)?, c_path(dst)?);
+    let mut status = CopyStatus { prog: cx.prog, counted: 0 };
+    let mut flags = libc::COPYFILE_METADATA | libc::COPYFILE_DATA | libc::COPYFILE_EXCL | libc::COPYFILE_NOFOLLOW_SRC;
+    if cx.clone {
+        flags |= libc::COPYFILE_CLONE;
+    }
+    // SAFETY: the state is freed before returning; the callback context
+    // outlives the copyfile call.
+    let (rc, err) = unsafe {
+        let state = libc::copyfile_state_alloc();
+        libc::copyfile_state_set(state, libc::COPYFILE_STATE_STATUS_CB as u32, copy_status_cb as *const libc::c_void);
+        libc::copyfile_state_set(
+            state,
+            libc::COPYFILE_STATE_STATUS_CTX as u32,
+            &mut status as *mut CopyStatus as *const libc::c_void,
+        );
+        let rc = libc::copyfile(s.as_ptr(), d.as_ptr(), state, flags);
+        let err = std::io::Error::last_os_error();
+        libc::copyfile_state_free(state);
+        (rc, err)
+    };
+    if rc != 0 {
+        if cx.prog.cancel.load(Ordering::Relaxed) || err.raw_os_error() == Some(libc::ECANCELED) {
+            return Err(cancelled_error());
+        }
+        return Err(err);
+    }
+    // Clones (and small files) report no progress; count the rest now.
+    cx.prog.done.fetch_add(len.saturating_sub(status.counted), Ordering::Relaxed);
+    if cx.durable {
+        fsync_path(dst)?;
+    }
+    Ok(())
+}
+
+/// Give a copied folder its source's xattrs, ACL, mode, flags and dates —
+/// after its children are written, so their arrival doesn't bump the mtime.
+fn copy_dir_metadata(src: &Path, dst: &Path, md: &fs::Metadata) {
+    let (Ok(s), Ok(d)) = (c_path(src), c_path(dst)) else { return };
+    // SAFETY: plain C call on NUL-terminated paths.
+    unsafe {
+        libc::copyfile(s.as_ptr(), d.as_ptr(), std::ptr::null_mut(), libc::COPYFILE_METADATA | libc::COPYFILE_NOFOLLOW);
+    }
+    set_dates(dst, md);
+}
+
+/// Give `dst` the access/modification dates in `md`.
+fn set_dates(dst: &Path, md: &fs::Metadata) {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(d) = c_path(dst) else { return };
+    let ts = [
+        libc::timespec { tv_sec: md.atime(), tv_nsec: md.atime_nsec() },
+        libc::timespec { tv_sec: md.mtime(), tv_nsec: md.mtime_nsec() },
+    ];
+    // SAFETY: plain C call on a NUL-terminated path.
+    unsafe { libc::utimensat(libc::AT_FDCWD, d.as_ptr(), ts.as_ptr(), libc::AT_SYMLINK_NOFOLLOW) };
+}
+
+/// clonefile keeps files' dates but stamps every cloned folder "now": put
+/// the source folders' dates back, children before parents.
+fn fix_cloned_dir_dates(src: &Path, dst: &Path, md: &fs::Metadata) {
+    for e in fs::read_dir(src).into_iter().flatten().flatten() {
+        if let Some(m) = e.metadata().ok().filter(|m| m.is_dir()) {
+            fix_cloned_dir_dates(&e.path(), &dst.join(e.file_name()), &m);
+        }
+    }
+    set_dates(dst, md);
+}
+
+/// Copy one entry of any kind to `dst` (which must not exist), keeping
+/// symlinks as symlinks. A move passes `manifest` to record each source as
+/// it was read. Sockets/FIFOs/devices are skipped (a move leaves them).
+fn copy_entry(
+    src: &Path,
+    dst: &Path,
+    cx: &CopyCtx,
+    manifest: Option<&Mutex<Vec<SrcStamp>>>,
+) -> std::io::Result<()> {
+    if cx.prog.cancel.load(Ordering::Relaxed) {
+        return Err(cancelled_error());
+    }
+    let md = fs::symlink_metadata(src)?;
+    let ft = md.file_type();
+    if ft.is_symlink() {
+        std::os::unix::fs::symlink(fs::read_link(src)?, dst)?;
+    } else if ft.is_dir() {
+        copy_dir(src, dst, &md, cx, manifest)?;
+    } else if ft.is_file() {
+        copy_file(src, dst, md.len(), cx)?;
+    } else {
+        return Ok(());
+    }
+    if let Some(m) = manifest {
+        m.lock().unwrap_or_else(|e| e.into_inner()).push(SrcStamp::of(src, &md));
+    }
+    Ok(())
+}
+
+fn copy_dir(
+    src: &Path,
+    dst: &Path,
+    md: &fs::Metadata,
+    cx: &CopyCtx,
+    manifest: Option<&Mutex<Vec<SrcStamp>>>,
+) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    // Owner-writable while filling; the real mode comes with the metadata.
+    fs::DirBuilder::new().mode(0o700).create(dst)?;
+    let mut files = Vec::new();
+    for e in fs::read_dir(src)? {
+        let e = e?;
+        let (from, to) = (e.path(), dst.join(e.file_name()));
+        if e.file_type()?.is_file() {
+            files.push((from, to));
+        } else {
+            copy_entry(&from, &to, cx, manifest)?;
+        }
+    }
+    if files.len() > 1 {
+        copy_pool().install(|| files.par_iter().try_for_each(|(f, t)| copy_entry(f, t, cx, manifest)))?;
+    } else {
+        for (f, t) in &files {
+            copy_entry(f, t, cx, manifest)?;
+        }
+    }
+    copy_dir_metadata(src, dst, md);
+    if cx.durable {
+        fsync_path(dst)?;
+    }
+    Ok(())
+}
+
+/// Copy `src` to the staged path. A folder copy (not a move) first tries one
+/// `clonefile` of the whole tree — instant on APFS, all metadata kept — and
+/// otherwise walks. Returns whether it was cloned whole.
+fn copy_item(
+    src: &Path,
+    staged: &Path,
+    cx: &CopyCtx,
+    manifest: Option<&Mutex<Vec<SrcStamp>>>,
+) -> std::io::Result<bool> {
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    let md = fs::symlink_metadata(src)?;
+    if cx.clone && manifest.is_none() && md.is_dir() {
+        let (s, d) = (c_path(src)?, c_path(staged)?);
+        if unsafe { libc::clonefile(s.as_ptr(), d.as_ptr(), CLONE_NOFOLLOW) } == 0 {
+            fix_cloned_dir_dates(src, staged, &md);
+            return Ok(true);
+        }
+        // Another volume, or no clone support: copy file by file instead.
+        remove_staged(staged);
+    }
+    copy_entry(src, staged, cx, manifest).map(|()| false)
+}
+
+/// A hidden staging name beside the final destination.
+fn staged_path(dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
+    let mut n = name.to_string_lossy().into_owned();
+    // Stay well under NAME_MAX (255 bytes) with the prefix added.
+    while n.len() > 200 {
+        n.pop();
+    }
+    dir.join(format!("{STAGE_PREFIX}{}-{}-{n}", std::process::id(), next_serial()))
+}
+
+/// Delete a staged (never published) item, even one whose folders already
+/// took on read-only modes.
+fn remove_staged(p: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(md) = fs::symlink_metadata(p) else { return };
+    if !md.is_dir() {
+        let _ = fs::remove_file(p);
+        return;
+    }
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let _ = fs::set_permissions(&d, fs::Permissions::from_mode(0o700));
+        for e in fs::read_dir(&d).into_iter().flatten().flatten() {
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
+                stack.push(e.path());
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(p);
+}
+
+/// Remove partials a crashed run left in `dir`: a day since their last
+/// status change, and not from a process that's still alive.
+fn sweep_stale_partials(dir: &Path) {
+    use std::os::unix::fs::MetadataExt;
+    let day_ago = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64 - 86_400)
+        .unwrap_or(0);
+    for e in fs::read_dir(dir).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(rest) = name.strip_prefix(STAGE_PREFIX) else { continue };
+        let pid: i32 = rest.split('-').next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        let alive = pid > 0 && (pid as u32 == std::process::id() || unsafe { libc::kill(pid, 0) } == 0);
+        if !alive && fs::symlink_metadata(e.path()).is_ok_and(|m| m.ctime() < day_ago) {
+            remove_staged(&e.path());
+        }
+    }
+}
+
+/// Add the bytes under `p` to `prog.total` as they're found (runs beside the
+/// copy, so copying starts at once instead of after a full pre-walk).
+fn add_sizes(p: &Path, prog: &JobProgress, stop: &AtomicBool) {
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        if stop.load(Ordering::Relaxed) || prog.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        match fs::symlink_metadata(&p) {
+            Ok(m) if m.is_dir() => {
+                stack.extend(fs::read_dir(&p).into_iter().flatten().flatten().map(|e| e.path()));
+            }
+            Ok(m) if m.is_file() => {
+                prog.total.fetch_add(m.len(), Ordering::Relaxed);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Fingerprint the tree at `p` (symlinks not followed).
+fn tree_stamp(p: &Path) -> TreeStamp {
+    use std::os::unix::fs::MetadataExt;
+    let mut s = TreeStamp::default();
+    let mut stack = vec![p.to_path_buf()];
+    while let Some(p) = stack.pop() {
+        let Ok(m) = fs::symlink_metadata(&p) else { continue };
+        s.items += 1;
+        s.newest = s.newest.max(m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128);
+        if m.is_dir() {
+            stack.extend(fs::read_dir(&p).into_iter().flatten().flatten().map(|e| e.path()));
+        } else if m.is_file() {
+            s.bytes += m.len();
+        }
+    }
+    s
+}
+
+/// After a copy-based move: delete the sources still exactly as they were
+/// read (deepest first; folders only once empty). Returns how many changed
+/// meanwhile and were kept.
+fn delete_moved_sources(manifest: Vec<SrcStamp>) -> usize {
+    // Check everything first: deleting a child touches its folder's dates.
+    let mut changed = 0;
+    let mut doomed = Vec::new();
+    for s in manifest {
+        match fs::symlink_metadata(&s.path) {
+            Ok(m) if SrcStamp::of(&s.path, &m) == s => doomed.push(s),
+            Ok(_) => changed += 1,
+            Err(_) => {}
+        }
+    }
+    doomed.sort_by_key(|s| std::cmp::Reverse(s.path.components().count()));
+    for s in doomed {
+        // A folder that kept a changed child (or gained one) stays.
+        let _ = if s.is_dir { fs::remove_dir(&s.path) } else { fs::remove_file(&s.path) };
+    }
+    changed
+}
+
+fn place_error(verb: &str, src: &Path, dest: &Path, e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        format!("“{}” already exists there", path_label(dest))
+    } else {
+        format!("Couldn't {verb} “{}”: {e}", path_label(src))
+    }
+}
+
+/// Copy one item through a staged sibling and publish it; for a move, then
+/// retire the sources. Ok: what was placed plus a note (originals kept).
+/// Err(None): cancelled.
+fn transfer_by_copy(
+    src: &Path,
+    dest: &Path,
+    kind: TransferKind,
+    policy: ConflictPolicy,
+    cx: &CopyCtx,
+    swept: &mut HashSet<PathBuf>,
+) -> Result<(Placed, Option<String>), Option<String>> {
+    let (Some(dir), Some(name)) = (dest.parent(), dest.file_name()) else {
+        return Err(Some(format!("Couldn't copy “{}”", path_label(src))));
+    };
+    if swept.insert(dir.to_path_buf()) {
+        sweep_stale_partials(dir);
+    }
+    // Fast path only — the publish below is what actually guarantees it.
+    if policy == ConflictPolicy::Skip && fs::symlink_metadata(dest).is_ok() {
+        return Err(Some(format!("“{}” already exists there", path_label(dest))));
+    }
+    let staged = staged_path(dir, name);
+    let manifest = (kind == TransferKind::Move).then(|| Mutex::new(Vec::new()));
+    let cloned = match copy_item(src, &staged, cx, manifest.as_ref()) {
+        Ok(c) => c,
+        Err(e) => {
+            remove_staged(&staged);
+            if cx.prog.cancel.load(Ordering::Relaxed) || e.kind() == std::io::ErrorKind::Interrupted {
+                return Err(None);
+            }
+            return Err(Some(format!("Couldn't copy “{}”: {e}", path_label(src))));
+        }
+    };
+    let dest = match place(dest, policy, |d| rename_excl(&staged, d)) {
+        Ok(d) => d,
+        Err(e) => {
+            remove_staged(&staged);
+            return Err(Some(place_error("copy", src, dest, &e)));
+        }
+    };
+    let mut note = None;
+    if let Some(m) = manifest {
+        // The copy must be on disk before any original goes.
+        if let Err(e) = full_barrier(dir) {
+            note = Some(format!("Couldn't flush “{}” to disk ({e}); kept the original", path_label(src)));
+        } else {
+            hook_before_delete();
+            if delete_moved_sources(m.into_inner().unwrap_or_else(|e| e.into_inner())) > 0 {
+                note = Some(format!("“{}” changed during the move; kept the original", path_label(src)));
+            }
+        }
+    }
+    let stamp = (kind == TransferKind::Copy || cloned).then(|| tree_stamp(&dest));
+    if cloned {
+        cx.prog.done.fetch_add(stamp.map_or(0, |s| s.bytes), Ordering::Relaxed);
+    }
+    Ok((Placed { src: src.to_path_buf(), dest, stamp }, note))
+}
+
+/// Copy or move each (src, dest) pair. Moves try an exclusive rename first
+/// (instant on one volume) and fall back to copy + verified delete across
+/// volumes. Copies clone on APFS (whole folders in one call) and are staged
+/// under a hidden name until complete. Never overwrites: `policy` says what a
+/// taken name gets. A cancel stops mid-file; the partial item is removed.
+fn run_transfer(
+    pairs: &[(PathBuf, PathBuf)],
+    kind: TransferKind,
+    policy: ConflictPolicy,
+    prog: &JobProgress,
+) -> TransferOutcome {
+    let mut placed = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    let mut to_copy = Vec::new();
+    for (src, dest) in pairs {
+        if kind == TransferKind::Move && !hook_force_exdev() {
+            match place(dest, policy, |d| rename_excl(src, d)) {
+                Ok(d) => {
+                    placed.push(Placed { src: src.clone(), dest: d, stamp: None });
+                    continue;
+                }
+                Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {}
+                Err(e) => {
+                    notes.push(place_error("move", src, dest, &e));
+                    continue;
+                }
+            }
+        }
+        to_copy.push((src, dest));
+    }
+    if !to_copy.is_empty() {
+        let cx = CopyCtx { prog, clone: !hook_no_clone(), durable: kind == TransferKind::Move };
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for (src, _) in &to_copy {
+                    add_sizes(src, prog, &stop);
+                }
+            });
+            let mut swept = HashSet::new();
+            for (src, dest) in &to_copy {
+                if prog.cancel.load(Ordering::Relaxed) {
+                    break;
+                }
+                match transfer_by_copy(src, dest, kind, policy, &cx, &mut swept) {
+                    Ok((p, note)) => {
+                        placed.push(p);
+                        notes.extend(note);
+                    }
+                    Err(Some(e)) => notes.push(e),
+                    Err(None) => break,
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+    }
+    let err = match notes.len() {
+        0 => None,
+        1 => notes.pop(),
+        n => Some(format!("{} (+{} more)", notes[0], n - 1)),
+    };
+    TransferOutcome { placed, err }
+}
+
+// --- undo helpers ---
 
 /// Move `path` to the Trash; returns where it landed there (for undo).
 fn trash_path(path: &Path) -> Option<PathBuf> {
@@ -16771,6 +17427,61 @@ fn trash_path(path: &Path) -> Option<PathBuf> {
     let mut out = None;
     fm.trashItemAtURL_resultingItemURL_error(&url, Some(&mut out)).ok()?;
     Some(out.and_then(|u| u.path()).map(|p| PathBuf::from(p.to_string())).unwrap_or_default())
+}
+
+#[cfg(test)]
+fn trash_for_undo(path: &Path) -> Option<PathBuf> {
+    let dir = TEST_TRASH.with(|t| t.borrow().clone())?;
+    let to = dir.join(format!("{}-{}", next_serial(), path.file_name()?.to_string_lossy()));
+    rename_excl(path, &to).ok().map(|()| to)
+}
+#[cfg(not(test))]
+fn trash_for_undo(path: &Path) -> Option<PathBuf> {
+    trash_path(path)
+}
+
+/// Trash the items still as they were placed. Returns (original, where it
+/// went) for what was trashed, and the items left alone as changed since.
+fn trash_unchanged(items: Vec<(PathBuf, Option<TreeStamp>)>) -> (Vec<(PathBuf, PathBuf)>, Vec<PathBuf>) {
+    let (mut trashed, mut changed) = (Vec::new(), Vec::new());
+    for (p, stamp) in items {
+        if fs::symlink_metadata(&p).is_err() {
+            continue;
+        }
+        if stamp.is_some_and(|s| tree_stamp(&p) != s) {
+            changed.push(p);
+            continue;
+        }
+        if let Some(t) = trash_for_undo(&p).filter(|t| !t.as_os_str().is_empty()) {
+            trashed.push((p, t));
+        }
+    }
+    (trashed, changed)
+}
+
+/// Rename each (original, now) back to its original name — via hidden
+/// temporary names, so a batch that swapped names reverts cleanly — never
+/// clobbering. Returns the pairs that went back.
+fn revert_renames(pairs: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, PathBuf)> {
+    let mut staged = Vec::new();
+    for (from, to) in pairs.iter().rev() {
+        if fs::symlink_metadata(to).is_err() {
+            continue;
+        }
+        let tmp = to.with_file_name(format!(".shuffle-undo-{}-{}", std::process::id(), next_serial()));
+        if rename_excl(to, &tmp).is_ok() {
+            staged.push((tmp, from, to));
+        }
+    }
+    let mut done = Vec::new();
+    for (tmp, from, to) in staged {
+        if rename_excl(&tmp, from).is_ok() {
+            done.push((from.clone(), to.clone()));
+        } else {
+            let _ = rename_excl(&tmp, to);
+        }
+    }
+    done
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -21880,29 +22591,309 @@ mod tests {
         std::os::unix::fs::symlink("sub/f.txt", src.join("link")).unwrap();
         let dst = d.join("dst");
         fs::create_dir(&dst).unwrap();
+        let skip = ConflictPolicy::Skip;
 
         let prog = JobProgress::default();
-        let (done, err) = run_transfer(&[(src.clone(), dst.join("copy"))], TransferKind::Copy, &prog);
-        assert!(err.is_none(), "{err:?}");
-        assert_eq!(done.len(), 1);
+        let out = run_transfer(&[(src.clone(), dst.join("copy"))], TransferKind::Copy, skip, &prog);
+        assert!(out.err.is_none(), "{:?}", out.err);
+        assert_eq!(out.placed.len(), 1);
         assert_eq!(fs::read_to_string(dst.join("copy/sub/f.txt")).unwrap(), "hello");
         assert!(fs::symlink_metadata(dst.join("copy/link")).unwrap().file_type().is_symlink());
         assert_eq!(prog.done.load(Ordering::Relaxed), 5);
 
         // Destination exists → skipped, nothing overwritten.
-        let (done, err) = run_transfer(&[(src.clone(), dst.join("copy"))], TransferKind::Copy, &prog);
-        assert!(done.is_empty() && err.is_some());
+        let out = run_transfer(&[(src.clone(), dst.join("copy"))], TransferKind::Copy, skip, &prog);
+        assert!(out.placed.is_empty() && out.err.is_some());
 
         // Same-volume move is a rename.
-        let (done, _) = run_transfer(&[(src.clone(), dst.join("moved"))], TransferKind::Move, &prog);
-        assert_eq!(done.len(), 1);
+        let out = run_transfer(&[(src.clone(), dst.join("moved"))], TransferKind::Move, skip, &prog);
+        assert_eq!(out.placed.len(), 1);
         assert!(!src.exists() && dst.join("moved/sub/f.txt").exists());
 
         // Cancelled before starting: nothing copied, no partial left behind.
         let cancelled = JobProgress::default();
         cancelled.cancel.store(true, Ordering::Relaxed);
-        let (done, _) = run_transfer(&[(dst.join("moved"), dst.join("c2"))], TransferKind::Copy, &cancelled);
-        assert!(done.is_empty() && !dst.join("c2").exists());
+        let out = run_transfer(&[(dst.join("moved"), dst.join("c2"))], TransferKind::Copy, skip, &cancelled);
+        assert!(out.placed.is_empty() && !dst.join("c2").exists());
+        assert!(partials(&dst).is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    /// Leftover `.shuffle-partial-*` names in `dir`.
+    fn partials(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(STAGE_PREFIX))
+            .collect()
+    }
+
+    #[test]
+    fn racing_transfers_never_clobber() {
+        let d = scratch("race");
+        let dst = d.join("dst");
+        fs::create_dir(&dst).unwrap();
+        let srcs: Vec<PathBuf> = (0..8)
+            .map(|i| {
+                let p = d.join(format!("s{i}"));
+                fs::create_dir(&p).unwrap();
+                fs::write(p.join("t.txt"), format!("writer {i}")).unwrap();
+                p.join("t.txt")
+            })
+            .collect();
+        let race = |kind: TransferKind, policy: ConflictPolicy| -> usize {
+            let gate = std::sync::Barrier::new(srcs.len());
+            std::thread::scope(|s| {
+                let hs: Vec<_> = srcs
+                    .iter()
+                    .map(|src| {
+                        let (gate, dest) = (&gate, dst.join("t.txt"));
+                        s.spawn(move || {
+                            gate.wait();
+                            run_transfer(&[(src.clone(), dest)], kind, policy, &JobProgress::default()).placed.len()
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap()).sum()
+            })
+        };
+        // Eight copies race for one name: exactly one wins, intact.
+        assert_eq!(race(TransferKind::Copy, ConflictPolicy::Skip), 1);
+        assert!(fs::read_to_string(dst.join("t.txt")).unwrap().starts_with("writer "));
+        assert!(partials(&dst).is_empty());
+        // Moves onto the now-taken name all fail and keep their sources.
+        assert_eq!(race(TransferKind::Move, ConflictPolicy::Skip), 0);
+        assert!(srcs.iter().all(|s| s.exists()));
+        // Keep Both: everyone lands, each under its own name.
+        fs::remove_file(dst.join("t.txt")).unwrap();
+        assert_eq!(race(TransferKind::Copy, ConflictPolicy::KeepBoth), 8);
+        let mut names: Vec<String> =
+            fs::read_dir(&dst).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        let mut want: Vec<String> = std::iter::once("t.txt".to_string()).chain((2..=8).map(|n| format!("t {n}.txt"))).collect();
+        want.sort();
+        assert_eq!(names, want);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failed_copy_never_appears_under_final_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("staged");
+        let src = d.join("src");
+        fs::create_dir_all(src.join("sub")).unwrap();
+        fs::write(src.join("a.txt"), "a").unwrap();
+        fs::write(src.join("sub/locked.txt"), "secret").unwrap();
+        fs::set_permissions(src.join("sub/locked.txt"), fs::Permissions::from_mode(0o000)).unwrap();
+        let dst = d.join("dst");
+        fs::create_dir(&dst).unwrap();
+        TEST_NO_CLONE.set(true);
+        let out = run_transfer(&[(src.clone(), dst.join("src"))], TransferKind::Copy, ConflictPolicy::Skip, &JobProgress::default());
+        TEST_NO_CLONE.set(false);
+        fs::set_permissions(src.join("sub/locked.txt"), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(out.placed.is_empty() && out.err.is_some());
+        assert!(!dst.join("src").exists());
+        assert!(partials(&dst).is_empty());
+        // A dead process's partial is only swept once it's a day old.
+        let stale = dst.join(format!("{STAGE_PREFIX}999999-0-x"));
+        fs::create_dir(&stale).unwrap();
+        sweep_stale_partials(&dst);
+        assert!(stale.exists(), "too fresh to sweep");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cancel_stops_mid_file() {
+        let d = scratch("cancel");
+        let big = d.join("big.bin");
+        let size = 512u64 << 20;
+        {
+            let f = fs::File::create(&big).unwrap();
+            f.set_len(size).unwrap();
+        }
+        let dst = d.join("dst");
+        fs::create_dir(&dst).unwrap();
+        let prog = JobProgress::default();
+        TEST_NO_CLONE.set(true);
+        let started = Instant::now();
+        let out = std::thread::scope(|s| {
+            s.spawn(|| {
+                // Cancel as soon as the copy is visibly under way.
+                while prog.done.load(Ordering::Relaxed) == 0 && started.elapsed() < Duration::from_secs(10) {
+                    std::thread::yield_now();
+                }
+                prog.cancel.store(true, Ordering::Relaxed);
+            });
+            run_transfer(&[(big.clone(), dst.join("big.bin"))], TransferKind::Copy, ConflictPolicy::Skip, &prog)
+        });
+        TEST_NO_CLONE.set(false);
+        let done = prog.done.load(Ordering::Relaxed);
+        assert!(out.placed.is_empty());
+        assert!(done > 0 && done < size, "progress inside the file, stopped early: {done}");
+        assert!(!dst.join("big.bin").exists());
+        assert!(partials(&dst).is_empty());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn cross_volume_move_keeps_changed_sources() {
+        let d = scratch("xvol");
+        let make = |root: &Path| {
+            fs::create_dir_all(root.join("sub")).unwrap();
+            fs::write(root.join("a.txt"), "aaa").unwrap();
+            fs::write(root.join("b.txt"), "bbb").unwrap();
+            fs::write(root.join("sub/c.txt"), "ccc").unwrap();
+        };
+        let dst = d.join("dst");
+        fs::create_dir(&dst).unwrap();
+        TEST_FORCE_EXDEV.set(true);
+
+        // Clean copy + delete: everything arrives, the source is gone.
+        let clean = d.join("clean");
+        make(&clean);
+        let out = run_transfer(&[(clean.clone(), dst.join("clean"))], TransferKind::Move, ConflictPolicy::Skip, &JobProgress::default());
+        assert!(out.err.is_none(), "{:?}", out.err);
+        assert!(!clean.exists());
+        assert_eq!(fs::read_to_string(dst.join("clean/sub/c.txt")).unwrap(), "ccc");
+
+        // A source edited mid-move is kept (and so is its folder).
+        let src = d.join("src");
+        make(&src);
+        let a = src.join("a.txt");
+        TEST_BEFORE_DELETE.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                std::thread::sleep(Duration::from_millis(5));
+                fs::write(&a, "edited during the move").unwrap();
+            }))
+        });
+        let out = run_transfer(&[(src.clone(), dst.join("src"))], TransferKind::Move, ConflictPolicy::Skip, &JobProgress::default());
+        TEST_BEFORE_DELETE.with(|h| *h.borrow_mut() = None);
+        TEST_FORCE_EXDEV.set(false);
+        assert_eq!(out.placed.len(), 1);
+        assert!(out.err.as_deref().is_some_and(|e| e.contains("changed during the move")), "{:?}", out.err);
+        assert_eq!(fs::read_to_string(dst.join("src/a.txt")).unwrap(), "aaa");
+        assert_eq!(fs::read_to_string(dst.join("src/sub/c.txt")).unwrap(), "ccc");
+        assert_eq!(fs::read_to_string(src.join("a.txt")).unwrap(), "edited during the move");
+        assert!(!src.join("b.txt").exists() && !src.join("sub").exists());
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn folder_metadata_survives_copy() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let d = scratch("meta");
+        let src = d.join("src");
+        fs::create_dir_all(src.join("inner")).unwrap();
+        fs::write(src.join("inner/f.txt"), "x").unwrap();
+        let set_mtime = |p: &Path, secs: i64| {
+            let c = c_path(p).unwrap();
+            let ts = [libc::timespec { tv_sec: secs, tv_nsec: 0 }, libc::timespec { tv_sec: secs, tv_nsec: 0 }];
+            assert_eq!(unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), ts.as_ptr(), 0) }, 0);
+        };
+        let c = c_path(&src).unwrap();
+        let (xname, val) = (c"com.shuffle.test", b"kept");
+        assert_eq!(
+            unsafe { libc::setxattr(c.as_ptr(), xname.as_ptr(), val.as_ptr().cast(), val.len(), 0, 0) },
+            0
+        );
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o750)).unwrap();
+        set_mtime(&src.join("inner"), 978_307_200); // 2001-01-01
+        set_mtime(&src, 1_000_000_000);
+        let dst = d.join("dst");
+        fs::create_dir(&dst).unwrap();
+        // Walked (no clone) and cloned copies alike.
+        for (no_clone, name) in [(true, "walked"), (false, "cloned")] {
+            TEST_NO_CLONE.set(no_clone);
+            let out = run_transfer(&[(src.clone(), dst.join(name))], TransferKind::Copy, ConflictPolicy::Skip, &JobProgress::default());
+            TEST_NO_CLONE.set(false);
+            assert!(out.err.is_none(), "{:?}", out.err);
+            let copy = dst.join(name);
+            let md = fs::metadata(&copy).unwrap();
+            assert_eq!(md.mode() & 0o777, 0o750, "{name}");
+            assert_eq!(md.mtime(), 1_000_000_000, "{name}");
+            assert_eq!(fs::metadata(copy.join("inner")).unwrap().mtime(), 978_307_200, "{name}");
+            let mut buf = [0u8; 16];
+            let cc = c_path(&copy).unwrap();
+            let n = unsafe { libc::getxattr(cc.as_ptr(), xname.as_ptr(), buf.as_mut_ptr().cast(), buf.len(), 0, 0) };
+            assert_eq!(&buf[..n.max(0) as usize], b"kept", "{name}");
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn undo_redo_round_trips() {
+        let d = scratch("undo");
+        let trash = d.join("trash");
+        fs::create_dir(&trash).unwrap();
+        TEST_TRASH.with(|t| *t.borrow_mut() = Some(trash.clone()));
+        let dst = d.join("dst");
+        fs::create_dir(&dst).unwrap();
+        fs::write(d.join("f.txt"), "original").unwrap();
+
+        // Copy → undo trashes the untouched copy → redo puts it back.
+        let out = run_transfer(&[(d.join("f.txt"), dst.join("f.txt"))], TransferKind::Copy, ConflictPolicy::Skip, &JobProgress::default());
+        let UndoOp::Placed(items) = transfer_undo_op(TransferKind::Copy, out.placed, false) else { panic!() };
+        let (trashed, changed) = trash_unchanged(items);
+        assert!(changed.is_empty() && trashed.len() == 1 && !dst.join("f.txt").exists());
+        let back: Vec<_> = trashed.into_iter().map(|(orig, now)| (now, orig)).collect();
+        let mut out = run_transfer(&back, TransferKind::Move, ConflictPolicy::Skip, &JobProgress::default());
+        for p in &mut out.placed {
+            p.stamp.get_or_insert_with(|| tree_stamp(&p.dest));
+        }
+        assert_eq!(fs::read_to_string(dst.join("f.txt")).unwrap(), "original");
+        // Edited since → undo leaves it alone.
+        let UndoOp::Placed(items) = transfer_undo_op(TransferKind::Move, out.placed, true) else { panic!() };
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(dst.join("f.txt"), "edited!!").unwrap();
+        let (trashed, changed) = trash_unchanged(items);
+        assert!(trashed.is_empty() && changed.len() == 1 && dst.join("f.txt").exists());
+
+        // A batch that swapped two names reverts, and the inverse redoes it.
+        let (a, b) = (d.join("a"), d.join("b"));
+        fs::write(&a, "was b").unwrap();
+        fs::write(&b, "was a").unwrap();
+        let swapped = vec![(a.clone(), b.clone()), (b.clone(), a.clone())];
+        let done = revert_renames(&swapped);
+        assert_eq!(done.len(), 2);
+        assert_eq!(fs::read_to_string(&a).unwrap(), "was a");
+        let inverse: Vec<_> = done.into_iter().map(|(from, to)| (to, from)).collect();
+        assert_eq!(revert_renames(&inverse).len(), 2);
+        assert_eq!(fs::read_to_string(&a).unwrap(), "was b");
+
+        // Undoing a rename never clobbers whatever took the old name since.
+        let (x, y) = (d.join("x"), d.join("y"));
+        fs::write(&y, "renamed").unwrap();
+        fs::write(&x, "newcomer").unwrap();
+        assert!(revert_renames(&[(x.clone(), y.clone())]).is_empty());
+        assert_eq!(fs::read_to_string(&x).unwrap(), "newcomer");
+        assert_eq!(fs::read_to_string(&y).unwrap(), "renamed");
+        // Case-only renames are staged, not refused.
+        let (lower, upper) = (d.join("case.txt"), d.join("CASE.txt"));
+        fs::write(&lower, "c").unwrap();
+        rename_no_clobber(&lower, &upper).unwrap();
+        assert!(fs::read_dir(&d).unwrap().flatten().any(|e| e.file_name() == "CASE.txt"));
+        TEST_TRASH.with(|t| *t.borrow_mut() = None);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn keep_both_names() {
+        assert_eq!(keep_both_name("alpha.txt", 1), "alpha 2.txt");
+        assert_eq!(keep_both_name("alpha.txt", 2), "alpha 3.txt");
+        assert_eq!(keep_both_name("alpha 2.txt", 1), "alpha 3.txt");
+        assert_eq!(keep_both_name("Folder", 1), "Folder 2");
+        assert_eq!(keep_both_name(".hidden", 1), ".hidden 2");
+        assert_eq!(keep_both_name("x copy", 1), "x copy 2");
+        assert_eq!(keep_both_name("v 01.txt", 1), "v 01 2.txt");
+        let d = scratch("keepboth");
+        fs::write(d.join("n.txt"), "1").unwrap();
+        let dst = d.join("dst");
+        fs::create_dir(&dst).unwrap();
+        let pairs = vec![(d.join("n.txt"), dst.join("n.txt")), (d.join("n.txt"), dst.join("n.txt"))];
+        let out = run_transfer(&pairs, TransferKind::Copy, ConflictPolicy::KeepBoth, &JobProgress::default());
+        let names: Vec<_> = out.placed.iter().map(|p| path_label(&p.dest)).collect();
+        assert_eq!(names, ["n.txt", "n 2.txt"]);
         let _ = fs::remove_dir_all(&d);
     }
 
