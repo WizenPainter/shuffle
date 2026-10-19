@@ -762,6 +762,7 @@ enum KeyAction {
     GetInfo,
     BatchRename,
     Undo,
+    Redo,
     CopyFiles,
     CutFiles,
     PasteFiles,
@@ -820,6 +821,7 @@ impl KeyAction {
         KeyAction::GetInfo,
         KeyAction::BatchRename,
         KeyAction::Undo,
+        KeyAction::Redo,
         KeyAction::CopyFiles,
         KeyAction::CutFiles,
         KeyAction::PasteFiles,
@@ -895,6 +897,7 @@ impl KeyAction {
             KeyAction::GetInfo => "get_info",
             KeyAction::BatchRename => "batch_rename",
             KeyAction::Undo => "undo",
+            KeyAction::Redo => "redo",
             KeyAction::CopyFiles => "copy_files",
             KeyAction::CutFiles => "cut_files",
             KeyAction::PasteFiles => "paste_files",
@@ -953,6 +956,7 @@ impl KeyAction {
             KeyAction::GetInfo => "Get Info",
             KeyAction::BatchRename => "Rename selected items…",
             KeyAction::Undo => "Undo last file operation",
+            KeyAction::Redo => "Redo",
             KeyAction::CopyFiles => "Copy files",
             KeyAction::CutFiles => "Cut files (paste moves them)",
             KeyAction::PasteFiles => "Paste files",
@@ -1001,6 +1005,7 @@ impl KeyAction {
             KeyAction::GetInfo => Some("cmd-i"),
             KeyAction::BatchRename => Some("cmd-shift-r"),
             KeyAction::Undo => Some("cmd-z"),
+            KeyAction::Redo => Some("cmd-shift-z"),
             KeyAction::Open => Some("cmd-down"),
             KeyAction::MoveToTrash => Some("cmd-backspace"),
             KeyAction::NewFolder => Some("cmd-shift-n"),
@@ -5851,7 +5856,6 @@ impl Shuffle {
     }
 
     /// ⇧⌘Z: redo the most recently undone file operation.
-    #[allow(dead_code)] // bound by the keyboard layer
     fn redo_last(&mut self, cx: &mut Context<Self>) {
         let Some(entry) = self.redo_stack.pop() else {
             self.set_notice("Nothing to redo".into(), cx);
@@ -9255,6 +9259,7 @@ impl Shuffle {
                 }
             }
             KeyAction::Undo => self.undo_last(cx),
+            KeyAction::Redo => self.redo_last(cx),
             KeyAction::CopyFiles | KeyAction::CutFiles => {
                 let targets = self.action_targets(pane);
                 if !targets.is_empty() && self.tab(pane).remote.is_none() {
