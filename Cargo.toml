@@ -20,6 +20,13 @@ objc2-foundation = { version = "0.3", features = ["NSString", "NSData", "NSFileM
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPDFImageRep", "NSGraphics", "NSGraphicsContext", "NSResponder", "NSView", "NSEvent", "NSApplication", "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSSharingService"] }
 # Reach the underlying NSView so we can start native OS drag sessions (drag files out to Finder/other apps).
 raw-window-handle = "0.6"
+# In-process QuickLook thumbnails for the preview pane (replaces spawning qlmanage).
+objc2-quick-look-thumbnailing = "0.3"
+block2 = "0.6"
+# Text/code preview: syntax highlighting (pure-Rust regex engine, no oniguruma).
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+# Markdown preview.
+pulldown-cmark = { version = "0.13", default-features = false }
 
 # Ships as a universal binary (arm64 + x86_64) via release.sh so it runs on
 # both Apple Silicon and Intel Macs. Build with a thin release profile while

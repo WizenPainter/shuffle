@@ -27,7 +27,7 @@ use gpui::{
     Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ExternalPaths, FocusHandle, FontWeight, ImageSource,
     KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
     PathPromptOptions, Rgba,
-    RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, TitlebarOptions,
+    HighlightStyle, RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, StyledText, TitlebarOptions,
     UniformListScrollHandle, Window, WindowBounds, WindowOptions,
 };
 use objc2::runtime::NSObjectProtocol;
@@ -3799,6 +3799,19 @@ struct Shuffle {
     update: Option<UpdateStatus>,
     /// Current page of the inspector's PDF preview (0-based; reset on focus).
     preview_page: usize,
+    /// Preview pipeline: newest request id (older results are dropped), the
+    /// in-flight (path, started) for the spinner, and the last preview shown
+    /// (kept, dimmed, while the next one loads).
+    preview_req: u64,
+    preview_loading: Option<(PathBuf, Instant)>,
+    preview_last: Option<Arc<PreviewContent>>,
+    /// The item the preview scroll positions belong to (reset on change).
+    preview_for: Option<PathBuf>,
+    preview_text_scroll: UniformListScrollHandle,
+    preview_scroll: ScrollHandle,
+    /// Inspector width, and an in-progress drag of its edge (x, width at grab).
+    preview_w: f32,
+    preview_drag: Option<(f32, f32)>,
     /// The row the mouse is currently over: (pane, path). Enter renames it
     /// even when nothing is selected (point-and-rename).
     hovered: Option<(usize, PathBuf)>,
@@ -4132,6 +4145,14 @@ impl Shuffle {
             term_scroll: ScrollHandle::new(),
             update: None,
             preview_page: 0,
+            preview_req: 0,
+            preview_loading: None,
+            preview_last: None,
+            preview_for: None,
+            preview_text_scroll: UniformListScrollHandle::new(),
+            preview_scroll: ScrollHandle::new(),
+            preview_w: PREVIEW_W_DEFAULT,
+            preview_drag: None,
             hovered: None,
             drop_hover: None,
             remote_error: None,
@@ -4892,7 +4913,10 @@ impl Shuffle {
     /// folder (tab-separated; paths can't contain tabs in practice). Remote
     /// tabs aren't restored.
     fn session_string(&self) -> String {
-        let mut out = format!("ratio\t{}\nactive\t{}\n", self.split_ratio, self.active_pane);
+        let mut out = format!(
+            "ratio\t{}\nactive\t{}\npreview_w\t{}\n",
+            self.split_ratio, self.active_pane, self.preview_w
+        );
         for p in &self.panes {
             let locals: Vec<(usize, &Tab)> = p.tabs.iter().enumerate().filter(|(_, t)| t.remote.is_none()).collect();
             if locals.is_empty() {
@@ -4942,6 +4966,11 @@ impl Shuffle {
             match f.as_slice() {
                 ["ratio", v] => ratio = v.parse().unwrap_or(0.5),
                 ["active", v] => active_pane = v.parse().unwrap_or(0),
+                ["preview_w", v] => {
+                    if let Ok(w) = v.parse::<f32>() {
+                        self.preview_w = w.clamp(260.0, 1100.0);
+                    }
+                }
                 ["pane", v] => {
                     panes.push(Pane { tabs: Vec::new(), active: 0, widths: ColumnWidths::default() });
                     wanted_active.push(v.parse().unwrap_or(0));
@@ -8903,9 +8932,14 @@ impl Shuffle {
                     self.arrow_move(pane, dx, dy, cx);
                     return;
                 }
-                // Spacebar → Quick Look the selection, like Finder.
+                // Space shows / hides the preview pane (Strata-style);
+                // ⇧Space is system Quick Look.
                 if key == "space" {
-                    self.quick_look(pane);
+                    if ks.modifiers.shift {
+                        self.quick_look(pane);
+                    } else {
+                        self.toggle_preview(cx);
+                    }
                     return;
                 }
             }
@@ -10524,8 +10558,11 @@ impl Shuffle {
             cx.notify();
             return;
         }
-        let gallery = self.tab(pane).view == ViewMode::Gallery;
-        self.ensure_preview(path.clone(), gallery, cx);
+        // Gallery's big image uses the thumbnail cache; the pane its own.
+        if self.tab(pane).view == ViewMode::Gallery {
+            self.ensure_preview(path.clone(), true, cx);
+        }
+        self.request_preview(path.clone(), cx);
         if prefs().preview && prefs().preview_pages {
             self.ensure_pdf_page(path.clone(), 0, cx);
         }
@@ -11381,6 +11418,463 @@ impl Shuffle {
         .detach();
     }
 
+    // ----- preview pane -----
+
+    /// Load the preview for `path`: instant from the cache when the file is
+    /// unchanged, otherwise built off-thread after a short debounce (so
+    /// holding an arrow key doesn't build every row). Only the newest request
+    /// lands; older ones are dropped when they finish. The previous preview
+    /// stays up meanwhile, and a spinner shows only if the load runs long.
+    fn request_preview(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if !prefs().preview {
+            return;
+        }
+        if self.preview_for.as_ref() != Some(&path) {
+            self.preview_for = Some(path.clone());
+            self.preview_text_scroll = UniformListScrollHandle::new();
+            self.preview_scroll = ScrollHandle::new();
+        }
+        if cached_preview(&path).is_some() {
+            self.preview_loading = None;
+            cx.notify();
+            return;
+        }
+        self.preview_req += 1;
+        let req = self.preview_req;
+        self.preview_loading = Some((path.clone(), Instant::now()));
+        let dark = theme_is_dark();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(75)).await;
+            if !matches!(this.update(cx, |this, _| this.preview_req == req), Ok(true)) {
+                return;
+            }
+            let p = path.clone();
+            let (stamp, content) = cx
+                .background_spawn(async move { (preview_stamp(&p), build_preview_content(&p, dark)) })
+                .await;
+            let content = Arc::new(content);
+            let _ = this.update(cx, |this, cx| {
+                // Cache it even if superseded — moving back is then instant.
+                cache_preview(path, stamp, content.clone());
+                if this.preview_req == req {
+                    this.preview_loading = None;
+                    this.preview_last = Some(content);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        // Repaint once the spinner threshold passes, if still loading.
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(130)).await;
+            let _ = this.update(cx, |this, cx| {
+                if this.preview_req == req && this.preview_loading.is_some() {
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Space: show / hide the preview pane (persisted), loading the focused
+    /// item's preview when it opens.
+    fn toggle_preview(&mut self, cx: &mut Context<Self>) {
+        let mut np = prefs();
+        np.preview = !np.preview;
+        let on = np.preview;
+        apply_prefs(np, cx);
+        if on {
+            let pane = self.active_pane;
+            if let Some(p) = self.tab(pane).anchor.clone() {
+                if self.tab(pane).remote.is_none() {
+                    self.request_preview(p, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Scroll the preview from the file list (⌥↑ / ⌥↓): text by lines,
+    /// everything else by pixels.
+    fn scroll_preview(&mut self, down: bool, cx: &mut Context<Self>) {
+        let step = if down { -120.0 } else { 120.0 };
+        for h in [&self.preview_text_scroll.0.borrow().base_handle, &self.preview_scroll] {
+            let o = h.offset();
+            let max = h.max_offset();
+            let y = (f32::from(o.y) + step).clamp(-f32::from(max.height), 0.0);
+            h.set_offset(point(o.x, px(y)));
+        }
+        cx.notify();
+    }
+
+    /// Header of the preview: icon, name, and "kind · size · modified".
+    fn render_preview_header(&self, sel: &Path) -> AnyElement {
+        let t = theme();
+        let is_dir = sel.is_dir();
+        let sub = lookup_info(sel)
+            .map(|i| {
+                let mut parts = vec![i.kind.clone()];
+                if !is_dir {
+                    parts.push(i.size.clone());
+                }
+                parts.push(i.modified.clone());
+                parts.join(" · ")
+            })
+            .unwrap_or_default();
+        div()
+            .flex_none()
+            .flex()
+            .items_center()
+            .gap_3()
+            .child(icon_element_sized(sel, is_dir, 36.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(div().truncate().text_color(rgb(t.text)).font_weight(FontWeight::SEMIBOLD).child(path_label(sel)))
+                    .child(div().truncate().text_xs().text_color(rgb(t.text_dim)).child(sub)),
+            )
+            .into_any_element()
+    }
+
+    /// The preview itself, filling its container: the built content for
+    /// `sel`, or the previous preview (dimmed) / a spinner while it loads.
+    fn render_preview_body(&self, sel: &Path, cx: &Context<Self>) -> AnyElement {
+        let t = theme();
+        let p = prefs();
+        // PDFs page through natively rendered pages when the pager is on.
+        if p.preview_pages && is_pdf(sel) {
+            let count = lookup_pdf_count(sel);
+            let page = self.preview_page.min(count.unwrap_or(1).saturating_sub(1));
+            if let Some(handle) = lookup_pdf_page(sel, page).flatten() {
+                let mut body = preview_frame(img(ImageSource::Render(handle)).size_full().object_fit(ObjectFit::Contain).into_any_element(), true);
+                if let Some(count) = count.filter(|&c| c > 1) {
+                    body = body.child(self.pdf_pager(sel, page, count, cx));
+                }
+                return body.into_any_element();
+            }
+        }
+        let loading = self.preview_loading.as_ref().filter(|(lp, _)| lp == sel);
+        let (content, stale) = match cached_preview(sel) {
+            Some(c) => (Some(c), false),
+            None => (self.preview_last.clone().filter(|_| loading.is_some()), true),
+        };
+        let spinner = loading.is_some_and(|(_, at)| at.elapsed() >= Duration::from_millis(120));
+        let body = match content {
+            Some(c) => self.render_preview_content(sel, &c, cx),
+            None if loading.is_some() => div().into_any_element(),
+            None => preview_placeholder(sel, "No preview"),
+        };
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .child(div().flex_1().min_h_0().flex().flex_col().when(stale, |d| d.opacity(0.45)).child(body))
+            .when(spinner, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .right_0()
+                        .bottom_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .px_3()
+                                .py_1()
+                                .rounded_full()
+                                .bg(Theme::alpha(t.surface, 0xee))
+                                .text_xs()
+                                .text_color(rgb(t.text_muted))
+                                .child("Loading preview…"),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    fn render_preview_content(&self, sel: &Path, content: &Arc<PreviewContent>, _cx: &Context<Self>) -> AnyElement {
+        let t = theme();
+        match &**content {
+            PreviewContent::Image(handle) => {
+                preview_frame(img(ImageSource::Render(handle.clone())).size_full().object_fit(ObjectFit::Contain).into_any_element(), is_pdf(sel))
+                    .into_any_element()
+            }
+            PreviewContent::Text { lines, truncated } => {
+                let n = lines.len();
+                let gutter = (n.max(1).ilog10() as f32 + 1.0) * 7.5 + 10.0;
+                let content = content.clone();
+                let truncated = *truncated;
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .rounded_md()
+                    .bg(rgb(t.bg))
+                    .border_1()
+                    .border_color(rgb(t.border))
+                    .overflow_hidden()
+                    .child(
+                        uniform_list("preview-text", n, move |range, _, _| {
+                            let PreviewContent::Text { lines, .. } = &*content else { return Vec::new() };
+                            let t = theme();
+                            range
+                                .map(|ix| {
+                                    let line = &lines[ix];
+                                    let styled = StyledText::new(line.text.clone()).with_highlights(
+                                        line.spans.iter().map(|(r, c)| {
+                                            (r.clone(), HighlightStyle { color: Some(rgb(*c).into()), ..Default::default() })
+                                        }),
+                                    );
+                                    div()
+                                        .flex()
+                                        .h(px(17.0))
+                                        .text_xs()
+                                        .font_family("Menlo")
+                                        .whitespace_nowrap()
+                                        .child(
+                                            div()
+                                                .flex_none()
+                                                .w(px(gutter))
+                                                .pr_2()
+                                                .flex()
+                                                .justify_end()
+                                                .text_color(rgb(t.text_dim))
+                                                .child((ix + 1).to_string()),
+                                        )
+                                        .child(div().flex_1().min_w_0().overflow_hidden().text_color(rgb(t.text)).child(styled))
+                                        .into_any_element()
+                                })
+                                .collect()
+                        })
+                        .flex_1()
+                        .py_1()
+                        .track_scroll(self.preview_text_scroll.clone()),
+                    )
+                    .when(truncated, |d| d.child(preview_note("Showing the first 1 MB")))
+                    .into_any_element()
+            }
+            PreviewContent::Markdown(blocks) => div()
+                .id("preview-md")
+                .flex_1()
+                .min_h_0()
+                .overflow_y_scroll()
+                .track_scroll(&self.preview_scroll)
+                .flex()
+                .flex_col()
+                .gap_2()
+                .p_3()
+                .rounded_md()
+                .bg(rgb(t.bg))
+                .border_1()
+                .border_color(rgb(t.border))
+                .text_sm()
+                .text_color(rgb(t.text))
+                .children(blocks.iter().map(render_md_block))
+                .into_any_element(),
+            PreviewContent::Table { rows, truncated } => {
+                let mut grid = div().flex().flex_col().text_xs();
+                for (r, row) in rows.iter().enumerate() {
+                    let mut line = div().flex().when(r == 0, |d| d.font_weight(FontWeight::SEMIBOLD).bg(rgb(t.surface)));
+                    for cell in row {
+                        line = line.child(
+                            div()
+                                .flex_none()
+                                .w(px(120.0))
+                                .px_2()
+                                .py_0p5()
+                                .truncate()
+                                .border_r_1()
+                                .border_b_1()
+                                .border_color(rgb(t.border))
+                                .child(cell.clone()),
+                        );
+                    }
+                    grid = grid.child(line);
+                }
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .rounded_md()
+                    .bg(rgb(t.bg))
+                    .border_1()
+                    .border_color(rgb(t.border))
+                    .overflow_hidden()
+                    .child(
+                        div()
+                            .id("preview-table")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_scroll()
+                            .track_scroll(&self.preview_scroll)
+                            .text_color(rgb(t.text))
+                            .child(grid),
+                    )
+                    .when(*truncated, |d| d.child(preview_note("Showing the first rows")))
+                    .into_any_element()
+            }
+            PreviewContent::Listing { total, items, archive } => {
+                let head = match (archive, total) {
+                    (true, n) => format!("Archive · {}", items_label(*n)),
+                    (false, 0) => "Empty folder".to_string(),
+                    (false, n) => items_label(*n),
+                };
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().flex_none().text_xs().text_color(rgb(t.text_dim)).child(head))
+                    .child(
+                        div()
+                            .id("preview-listing")
+                            .flex_1()
+                            .min_h_0()
+                            .overflow_y_scroll()
+                            .track_scroll(&self.preview_scroll)
+                            .flex()
+                            .flex_col()
+                            .children(items.iter().map(|(name, is_dir)| {
+                                let icon_path = if *archive { PathBuf::from(name) } else { sel.join(name) };
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap_2()
+                                    .h(px(22.0))
+                                    .child(icon_element_sized(&icon_path, *is_dir, 16.0))
+                                    .child(div().flex_1().min_w_0().truncate().text_sm().text_color(rgb(t.text)).child(name.clone()))
+                            }))
+                            .when(items.len() < *total, |d| {
+                                d.child(div().text_xs().text_color(rgb(t.text_dim)).child(format!("…and {} more", total - items.len())))
+                            }),
+                    )
+                    .into_any_element()
+            }
+            PreviewContent::Nothing => preview_placeholder(sel, "No preview"),
+        }
+    }
+
+    /// The ‹ 2 / 14 › pager over a PDF preview.
+    fn pdf_pager(&self, sel: &Path, page: usize, count: usize, cx: &Context<Self>) -> AnyElement {
+        let prev_sel = sel.to_path_buf();
+        let next_sel = sel.to_path_buf();
+        let pager_btn = |id: &'static str, label: &'static str, enabled: bool| {
+            div()
+                .id(id)
+                .px_1p5()
+                .rounded_full()
+                .cursor_pointer()
+                .text_color(if enabled { rgba(0xffffffff) } else { rgba(0xffffff44) })
+                .when(enabled, |s| s.hover(|s| s.bg(rgba(0xffffff33))))
+                .child(label)
+        };
+        div()
+            .absolute()
+            .bottom_2()
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .py_0p5()
+                    .rounded_full()
+                    .bg(rgba(0x000000aa))
+                    .text_xs()
+                    .child(pager_btn("pdf-prev", "‹", page > 0).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        if this.preview_page > 0 {
+                            this.preview_page -= 1;
+                            let pg = this.preview_page;
+                            this.ensure_pdf_page(prev_sel.clone(), pg, cx);
+                            if pg > 0 {
+                                this.ensure_pdf_page(prev_sel.clone(), pg - 1, cx);
+                            }
+                            cx.notify();
+                        }
+                    })))
+                    .child(div().text_color(rgba(0xffffffdd)).child(format!("{} / {}", page + 1, count)))
+                    .child(pager_btn("pdf-next", "›", page + 1 < count).on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        let count = lookup_pdf_count(&next_sel).unwrap_or(1);
+                        if this.preview_page + 1 < count {
+                            this.preview_page += 1;
+                            let pg = this.preview_page;
+                            this.ensure_pdf_page(next_sel.clone(), pg, cx);
+                            if pg + 1 < count {
+                                this.ensure_pdf_page(next_sel.clone(), pg + 1, cx);
+                            }
+                            cx.notify();
+                        }
+                    }))),
+            )
+            .into_any_element()
+    }
+
+    /// The Information rows (when that feature is on).
+    fn render_info_rows(&self, sel: &Path) -> AnyElement {
+        let t = theme();
+        let Some(info) = lookup_info(sel) else {
+            return div().text_xs().text_color(rgb(t.text_dim)).child("Loading…").into_any_element();
+        };
+        let mut rows = div().flex().flex_col().gap_1();
+        rows = rows.child(info_row("Kind", &info.kind));
+        rows = rows.child(info_row("Size", &info.size));
+        rows = rows.child(info_row("Created", &info.created));
+        rows = rows.child(info_row("Modified", &info.modified));
+        rows = rows.child(info_row("Last opened", &info.accessed));
+        if let Some(d) = &info.dimensions {
+            rows = rows.child(info_row("Dimensions", d));
+        }
+        if let Some(c) = &info.color {
+            rows = rows.child(info_row("Color", c));
+        }
+        if let Some(s) = &info.signed {
+            rows = rows.child(info_row("Signature", s));
+        }
+        rows.into_any_element()
+    }
+
+    /// Header + preview + (optional) info, filling the given container.
+    fn render_preview_stack(&self, sel: &Path, show_preview: bool, cx: &Context<Self>) -> gpui::Div {
+        let p = prefs();
+        let mut stack = div()
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(self.render_preview_header(sel));
+        if show_preview {
+            stack = stack.child(self.render_preview_body(sel, cx));
+        }
+        if p.info {
+            stack = stack.child(
+                div()
+                    .flex_none()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(settings_title("Information"))
+                    .child(self.render_info_rows(sel)),
+            );
+        }
+        stack
+    }
+
     /// The floating "why this name won't work" pill shown over `pane` while an
     /// in-progress rename there has an invalid name.
     fn rename_error_pill(&self, pane: usize) -> Option<AnyElement> {
@@ -11418,191 +11912,69 @@ impl Shuffle {
         )
     }
 
-    /// The right-hand inspector: preview and/or information for the selected
-    /// file. `None` when neither feature is on or nothing is selected.
+    /// The right-hand inspector: preview and/or information for the focused
+    /// item, as a resizable pane (drag its left edge). `None` when neither
+    /// feature is on, nothing is focused, or the view shows the preview
+    /// itself (Gallery, and Column view's preview column).
     fn render_inspector(&self, cx: &Context<Self>) -> Option<AnyElement> {
         let p = prefs();
-        // In Gallery view the big preview already shows, so don't duplicate it
-        // in the side inspector even when the Preview toggle is on.
-        let show_preview = p.preview && self.active_tab().view != ViewMode::Gallery;
-        if !show_preview && !p.info {
+        let view = self.active_tab().view;
+        let show_preview = p.preview && view != ViewMode::Gallery;
+        if (!show_preview && !p.info) || (p.preview && view == ViewMode::Columns) {
             return None;
         }
         let sel = self.active_tab().anchor.clone()?;
         let t = theme();
-
-        let mut col = div()
-            .id("inspector")
-            .flex_none()
-            .w(px(320.0))
-            .h_full()
-            .overflow_y_scroll()
-            .flex()
-            .flex_col()
-            .gap_3()
-            .p_4()
-            .bg(rgb(t.sidebar))
-            .border_l_1()
-            .border_color(rgb(t.border))
-            .child(
-                div()
-                    .flex_none()
-                    .text_color(rgb(t.text))
-                    .truncate()
-                    .child(path_label(&sel)),
-            );
-
-        if show_preview {
-            // Multi-page PDFs: show the natively rendered current page when the
-            // pager is on, falling back to the QuickLook thumbnail (page 1)
-            // while it builds.
-            let paging = p.preview_pages && is_pdf(&sel);
-            let page_count = if paging { lookup_pdf_count(&sel) } else { None };
-            let page = self
-                .preview_page
-                .min(page_count.unwrap_or(1).saturating_sub(1));
-            let page_img = if paging {
-                lookup_pdf_page(&sel, page).flatten()
-            } else {
-                None
-            };
-            let handle = page_img.or_else(|| lookup_preview(&sel).flatten());
-            let body: AnyElement = match handle {
-                Some(handle) => img(ImageSource::Render(handle))
-                    .max_w(px(288.0))
-                    .max_h(px(360.0))
-                    .object_fit(ObjectFit::Contain)
-                    .into_any_element(),
-                // Not ready yet or unavailable → show the file's icon.
-                None => icon_element_sized(&sel, false, 96.0),
-            };
-            let preview_box = div()
+        let dragging = self.preview_drag.is_some();
+        Some(
+            div()
+                .id("inspector")
                 .relative()
                 .flex_none()
+                .w(px(self.preview_w))
+                .h_full()
                 .flex()
-                .items_center()
-                .justify_center()
-                .w_full()
-                .min_h(px(120.0))
-                // Clip so a tall preview can't paint over the title above or the
-                // "Information" section below.
-                .max_h(px(380.0))
-                .overflow_hidden()
-                .p_2()
-                .rounded_md()
-                // White "page" so document/text previews (black text, often
-                // transparent background) stay readable on dark themes.
-                .bg(rgb(0xffffff))
-                .child(body);
-
-            // Finder-style ‹ 2 / 14 › pill over the bottom of the preview.
-            if let Some(count) = page_count.filter(|&c| c > 1) {
-                let prev_sel = sel.clone();
-                let next_sel = sel.clone();
-                let pager_btn = |id: &'static str, label: &'static str, enabled: bool| {
+                .flex_col()
+                .p_4()
+                .bg(rgb(t.sidebar))
+                .border_l_1()
+                .border_color(rgb(t.border))
+                .child(self.render_preview_stack(&sel, show_preview, cx))
+                // Resize grip along the left edge.
+                .child(
                     div()
-                        .id(id)
-                        .px_1p5()
-                        .rounded_full()
-                        .cursor_pointer()
-                        .text_color(if enabled {
-                            rgba(0xffffffff)
-                        } else {
-                            rgba(0xffffff44)
-                        })
-                        .when(enabled, |s| s.hover(|s| s.bg(rgba(0xffffff33))))
-                        .child(label)
-                };
-                col = col.child(
-                    preview_box.child(
-                        div()
-                            .absolute()
-                            .bottom_2()
-                            .left_0()
-                            .right_0()
-                            .flex()
-                            .justify_center()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .px_1()
-                                    .py_0p5()
-                                    .rounded_full()
-                                    .bg(rgba(0x000000aa))
-                                    .text_xs()
-                                    .child(pager_btn("pdf-prev", "‹", page > 0).on_click(
-                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                            if this.preview_page > 0 {
-                                                this.preview_page -= 1;
-                                                let pg = this.preview_page;
-                                                this.ensure_pdf_page(prev_sel.clone(), pg, cx);
-                                                if pg > 0 {
-                                                    this.ensure_pdf_page(prev_sel.clone(), pg - 1, cx);
-                                                }
-                                                cx.notify();
-                                            }
-                                        }),
-                                    ))
-                                    .child(
-                                        div()
-                                            .text_color(rgba(0xffffffdd))
-                                            .child(format!("{} / {}", page + 1, count)),
-                                    )
-                                    .child(pager_btn("pdf-next", "›", page + 1 < count).on_click(
-                                        cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                            let count =
-                                                lookup_pdf_count(&next_sel).unwrap_or(1);
-                                            if this.preview_page + 1 < count {
-                                                this.preview_page += 1;
-                                                let pg = this.preview_page;
-                                                this.ensure_pdf_page(next_sel.clone(), pg, cx);
-                                                if pg + 1 < count {
-                                                    this.ensure_pdf_page(next_sel.clone(), pg + 1, cx);
-                                                }
-                                                cx.notify();
-                                            }
-                                        }),
-                                    )),
-                            ),
-                    ),
-                );
-            } else {
-                col = col.child(preview_box);
-            }
-        }
+                        .id("inspector-grip")
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .left(px(-3.0))
+                        .w(px(6.0))
+                        .cursor(CursorStyle::ResizeLeftRight)
+                        .when(dragging, |d| d.bg(Theme::alpha(t.accent, 0x55)))
+                        .hover(|d| d.bg(Theme::alpha(t.accent, 0x33)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, ev: &MouseDownEvent, _, cx| {
+                                if ev.click_count >= 2 {
+                                    this.preview_w = PREVIEW_W_DEFAULT;
+                                } else {
+                                    this.preview_drag = Some((f32::from(ev.position.x), this.preview_w));
+                                }
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
 
-        if p.info {
-            col = col.child(settings_title("Information"));
-            if let Some(info) = lookup_info(&sel) {
-                let mut rows = div().flex().flex_col().gap_1();
-                rows = rows.child(info_row("Kind", &info.kind));
-                rows = rows.child(info_row("Size", &info.size));
-                rows = rows.child(info_row("Created", &info.created));
-                rows = rows.child(info_row("Modified", &info.modified));
-                rows = rows.child(info_row("Last opened", &info.accessed));
-                if let Some(d) = &info.dimensions {
-                    rows = rows.child(info_row("Dimensions", d));
-                }
-                if let Some(c) = &info.color {
-                    rows = rows.child(info_row("Color", c));
-                }
-                if let Some(s) = &info.signed {
-                    rows = rows.child(info_row("Signature", s));
-                }
-                col = col.child(rows);
-            } else {
-                col = col.child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(t.text_dim))
-                        .child("Loading…"),
-                );
-            }
+    /// Drag the inspector's left edge: wider to the left, within limits.
+    fn update_preview_drag(&mut self, x: f32, cx: &mut Context<Self>) {
+        if let Some((start_x, start_w)) = self.preview_drag {
+            self.preview_w = (start_w - (x - start_x)).clamp(260.0, 1100.0);
+            cx.notify();
         }
-
-        Some(col.into_any_element())
     }
 
     // ----- terminal mode (the bottom command bar) -----
@@ -14010,6 +14382,26 @@ impl Shuffle {
             );
         }
 
+        // A focused file gets the preview as the last column, filling the free
+        // space (Strata-style) — the side inspector steps aside in this view.
+        let p = prefs();
+        if p.preview && tab.remote.is_none() {
+            if let Some(file) = anchor.as_ref().filter(|a| !a.is_dir()) {
+                cols.push(
+                    div()
+                        .id(("col-preview", pane))
+                        .flex_1()
+                        .min_w(px(320.0))
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .p_4()
+                        .bg(rgb(t.sidebar))
+                        .child(self.render_preview_stack(file, true, cx))
+                        .into_any_element(),
+                );
+            }
+        }
         div()
             .id(("columns", pane))
             .flex_1()
@@ -14414,6 +14806,7 @@ impl Render for Shuffle {
                 this.update_resize(x, cx);
                 this.update_scroll_drag(y, cx);
                 this.update_hbar_drag(x, cx);
+                this.update_preview_drag(x, cx);
                 this.update_divider(x, cx);
                 this.update_marquee(x, y, cx);
                 this.update_drop_hover(x, y, cx);
@@ -14425,6 +14818,7 @@ impl Render for Shuffle {
                     this.end_resize();
                     this.end_scroll_drag(cx);
                     this.hbar_drag = None;
+                    this.preview_drag = None;
                     this.divider_drag = None;
                     this.end_marquee(cx);
                     // A native file drag ends as a synthesized mouse-up.
@@ -17819,36 +18213,675 @@ fn remote_preview_temp(remote: &Path) -> PathBuf {
 /// Generate a preview image for any file via macOS QuickLook (`qlmanage -t`),
 /// then decode it into a GPUI `RenderImage`. Runs off the render thread.
 fn build_preview(path: &Path) -> Option<Arc<RenderImage>> {
-    let out_dir = std::env::temp_dir().join("shuffle-preview");
-    let _ = fs::create_dir_all(&out_dir);
-    let name = path.file_name()?.to_string_lossy().into_owned();
-    let png = out_dir.join(format!("{name}.png"));
-    let _ = fs::remove_file(&png); // avoid showing a stale preview
+    // In-process QuickLook (no qlmanage spawn, no shared temp file).
+    ql_thumbnail(path, 1200.0)
+}
 
-    // QuickLook renders almost anything (images, PDFs, Office docs, code, …).
-    let ok = Command::new("qlmanage")
-        .args(["-t", "-s", "600", "-o"])
-        .arg(&out_dir)
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok || !png.exists() {
+// ----- preview pane: content model, builders, bounded cache ----------------
+//
+// The pane shows a real preview for the focused item: a QuickLook thumbnail
+// for images / video / Office docs, syntax-highlighted text and code, rendered
+// Markdown, a CSV table, a folder's or archive's contents. Content is built
+// off the main thread (debounced, stale requests dropped — see
+// `request_preview`) and kept in a small LRU keyed by path and validated by
+// (mtime, size), so an edited file never shows a stale preview. Limits follow
+// Strata's: text is read up to 1 MiB, highlighting stops on big files.
+
+/// One line of a text preview: its text plus colored byte ranges.
+struct PreviewLine {
+    text: SharedString,
+    spans: Vec<(std::ops::Range<usize>, u32)>,
+}
+
+/// Inline styling inside a Markdown block.
+#[derive(Clone, Copy, Default, PartialEq)]
+struct MdStyle {
+    bold: bool,
+    italic: bool,
+    code: bool,
+    link: bool,
+}
+
+/// A run of Markdown inline text with styled ranges.
+#[derive(Default)]
+struct MdText {
+    text: String,
+    spans: Vec<(std::ops::Range<usize>, MdStyle)>,
+}
+
+enum MdBlock {
+    Heading(u8, MdText),
+    Para(MdText),
+    /// List item: nesting depth, ordered number (if any), text.
+    Item(u8, Option<u64>, MdText),
+    Quote(MdText),
+    Code(String),
+    Rule,
+}
+
+/// What the preview pane shows for one item.
+enum PreviewContent {
+    Image(Arc<RenderImage>),
+    Text { lines: Vec<PreviewLine>, truncated: bool },
+    Markdown(Vec<MdBlock>),
+    Table { rows: Vec<Vec<String>>, truncated: bool },
+    /// A folder or archive listing: total entries and the first few
+    /// (name, is_dir).
+    Listing { total: usize, items: Vec<(String, bool)>, archive: bool },
+    /// Nothing better than the icon (unknown binary, unreadable, …).
+    Nothing,
+}
+
+impl PreviewContent {
+    /// Rough memory cost, for the cache budget.
+    fn cost(&self) -> usize {
+        match self {
+            PreviewContent::Image(img) => {
+                let s = img.size(0);
+                (s.width.0.max(0) as usize) * (s.height.0.max(0) as usize) * 4
+            }
+            PreviewContent::Text { lines, .. } => lines.iter().map(|l| l.text.len() + l.spans.len() * 24 + 48).sum(),
+            PreviewContent::Markdown(b) => b.len() * 256,
+            PreviewContent::Table { rows, .. } => rows.iter().flatten().map(|c| c.len() + 24).sum(),
+            PreviewContent::Listing { items, .. } => items.iter().map(|(n, _)| n.len() + 32).sum(),
+            PreviewContent::Nothing => 0,
+        }
+    }
+}
+
+/// The inspector's default width (double-click its edge to restore).
+const PREVIEW_W_DEFAULT: f32 = 380.0;
+
+/// Text is read up to this many bytes; past it the preview says "truncated".
+const PREVIEW_TEXT_MAX: usize = 1024 * 1024;
+const PREVIEW_TEXT_MAX_LINES: usize = 20_000;
+/// Above these, text is shown plain (highlighting a huge file costs too much).
+const PREVIEW_HIGHLIGHT_MAX: usize = 256 * 1024;
+const PREVIEW_HIGHLIGHT_MAX_LINES: usize = 4_000;
+/// Longest side of an image preview, in pixels.
+const PREVIEW_IMAGE_PX: f64 = 1280.0;
+
+/// Build the preview for `path` (blocking; call off the main thread). `dark`
+/// picks the syntax-highlighting palette.
+fn build_preview_content(path: &Path, dark: bool) -> PreviewContent {
+    let Ok(md) = fs::metadata(path) else { return PreviewContent::Nothing };
+    if md.is_dir() {
+        // App bundles and other packages read better as their icon/thumbnail.
+        if path.extension().is_some_and(|e| e == "app") {
+            return ql_thumbnail(path, PREVIEW_IMAGE_PX).map(PreviewContent::Image).unwrap_or(PreviewContent::Nothing);
+        }
+        return folder_listing(path);
+    }
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if let Some(listing) = archive_listing(path, &name) {
+        return listing;
+    }
+    match ext.as_str() {
+        "md" | "markdown" | "mdown" | "mkd" => {
+            if let Some(text) = read_text_prefix(path).map(|(t, _)| t) {
+                return PreviewContent::Markdown(parse_markdown(&text));
+            }
+        }
+        "csv" | "tsv" => {
+            if let Some((text, truncated)) = read_text_prefix(path) {
+                let sep = if ext == "tsv" { '\t' } else { ',' };
+                let (rows, cut) = parse_delimited(&text, sep, 500, 40);
+                return PreviewContent::Table { rows, truncated: truncated || cut };
+            }
+        }
+        _ => {}
+    }
+    // Media and documents QuickLook renders better than we could.
+    let ql_first = is_image(path)
+        || is_pdf(path)
+        || matches!(
+            ext.as_str(),
+            "mov" | "mp4" | "m4v" | "avi" | "mkv" | "webm" | "mp3" | "m4a" | "aac" | "wav" | "flac" | "aiff"
+                | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "pages" | "numbers" | "key"
+                | "rtf" | "rtfd" | "psd" | "ai" | "eps" | "svg" | "heic" | "heif" | "dng" | "cr2" | "cr3"
+                | "nef" | "arw" | "raf" | "orf" | "usdz" | "obj" | "stl" | "ttf" | "otf" | "epub"
+        );
+    if !ql_first {
+        if let Some((text, truncated)) = read_text_prefix(path) {
+            return PreviewContent::Text { lines: highlight_text(&text, &ext, &name, dark), truncated };
+        }
+    }
+    ql_thumbnail(path, PREVIEW_IMAGE_PX).map(PreviewContent::Image).unwrap_or(PreviewContent::Nothing)
+}
+
+/// Read up to `PREVIEW_TEXT_MAX` bytes as text, or `None` if the file looks
+/// binary. Decodes UTF-8 (lossy) and UTF-16 with a byte-order mark. Returns
+/// the text and whether it was truncated.
+fn read_text_prefix(path: &Path) -> Option<(String, bool)> {
+    use std::io::Read;
+    let mut f = fs::File::open(path).ok()?;
+    let mut buf = Vec::with_capacity(64 * 1024);
+    f.by_ref().take(PREVIEW_TEXT_MAX as u64 + 1).read_to_end(&mut buf).ok()?;
+    let truncated = buf.len() > PREVIEW_TEXT_MAX;
+    buf.truncate(PREVIEW_TEXT_MAX);
+    let utf16 = |be: bool| {
+        let units: Vec<u16> = buf[2..]
+            .chunks_exact(2)
+            .map(|c| if be { u16::from_be_bytes([c[0], c[1]]) } else { u16::from_le_bytes([c[0], c[1]]) })
+            .collect();
+        String::from_utf16_lossy(&units)
+    };
+    let text = match buf.as_slice() {
+        [0xFF, 0xFE, ..] => utf16(false),
+        [0xFE, 0xFF, ..] => utf16(true),
+        _ => {
+            // A NUL in the first 8 KiB, or mostly-invalid UTF-8, means binary.
+            let sample = &buf[..buf.len().min(8192)];
+            if sample.contains(&0) {
+                return None;
+            }
+            let lossy = String::from_utf8_lossy(&buf).into_owned();
+            let bad = lossy.chars().take(8192).filter(|&c| c == '\u{FFFD}').count();
+            if bad > 32 {
+                return None;
+            }
+            lossy
+        }
+    };
+    Some((text, truncated))
+}
+
+/// Split text into preview lines, syntax-highlighted when the file is small
+/// enough and syntect knows the language.
+fn highlight_text(text: &str, ext: &str, name: &str, dark: bool) -> Vec<PreviewLine> {
+    use syntect::easy::HighlightLines;
+    use syntect::highlighting::ThemeSet;
+    use syntect::parsing::SyntaxSet;
+    use syntect::util::LinesWithEndings;
+    static SYNTAXES: OnceLock<SyntaxSet> = OnceLock::new();
+    static THEMES: OnceLock<ThemeSet> = OnceLock::new();
+
+    let plain = |t: &str| PreviewLine { text: SharedString::from(t.trim_end_matches(['\r', '\n']).replace('\t', "    ")), spans: Vec::new() };
+    let line_count = text.lines().count();
+    let small = text.len() <= PREVIEW_HIGHLIGHT_MAX && line_count <= PREVIEW_HIGHLIGHT_MAX_LINES;
+    let ss = SYNTAXES.get_or_init(SyntaxSet::load_defaults_newlines);
+    let syntax = if small {
+        ss.find_syntax_by_extension(ext)
+            .or_else(|| ss.find_syntax_by_token(name))
+            .or_else(|| text.lines().next().and_then(|l| ss.find_syntax_by_first_line(l)))
+            .filter(|s| s.name != "Plain Text")
+    } else {
+        None
+    };
+    let Some(syntax) = syntax else {
+        return text.lines().take(PREVIEW_TEXT_MAX_LINES).map(plain).collect();
+    };
+    let ts = THEMES.get_or_init(ThemeSet::load_defaults);
+    let theme = &ts.themes[if dark { "base16-ocean.dark" } else { "InspiredGitHub" }];
+    let mut h = HighlightLines::new(syntax, theme);
+    let mut out = Vec::with_capacity(line_count.min(PREVIEW_TEXT_MAX_LINES));
+    for line in LinesWithEndings::from(text).take(PREVIEW_TEXT_MAX_LINES) {
+        let Ok(ranges) = h.highlight_line(line, ss) else {
+            out.push(plain(line));
+            continue;
+        };
+        let mut s = String::with_capacity(line.len());
+        let mut spans = Vec::new();
+        for (style, piece) in ranges {
+            let piece = piece.trim_end_matches(['\r', '\n']).replace('\t', "    ");
+            if piece.is_empty() {
+                continue;
+            }
+            let start = s.len();
+            s.push_str(&piece);
+            let c = style.foreground;
+            spans.push((start..s.len(), (u32::from(c.r) << 16) | (u32::from(c.g) << 8) | u32::from(c.b)));
+        }
+        out.push(PreviewLine { text: SharedString::from(s), spans });
+    }
+    out
+}
+
+/// Minimal Markdown → blocks (headings, paragraphs, lists, quotes, code,
+/// rules) with bold / italic / code / link inline styles.
+fn parse_markdown(src: &str) -> Vec<MdBlock> {
+    use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+    let mut blocks = Vec::new();
+    let mut cur = MdText::default();
+    let mut style = MdStyle::default();
+    // (ordered next number, nesting) per open list.
+    let mut lists: Vec<Option<u64>> = Vec::new();
+    let mut heading: Option<u8> = None;
+    let mut quote = 0usize;
+    let mut code: Option<String> = None;
+    let mut item_num: Option<Option<u64>> = None;
+
+    let flush = |cur: &mut MdText, blocks: &mut Vec<MdBlock>, heading: Option<u8>, quote: usize, item: &mut Option<Option<u64>>, depth: usize| {
+        if cur.text.trim().is_empty() {
+            *cur = MdText::default();
+            return;
+        }
+        let t = std::mem::take(cur);
+        blocks.push(if let Some(lvl) = heading {
+            MdBlock::Heading(lvl, t)
+        } else if let Some(num) = item.take() {
+            MdBlock::Item(depth.saturating_sub(1) as u8, num, t)
+        } else if quote > 0 {
+            MdBlock::Quote(t)
+        } else {
+            MdBlock::Para(t)
+        });
+    };
+    for ev in Parser::new(src) {
+        if blocks.len() > 2000 {
+            break;
+        }
+        match ev {
+            Event::Start(Tag::Heading { level, .. }) => heading = Some(level as u8),
+            Event::End(TagEnd::Heading(_)) => {
+                flush(&mut cur, &mut blocks, heading, quote, &mut item_num, lists.len());
+                heading = None;
+            }
+            Event::Start(Tag::BlockQuote(_)) => quote += 1,
+            Event::End(TagEnd::BlockQuote(_)) => {
+                flush(&mut cur, &mut blocks, heading, quote, &mut item_num, lists.len());
+                quote = quote.saturating_sub(1);
+            }
+            Event::Start(Tag::List(start)) => {
+                flush(&mut cur, &mut blocks, heading, quote, &mut item_num, lists.len());
+                lists.push(start);
+            }
+            Event::End(TagEnd::List(_)) => {
+                lists.pop();
+            }
+            Event::Start(Tag::Item) => {
+                flush(&mut cur, &mut blocks, heading, quote, &mut item_num, lists.len());
+                let num = lists.last_mut().and_then(|n| {
+                    let v = *n;
+                    if let Some(x) = n.as_mut() {
+                        *x += 1;
+                    }
+                    v
+                });
+                item_num = Some(num);
+            }
+            Event::End(TagEnd::Item) | Event::End(TagEnd::Paragraph) => {
+                flush(&mut cur, &mut blocks, heading, quote, &mut item_num, lists.len());
+            }
+            Event::Start(Tag::CodeBlock(_)) => code = Some(String::new()),
+            Event::End(TagEnd::CodeBlock) => {
+                if let Some(c) = code.take() {
+                    blocks.push(MdBlock::Code(c.trim_end().to_string()));
+                }
+            }
+            Event::Start(Tag::Strong) => style.bold = true,
+            Event::End(TagEnd::Strong) => style.bold = false,
+            Event::Start(Tag::Emphasis) => style.italic = true,
+            Event::End(TagEnd::Emphasis) => style.italic = false,
+            Event::Start(Tag::Link { .. }) => style.link = true,
+            Event::End(TagEnd::Link) => style.link = false,
+            Event::Text(t) | Event::Html(t) | Event::InlineHtml(t) => {
+                if let Some(c) = code.as_mut() {
+                    c.push_str(&t);
+                } else {
+                    let start = cur.text.len();
+                    cur.text.push_str(&t);
+                    if style != MdStyle::default() {
+                        cur.spans.push((start..cur.text.len(), style));
+                    }
+                }
+            }
+            Event::Code(t) => {
+                let start = cur.text.len();
+                cur.text.push_str(&t);
+                cur.spans.push((start..cur.text.len(), MdStyle { code: true, ..style }));
+            }
+            Event::SoftBreak => cur.text.push(' '),
+            Event::HardBreak => cur.text.push('\n'),
+            Event::Rule => blocks.push(MdBlock::Rule),
+            Event::TaskListMarker(done) => cur.text.push_str(if done { "☑ " } else { "☐ " }),
+            _ => {}
+        }
+    }
+    flush(&mut cur, &mut blocks, heading, quote, &mut item_num, lists.len());
+    blocks
+}
+
+/// Parse delimited text (CSV / TSV) with quoted fields. Returns at most
+/// `max_rows` × `max_cols` cells and whether anything was cut.
+fn parse_delimited(text: &str, sep: char, max_rows: usize, max_cols: usize) -> (Vec<Vec<String>>, bool) {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut cut = false;
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if quoted {
+            match c {
+                '"' if chars.peek() == Some(&'"') => {
+                    field.push('"');
+                    chars.next();
+                }
+                '"' => quoted = false,
+                _ => field.push(c),
+            }
+            continue;
+        }
+        match c {
+            '"' if field.is_empty() => quoted = true,
+            c if c == sep => row.push(std::mem::take(&mut field)),
+            '\r' => {}
+            '\n' => {
+                row.push(std::mem::take(&mut field));
+                if row.len() > max_cols {
+                    row.truncate(max_cols);
+                    cut = true;
+                }
+                rows.push(std::mem::take(&mut row));
+                if rows.len() >= max_rows {
+                    return (rows, chars.peek().is_some());
+                }
+            }
+            _ => field.push(c),
+        }
+    }
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        row.truncate(max_cols);
+        rows.push(row);
+    }
+    (rows, cut)
+}
+
+/// A folder's entry count and its first entries (folders first, natural-ish
+/// name order). Hidden files are skipped like the listing does.
+fn folder_listing(path: &Path) -> PreviewContent {
+    let Ok(rd) = fs::read_dir(path) else { return PreviewContent::Nothing };
+    let mut items: Vec<(String, bool)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            (!name.starts_with('.')).then(|| (name, e.file_type().is_ok_and(|t| t.is_dir())))
+        })
+        .collect();
+    let total = items.len();
+    items.sort_by_cached_key(|(n, d)| (!*d, n.to_lowercase()));
+    items.truncate(300);
+    PreviewContent::Listing { total, items, archive: false }
+}
+
+/// Entries of a zip / tar archive via the system `zipinfo` / `tar` (fast,
+/// no extraction). `None` when `name` isn't an archive we can list.
+fn archive_listing(path: &Path, name: &str) -> Option<PreviewContent> {
+    let tar = [".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz", ".tbz2", ".tar.xz", ".txz"];
+    let out = if name.ends_with(".zip") {
+        Command::new("zipinfo").arg("-1").arg(path).output().ok()?
+    } else if tar.iter().any(|s| name.ends_with(s)) {
+        Command::new("tar").arg("-tf").arg(path).output().ok()?
+    } else {
+        return None;
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let all: Vec<&str> = text.lines().filter(|l| !l.is_empty() && !l.starts_with("__MACOSX/")).collect();
+    let total = all.len();
+    let items = all
+        .into_iter()
+        .take(300)
+        .map(|l| (l.trim_end_matches('/').to_string(), l.ends_with('/')))
+        .collect();
+    Some(PreviewContent::Listing { total, items, archive: true })
+}
+
+/// A QuickLook thumbnail of `path` no larger than `max_px` on its longest
+/// side, generated in-process by QLThumbnailGenerator (images, video poster
+/// frames, PDFs, Office/iWork docs, fonts, 3D…). Blocks the calling (worker)
+/// thread until QuickLook answers, at most a few seconds.
+fn ql_thumbnail(path: &Path, max_px: f64) -> Option<Arc<RenderImage>> {
+    use objc2_quick_look_thumbnailing::{
+        QLThumbnailGenerationRequest, QLThumbnailGenerationRequestRepresentationTypes, QLThumbnailGenerator,
+        QLThumbnailRepresentation,
+    };
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str()?));
+    let size = objc2_foundation::NSSize { width: max_px / 2.0, height: max_px / 2.0 };
+    let (tx, rx) = std::sync::mpsc::channel::<Option<(Vec<u8>, u32, u32)>>();
+    let tx = Mutex::new(Some(tx));
+    let handler = block2::RcBlock::new(move |rep: *mut QLThumbnailRepresentation, _err: *mut objc2_foundation::NSError| {
+        // Called once on a QuickLook queue: rasterize there, hand back pixels.
+        let pixels = unsafe { rep.as_ref() }.and_then(|rep| {
+            let cg = unsafe { rep.CGImage() };
+            cgimage_bgra(&*cg as *const _ as *const std::ffi::c_void)
+        });
+        if let Some(tx) = tx.lock().ok().and_then(|mut t| t.take()) {
+            let _ = tx.send(pixels);
+        }
+    });
+    unsafe {
+        let req = QLThumbnailGenerationRequest::initWithFileAtURL_size_scale_representationTypes(
+            QLThumbnailGenerationRequest::alloc(),
+            &url,
+            size,
+            2.0,
+            QLThumbnailGenerationRequestRepresentationTypes::Thumbnail,
+        );
+        let gen = QLThumbnailGenerator::sharedGenerator();
+        gen.generateBestRepresentationForRequest_completionHandler(&req, &handler);
+        match rx.recv_timeout(Duration::from_secs(8)) {
+            Ok(Some((bgra, w, h))) => {
+                let buffer = image::RgbaImage::from_raw(w, h, bgra)?;
+                Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+            }
+            Ok(None) => None,
+            Err(_) => {
+                gen.cancelRequest(&req);
+                None
+            }
+        }
+    }
+}
+
+/// Rasterize a CGImage into premultiplied BGRA bytes (what gpui's
+/// `RenderImage` expects). Thread-safe: a private bitmap context, no AppKit.
+fn cgimage_bgra(img: *const std::ffi::c_void) -> Option<(Vec<u8>, u32, u32)> {
+    #[repr(C)]
+    struct Rect {
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGImageGetWidth(img: *const std::ffi::c_void) -> usize;
+        fn CGImageGetHeight(img: *const std::ffi::c_void) -> usize;
+        fn CGColorSpaceCreateDeviceRGB() -> *mut std::ffi::c_void;
+        fn CGColorSpaceRelease(cs: *mut std::ffi::c_void);
+        fn CGBitmapContextCreate(
+            data: *mut std::ffi::c_void,
+            width: usize,
+            height: usize,
+            bits_per_component: usize,
+            bytes_per_row: usize,
+            space: *mut std::ffi::c_void,
+            bitmap_info: u32,
+        ) -> *mut std::ffi::c_void;
+        fn CGContextDrawImage(ctx: *mut std::ffi::c_void, rect: Rect, img: *const std::ffi::c_void);
+        fn CGContextRelease(ctx: *mut std::ffi::c_void);
+    }
+    // kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little = BGRA.
+    const BGRA: u32 = 2 | (2 << 12);
+    if img.is_null() {
         return None;
     }
-
-    let decoded = image::open(&png).ok()?;
-    let decoded = decoded.thumbnail(600, 600); // bound memory; keeps aspect
-    let rgba = decoded.to_rgba8();
-    let (w, h) = rgba.dimensions();
-    let mut raw = rgba.into_raw();
-    for px in raw.chunks_exact_mut(4) {
-        px.swap(0, 2); // RGBA → BGRA
+    unsafe {
+        let (w, h) = (CGImageGetWidth(img), CGImageGetHeight(img));
+        if w == 0 || h == 0 || w > 8192 || h > 8192 {
+            return None;
+        }
+        let mut buf = vec![0u8; w * h * 4];
+        let cs = CGColorSpaceCreateDeviceRGB();
+        let ctx = CGBitmapContextCreate(buf.as_mut_ptr().cast(), w, h, 8, w * 4, cs, BGRA);
+        CGColorSpaceRelease(cs);
+        if ctx.is_null() {
+            return None;
+        }
+        CGContextDrawImage(ctx, Rect { x: 0.0, y: 0.0, w: w as f64, h: h as f64 }, img);
+        CGContextRelease(ctx);
+        Some((buf, w as u32, h as u32))
     }
-    let buffer = image::RgbaImage::from_raw(w, h, raw)?;
-    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+}
+
+thread_local! {
+    /// Built previews, most recently used last: (path, (mtime, size), content).
+    static PREVIEW_LRU: RefCell<Vec<(PathBuf, (Option<SystemTime>, u64), Arc<PreviewContent>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// The cache stays under this many entries and roughly this many bytes.
+const PREVIEW_LRU_ENTRIES: usize = 48;
+const PREVIEW_LRU_BYTES: usize = 160 * 1024 * 1024;
+
+/// (mtime, size) — what a cached preview must still match to be reused.
+fn preview_stamp(path: &Path) -> (Option<SystemTime>, u64) {
+    fs::metadata(path).map(|m| (m.modified().ok(), m.len())).unwrap_or((None, 0))
+}
+
+/// A cached preview for `path`, if one exists and the file hasn't changed.
+fn cached_preview(path: &Path) -> Option<Arc<PreviewContent>> {
+    let stamp = preview_stamp(path);
+    PREVIEW_LRU.with(|c| {
+        let mut c = c.borrow_mut();
+        let ix = c.iter().position(|(p, s, _)| p == path && *s == stamp)?;
+        let hit = c.remove(ix);
+        let content = hit.2.clone();
+        c.push(hit);
+        Some(content)
+    })
+}
+
+fn cache_preview(path: PathBuf, stamp: (Option<SystemTime>, u64), content: Arc<PreviewContent>) {
+    PREVIEW_LRU.with(|c| {
+        let mut c = c.borrow_mut();
+        c.retain(|(p, _, _)| *p != path);
+        c.push((path, stamp, content));
+        while c.len() > PREVIEW_LRU_ENTRIES
+            || (c.len() > 1 && c.iter().map(|(_, _, x)| x.cost()).sum::<usize>() > PREVIEW_LRU_BYTES)
+        {
+            c.remove(0);
+        }
+    });
+}
+
+/// Whether the active theme is dark (picks the code-highlighting palette).
+fn theme_is_dark() -> bool {
+    let bg = theme().bg;
+    let (r, g, b) = ((bg >> 16) & 0xff, (bg >> 8) & 0xff, bg & 0xff);
+    (r * 299 + g * 587 + b * 114) / 1000 < 128
+}
+
+/// A centered frame for image-like previews. Documents (PDF pages) get a
+/// white page so black-on-transparent content stays readable on dark themes.
+fn preview_frame(content: AnyElement, white_page: bool) -> gpui::Div {
+    div()
+        .relative()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p_2()
+        .rounded_md()
+        .when(white_page, |d| d.bg(rgb(0xffffff)))
+        .child(content)
+}
+
+/// The big icon + a short note, for items without a richer preview.
+fn preview_placeholder(path: &Path, note: &str) -> AnyElement {
+    div()
+        .flex_1()
+        .min_h_0()
+        .flex()
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .child(icon_element_sized(path, path.is_dir(), 96.0))
+        .child(div().text_xs().text_color(rgb(theme().text_dim)).child(note.to_string()))
+        .into_any_element()
+}
+
+/// A dim one-line footnote under a preview ("Showing the first 1 MB").
+fn preview_note(text: &str) -> AnyElement {
+    div()
+        .flex_none()
+        .px_2()
+        .py_1()
+        .border_t_1()
+        .border_color(rgb(theme().border))
+        .text_xs()
+        .text_color(rgb(theme().text_dim))
+        .child(text.to_string())
+        .into_any_element()
+}
+
+/// Inline Markdown text with its bold / italic / code / link runs.
+fn md_styled(text: &MdText) -> StyledText {
+    let t = theme();
+    StyledText::new(text.text.clone()).with_highlights(text.spans.iter().map(|(r, s)| {
+        let mut h = HighlightStyle::default();
+        if s.bold {
+            h.font_weight = Some(FontWeight::BOLD);
+        }
+        if s.italic {
+            h.font_style = Some(gpui::FontStyle::Italic);
+        }
+        if s.code {
+            h.background_color = Some(Theme::alpha(t.text, 0x18).into());
+        }
+        if s.link {
+            h.color = Some(rgb(t.accent).into());
+            h.underline = Some(gpui::UnderlineStyle { thickness: px(1.0), ..Default::default() });
+        }
+        (r.clone(), h)
+    }))
+}
+
+fn render_md_block(b: &MdBlock) -> AnyElement {
+    let t = theme();
+    match b {
+        MdBlock::Heading(level, text) => div()
+            .font_weight(FontWeight::BOLD)
+            .when(*level == 1, |d| d.text_xl().pb_1().border_b_1().border_color(rgb(t.border)))
+            .when(*level == 2, |d| d.text_lg())
+            .when(*level >= 3, |d| d.text_base())
+            .child(md_styled(text))
+            .into_any_element(),
+        MdBlock::Para(text) => div().child(md_styled(text)).into_any_element(),
+        MdBlock::Item(depth, num, text) => div()
+            .flex()
+            .gap_2()
+            .pl(px(*depth as f32 * 16.0))
+            .child(
+                div()
+                    .flex_none()
+                    .text_color(rgb(t.text_dim))
+                    .child(num.map(|n| format!("{n}.")).unwrap_or_else(|| "•".to_string())),
+            )
+            .child(div().flex_1().min_w_0().child(md_styled(text)))
+            .into_any_element(),
+        MdBlock::Quote(text) => div()
+            .pl_3()
+            .border_l_2()
+            .border_color(rgb(t.border_strong))
+            .text_color(rgb(t.text_muted))
+            .child(md_styled(text))
+            .into_any_element(),
+        MdBlock::Code(code) => div()
+            .p_2()
+            .rounded_md()
+            .bg(Theme::alpha(t.text, 0x10))
+            .text_xs()
+            .font_family("Menlo")
+            .children(code.lines().take(400).map(|l| div().whitespace_nowrap().child(l.replace('\t', "    "))))
+            .into_any_element(),
+        MdBlock::Rule => div().h(px(1.0)).bg(rgb(t.border)).into_any_element(),
+    }
 }
 
 /// Everything we display in the Information inspector for one file.
@@ -20301,6 +21334,72 @@ mod tests {
         assert_eq!(mode_string(0o640, false), "-rw-r----- (640)");
         assert_eq!(group_digits(1234567), "1,234,567");
         assert_eq!(group_digits(12), "12");
+    }
+
+    #[test]
+    fn preview_content_kinds() {
+        let d = scratch("preview");
+        fs::write(d.join("main.rs"), "fn main() {\n    println!(\"hi\");\n}\n").unwrap();
+        fs::write(d.join("notes.md"), "# Title\n\nSome **bold** and `code`.\n\n- one\n- two\n").unwrap();
+        fs::write(d.join("data.csv"), "name,qty\n\"Smith, J\",3\n\"say \"\"hi\"\"\",4\n").unwrap();
+        fs::write(d.join("blob.bin"), [0u8, 159, 146, 150, 0, 1, 2]).unwrap();
+        fs::create_dir(d.join("sub")).unwrap();
+        fs::write(d.join("sub/a.txt"), "a").unwrap();
+
+        match build_preview_content(&d.join("main.rs"), true) {
+            PreviewContent::Text { lines, truncated } => {
+                assert_eq!(lines.len(), 3);
+                assert!(!truncated);
+                assert!(!lines[0].spans.is_empty(), "Rust should be highlighted");
+                assert_eq!(lines[1].text.as_ref(), "    println!(\"hi\");");
+            }
+            _ => panic!("expected text"),
+        }
+        match build_preview_content(&d.join("notes.md"), false) {
+            PreviewContent::Markdown(b) => {
+                assert!(matches!(&b[0], MdBlock::Heading(1, t) if t.text == "Title"));
+                assert!(matches!(&b[1], MdBlock::Para(t) if t.text == "Some bold and code." && t.spans.len() == 2));
+                assert!(b.iter().filter(|x| matches!(x, MdBlock::Item(..))).count() == 2);
+            }
+            _ => panic!("expected markdown"),
+        }
+        match build_preview_content(&d.join("data.csv"), false) {
+            PreviewContent::Table { rows, .. } => {
+                assert_eq!(rows[1], vec!["Smith, J".to_string(), "3".to_string()]);
+                assert_eq!(rows[2][0], "say \"hi\"");
+            }
+            _ => panic!("expected table"),
+        }
+        assert!(read_text_prefix(&d.join("blob.bin")).is_none());
+        match build_preview_content(&d, false) {
+            PreviewContent::Listing { total, items, archive } => {
+                assert!(!archive);
+                assert_eq!(total, 5);
+                assert_eq!(items[0], ("sub".to_string(), true), "folders first");
+            }
+            _ => panic!("expected listing"),
+        }
+        // zip listing via zipinfo.
+        let zip = d.join("a.zip");
+        Command::new("zip").current_dir(&d).args(["-q", "-r"]).arg(&zip).arg("sub").status().unwrap();
+        match build_preview_content(&zip, false) {
+            PreviewContent::Listing { archive: true, items, .. } => {
+                assert!(items.iter().any(|(n, _)| n == "sub/a.txt"));
+            }
+            _ => panic!("expected archive listing"),
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn ql_thumbnail_renders_in_process() {
+        let d = scratch("qlthumb");
+        let png = d.join("red.png");
+        image::RgbaImage::from_pixel(64, 48, image::Rgba([255, 0, 0, 255])).save(&png).unwrap();
+        let img = ql_thumbnail(&png, 512.0).expect("QuickLook thumbnail");
+        let s = img.size(0);
+        assert!(s.width.0 > 0 && s.height.0 > 0);
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
