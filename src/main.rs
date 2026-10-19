@@ -12847,8 +12847,81 @@ impl Shuffle {
                     )
                     .into_any_element()
             }
+            PreviewContent::Media { poster, video, playable, details } => {
+                let live = *playable && self.media_target().as_deref() == Some(sel);
+                let (path, video) = (sel.to_path_buf(), *video);
+                // The slot the native player is positioned over each frame.
+                let slot = div()
+                    .relative()
+                    .rounded_md()
+                    .overflow_hidden()
+                    .bg(rgb(0x000000))
+                    .when(video, |d| d.flex_1().min_h(px(120.0)))
+                    .when(!video, |d| d.flex_none().h(px(46.0)))
+                    .when_some(poster.clone().filter(|_| video), |d, p| d.child(img_el(p)))
+                    .when(live, |d| {
+                        d.child(
+                            gpui::canvas(
+                                move |b, window, _| {
+                                    if let Some(v) = ns_view_ptr(window) {
+                                        let o = b.origin;
+                                        let sz = b.size;
+                                        media_show(v, &path, video, (f32::from(o.x), f32::from(o.y), f32::from(sz.width), f32::from(sz.height)));
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        )
+                    });
+                let rows = div().flex_none().flex().flex_col().gap_0p5().text_xs().children(details.iter().map(|(k, v)| {
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(div().flex_none().w(px(84.0)).text_color(rgb(t.text_dim)).child(k.clone()))
+                        .child(div().flex_1().min_w_0().truncate().text_color(rgb(t.text)).child(v.clone()))
+                }));
+                let note = (!*playable).then(|| preview_note("This format can’t play here — open it in its app"));
+                let mut col = div().flex_1().min_h_0().flex().flex_col().gap_3();
+                if !video {
+                    // Audio: artwork (or the icon) above the player bar.
+                    col = col.child(
+                        div().flex_1().min_h_0().flex().items_center().justify_center().child(match poster.clone() {
+                            Some(p) => div().size_full().max_w(px(320.0)).max_h(px(320.0)).child(img(ImageSource::Render(p)).size_full().object_fit(ObjectFit::Contain)).into_any_element(),
+                            None => icon_element_sized(sel, false, 128.0),
+                        }),
+                    );
+                }
+                col.child(slot).children(note).child(rows).into_any_element()
+            }
             PreviewContent::Nothing => preview_placeholder(sel, "No preview"),
         }
+    }
+
+    /// The media file whose native player should be live right now: the
+    /// active tab's focused file, while the preview shows it and no gpui
+    /// overlay is open (a native view would draw over it).
+    fn media_target(&self) -> Option<PathBuf> {
+        let p = prefs();
+        let overlay = self.context_menu.is_some()
+            || self.palette_open
+            || self.confirm_delete.is_some()
+            || self.info_panel.is_some()
+            || self.batch_rename.is_some()
+            || self.shortcut_help.is_some()
+            || self.server_dialog.is_some()
+            || self.sidebar_menu.is_some()
+            || self.group_dialog.is_some()
+            || self.sort_menu.is_some()
+            || self.ssh_ask;
+        let tab = self.active_tab();
+        if !p.preview || overlay || tab.remote.is_some() || tab.view == ViewMode::Gallery {
+            return None;
+        }
+        let a = tab.anchor.clone()?;
+        media_kind(&a)?;
+        Some(a)
     }
 
     // ----- PDF continuous view -----
@@ -15934,6 +16007,13 @@ impl Render for Shuffle {
         let t = theme();
         // Kick off any pending waterfall folder reads before rendering the tree.
         self.ensure_waterfall_loaded(cx);
+        // The native media player shows only while its file is previewed and
+        // nothing gpui-drawn needs to sit on top of it.
+        let target = self.media_target();
+        let showing = MEDIA.with(|m| m.borrow().as_ref().and_then(|mv| mv.path.clone()));
+        if showing.is_some() && showing != target {
+            media_hide();
+        }
         // Keep the folder watcher on whatever is now on screen.
         self.sync_watches();
         // Main row: sidebar | content (canvas) | optional inspector.
@@ -20337,6 +20417,9 @@ enum PreviewContent {
     /// A folder or archive listing: total entries and the first few
     /// (name, is_dir).
     Listing { total: usize, items: Vec<(String, bool)>, archive: bool },
+    /// Video / audio: poster frame or artwork, whether AVFoundation can play
+    /// it, and Spotlight details (duration, codecs, …).
+    Media { poster: Option<Arc<RenderImage>>, video: bool, playable: bool, details: Vec<(String, String)> },
     /// Nothing better than the icon (unknown binary, unreadable, …).
     Nothing,
 }
@@ -20353,6 +20436,10 @@ impl PreviewContent {
             PreviewContent::Markdown(b) => b.len() * 256,
             PreviewContent::Table { rows, .. } => rows.iter().flatten().map(|c| c.len() + 24).sum(),
             PreviewContent::Listing { items, .. } => items.iter().map(|(n, _)| n.len() + 32).sum(),
+            PreviewContent::Media { poster, .. } => poster.as_ref().map_or(0, |img| {
+                let s = img.size(0);
+                (s.width.0.max(0) as usize) * (s.height.0.max(0) as usize) * 4
+            }),
             PreviewContent::Nothing => 0,
         }
     }
@@ -20385,6 +20472,9 @@ fn build_preview_content(path: &Path, dark: bool) -> PreviewContent {
     let name = path.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
     if let Some(listing) = archive_listing(path, &name) {
         return listing;
+    }
+    if let Some(video) = media_kind(path) {
+        return build_media_preview(path, video);
     }
     match ext.as_str() {
         "md" | "markdown" | "mdown" | "mkd" => {
@@ -21043,6 +21133,207 @@ thread_local! {
 /// A rendered page filling its box.
 fn img_el(handle: Arc<RenderImage>) -> AnyElement {
     img(ImageSource::Render(handle)).size_full().into_any_element()
+}
+
+// ----- media playback: a native AVPlayerView over the preview pane ---------
+//
+// Video and audio play in AVKit's own player view (standard macOS controls:
+// play/pause, scrubber, volume, AirPlay). It's an NSView added on top of
+// gpui's content view and positioned each frame over the preview's media
+// placeholder; it's hidden whenever the preview isn't showing that file or
+// a gpui overlay (menu, palette, dialog) is open, since a native view always
+// draws above gpui's content.
+
+const VIDEO_EXTS: &[&str] = &["mov", "mp4", "m4v", "avi", "mkv", "webm", "3gp", "mts"];
+const AUDIO_EXTS: &[&str] = &["mp3", "m4a", "aac", "wav", "flac", "aiff", "aif", "caf", "opus", "m4b", "alac"];
+/// Containers AVFoundation can't play; they still get a poster frame.
+const UNPLAYABLE_EXTS: &[&str] = &["mkv", "webm", "opus"];
+
+/// Some(true) for video, Some(false) for audio, None otherwise.
+fn media_kind(path: &Path) -> Option<bool> {
+    let ext = path.extension()?.to_string_lossy().to_lowercase();
+    if VIDEO_EXTS.contains(&ext.as_str()) {
+        Some(true)
+    } else if AUDIO_EXTS.contains(&ext.as_str()) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Poster/artwork plus Spotlight metadata for a media file.
+fn build_media_preview(path: &Path, video: bool) -> PreviewContent {
+    let poster = ql_thumbnail(path, PREVIEW_IMAGE_PX);
+    let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    PreviewContent::Media {
+        poster,
+        video,
+        playable: !UNPLAYABLE_EXTS.contains(&ext.as_str()),
+        details: media_details(path),
+    }
+}
+
+/// Duration, dimensions, codecs, bitrate, sample rate and tags from
+/// Spotlight (`mdls`), as display pairs. Missing fields are skipped.
+fn media_details(path: &Path) -> Vec<(String, String)> {
+    let keys = [
+        "kMDItemTitle",
+        "kMDItemAuthors",
+        "kMDItemAlbum",
+        "kMDItemDurationSeconds",
+        "kMDItemPixelWidth",
+        "kMDItemPixelHeight",
+        "kMDItemCodecs",
+        "kMDItemTotalBitRate",
+        "kMDItemAudioSampleRate",
+        "kMDItemAudioChannelCount",
+    ];
+    let mut cmd = Command::new("mdls");
+    for k in keys {
+        cmd.arg("-name").arg(k);
+    }
+    let Ok(out) = cmd.arg(path).output() else { return Vec::new() };
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Values are `key = value` or `key = (\n "a",\n "b"\n)`.
+    let mut vals: HashMap<String, String> = HashMap::new();
+    let mut lines = text.lines();
+    while let Some(line) = lines.next() {
+        let Some((k, v)) = line.split_once(" = ") else { continue };
+        let k = k.trim().to_string();
+        let v = v.trim();
+        let v = if v == "(" {
+            let mut items = Vec::new();
+            for l in lines.by_ref() {
+                let l = l.trim();
+                if l == ")" {
+                    break;
+                }
+                items.push(l.trim_end_matches(',').trim_matches('"').to_string());
+            }
+            items.join(", ")
+        } else {
+            v.trim_matches('"').to_string()
+        };
+        if v != "(null)" && !v.is_empty() {
+            vals.insert(k, v);
+        }
+    }
+    let mut out = Vec::new();
+    let mut push = |label: &str, v: Option<String>| {
+        if let Some(v) = v {
+            out.push((label.to_string(), v));
+        }
+    };
+    push("Title", vals.get("kMDItemTitle").cloned());
+    push("Artist", vals.get("kMDItemAuthors").cloned());
+    push("Album", vals.get("kMDItemAlbum").cloned());
+    push(
+        "Duration",
+        vals.get("kMDItemDurationSeconds").and_then(|s| s.parse::<f64>().ok()).map(format_duration),
+    );
+    if let (Some(w), Some(h)) = (vals.get("kMDItemPixelWidth"), vals.get("kMDItemPixelHeight")) {
+        push("Dimensions", Some(format!("{w} × {h}")));
+    }
+    push("Codecs", vals.get("kMDItemCodecs").cloned());
+    push(
+        "Bit rate",
+        vals.get("kMDItemTotalBitRate").and_then(|s| s.parse::<f64>().ok()).map(|b| format!("{:.0} kbps", b / 1000.0)),
+    );
+    push(
+        "Sample rate",
+        vals.get("kMDItemAudioSampleRate").and_then(|s| s.parse::<f64>().ok()).map(|r| format!("{:.1} kHz", r / 1000.0)),
+    );
+    push(
+        "Channels",
+        vals.get("kMDItemAudioChannelCount").map(|c| match c.as_str() {
+            "1" => "Mono".to_string(),
+            "2" => "Stereo".to_string(),
+            n => format!("{n} channels"),
+        }),
+    );
+    out
+}
+
+/// 3725.4 → "1:02:05", 65 → "1:05".
+fn format_duration(secs: f64) -> String {
+    let s = secs.round() as u64;
+    let (h, m, s) = (s / 3600, (s / 60) % 60, s % 60);
+    if h > 0 { format!("{h}:{m:02}:{s:02}") } else { format!("{m}:{s:02}") }
+}
+
+/// The live native player: the file it's showing and the AppKit objects.
+struct MediaView {
+    path: Option<PathBuf>,
+    view: objc2::rc::Retained<objc2_av_kit::AVPlayerView>,
+}
+
+thread_local! {
+    static MEDIA: RefCell<Option<MediaView>> = const { RefCell::new(None) };
+}
+
+/// Show the native player for `path` over `rect` (window coords, top-left
+/// origin), creating it or switching files as needed. Video starts playing
+/// muted (unmute from the controls); audio waits for a click.
+fn media_show(view_ptr: *mut std::ffi::c_void, path: &Path, video: bool, rect: (f32, f32, f32, f32)) {
+    use objc2_app_kit::NSView;
+    use objc2_av_foundation::AVPlayer;
+    use objc2_av_kit::{AVPlayerView, AVPlayerViewControlsStyle};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+    let Some(mtm) = objc2::MainThreadMarker::new() else { return };
+    if view_ptr.is_null() {
+        return;
+    }
+    // SAFETY: gpui's content view, alive on the main thread.
+    let parent: &NSView = unsafe { &*(view_ptr as *const NSView) };
+    let (x, y, w, h) = (rect.0 as f64, rect.1 as f64, rect.2.max(1.0) as f64, rect.3.max(1.0) as f64);
+    let y = if parent.isFlipped() { y } else { parent.bounds().size.height - y - h };
+    let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+    MEDIA.with(|m| {
+        let mut m = m.borrow_mut();
+        let mv = m.get_or_insert_with(|| {
+            let view = unsafe { AVPlayerView::initWithFrame(AVPlayerView::alloc(mtm), frame) };
+            unsafe {
+                view.setControlsStyle(AVPlayerViewControlsStyle::Inline);
+            }
+            parent.addSubview(&view);
+            MediaView { path: None, view }
+        });
+        if mv.path.as_deref() != Some(path) {
+            let Some(s) = path.to_str() else { return };
+            let url = NSURL::fileURLWithPath(&NSString::from_str(s));
+            unsafe {
+                if let Some(old) = mv.view.player() {
+                    old.pause();
+                }
+                let player = AVPlayer::playerWithURL(&url, mtm);
+                if video {
+                    player.setMuted(true);
+                    player.play();
+                }
+                mv.view.setPlayer(Some(&player));
+            }
+            mv.path = Some(path.to_path_buf());
+        }
+        mv.view.setFrame(frame);
+        mv.view.setHidden(false);
+    });
+}
+
+/// Stop and hide the native player (no-op when there isn't one).
+fn media_hide() {
+    MEDIA.with(|m| {
+        if let Some(mv) = m.borrow_mut().as_mut() {
+            if mv.path.take().is_some() {
+                unsafe {
+                    if let Some(p) = mv.view.player() {
+                        p.pause();
+                    }
+                    mv.view.setPlayer(None);
+                }
+            }
+            mv.view.setHidden(true);
+        }
+    });
 }
 
 /// Whether the active theme is dark (picks the code-highlighting palette).
@@ -25192,6 +25483,39 @@ mod tests {
         assert_eq!(pdf_width_bucket(600.0), 1400);
         assert_eq!(pdf_width_bucket(5000.0), 2800);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn media_detection_and_details() {
+        assert_eq!(media_kind(Path::new("a/clip.MOV")), Some(true));
+        assert_eq!(media_kind(Path::new("song.m4a")), Some(false));
+        assert_eq!(media_kind(Path::new("doc.pdf")), None);
+        assert_eq!(format_duration(65.2), "1:05");
+        assert_eq!(format_duration(3725.4), "1:02:05");
+        let d = scratch("media");
+        let aiff = d.join("hello.aiff");
+        let ok = Command::new("say").arg("-o").arg(&aiff).arg("hello").status().map(|s| s.success()).unwrap_or(false);
+        if ok {
+            match build_preview_content(&aiff, false) {
+                PreviewContent::Media { video, playable, .. } => assert!(!video && playable),
+                _ => panic!("expected media"),
+            }
+        }
+        match build_preview_content(&d.join("x.mkv").tap_write(), false) {
+            PreviewContent::Media { playable, .. } => assert!(!playable),
+            _ => panic!("expected media"),
+        }
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    trait TapWrite {
+        fn tap_write(self) -> Self;
+    }
+    impl TapWrite for PathBuf {
+        fn tap_write(self) -> Self {
+            fs::write(&self, b"not really a video").unwrap();
+            self
+        }
     }
 
     #[test]
