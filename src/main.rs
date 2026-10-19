@@ -11152,6 +11152,11 @@ impl Shuffle {
         self.tab(pane).scroll_handle.scroll_to_item(item, ScrollStrategy::Center);
         // Keyboard scrolling shows the overlay scrollbar too.
         self.mark_scrolled(pane, cx);
+        // Repaint now. Don't lean on the scrollbar fade ticker: its timer
+        // shares GPUI's background thread pool, so if that pool is saturated
+        // (e.g. by hung QuickLook calls) the ticker never fires and the new
+        // selection doesn't show until something else (a mouse move) repaints.
+        cx.notify();
         self.focus_entry(pane, target, cx);
     }
 
@@ -11246,9 +11251,32 @@ impl Shuffle {
         if (!force && !prefs().preview) || lookup_preview(&path).is_some() {
             return;
         }
+        // One QuickLook run per path at a time.
+        if !PREVIEW_PENDING.with(|s| s.borrow_mut().insert(path.clone())) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
+            // Debounce: holding an arrow key focuses a new item every few ms.
+            // Only preview the item the selection settles on, rather than
+            // queueing a QuickLook request for every row passed over.
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            let still_focused = this
+                .update(cx, |this, _| {
+                    this.panes
+                        .iter()
+                        .flat_map(|p| p.tabs.iter())
+                        .any(|t| t.anchor.as_deref() == Some(path.as_path()))
+                })
+                .unwrap_or(false);
+            if !still_focused {
+                PREVIEW_PENDING.with(|s| s.borrow_mut().remove(&path));
+                return;
+            }
             let p = path.clone();
             let img = cx.background_spawn(async move { build_preview(&p) }).await;
+            PREVIEW_PENDING.with(|s| s.borrow_mut().remove(&path));
             let _ = this.update(cx, |_, cx| {
                 PREVIEW_CACHE.with(|c| {
                     c.borrow_mut().insert(path, img);
@@ -17658,6 +17686,8 @@ thread_local! {
     /// Cache of generated file previews. `None` = generation failed/unavailable.
     static PREVIEW_CACHE: RefCell<HashMap<PathBuf, Option<Arc<RenderImage>>>> =
         RefCell::new(HashMap::new());
+    /// Local previews currently being generated (so they aren't started twice).
+    static PREVIEW_PENDING: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
     /// Cache of gathered file information.
     static INFO_CACHE: RefCell<HashMap<PathBuf, FileInfo>> = RefCell::new(HashMap::new());
 }
@@ -17783,30 +17813,54 @@ fn remote_preview_temp(remote: &Path) -> PathBuf {
         .join(format!("{:016x}-{name}", h.finish()))
 }
 
-/// Generate a preview image for any file via macOS QuickLook (`qlmanage -t`),
-/// then decode it into a GPUI `RenderImage`. Runs off the render thread.
+/// Generate a preview image for any file via macOS QuickLook
+/// (`QLThumbnailGenerator`), then decode it into a GPUI `RenderImage`. Runs off
+/// the render thread; blocks it until QuickLook answers.
 fn build_preview(path: &Path) -> Option<Arc<RenderImage>> {
-    let out_dir = std::env::temp_dir().join("shuffle-preview");
-    let _ = fs::create_dir_all(&out_dir);
-    let name = path.file_name()?.to_string_lossy().into_owned();
-    let png = out_dir.join(format!("{name}.png"));
-    let _ = fs::remove_file(&png); // avoid showing a stale preview
+    use objc2_foundation::{NSError, NSSize};
+    use objc2_quick_look_thumbnailing::{
+        QLThumbnailGenerationRequest, QLThumbnailGenerationRequestRepresentationTypes,
+        QLThumbnailGenerator, QLThumbnailRepresentation,
+    };
 
     // QuickLook renders almost anything (images, PDFs, Office docs, code, …).
-    let ok = Command::new("qlmanage")
-        .args(["-t", "-s", "600", "-o"])
-        .arg(&out_dir)
-        .arg(path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !ok || !png.exists() {
-        return None;
-    }
+    // Use the API rather than `qlmanage -t`: on macOS 26 qlmanage never exits
+    // for files QuickLook can't thumbnail (folders, dotfiles, .toml, .zip, …),
+    // and each hung run pinned one of GPUI's background threads. The API
+    // reports those as an error straight away.
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path.to_str()?));
+    let request = unsafe {
+        QLThumbnailGenerationRequest::initWithFileAtURL_size_scale_representationTypes(
+            QLThumbnailGenerationRequest::alloc(),
+            &url,
+            NSSize::new(600.0, 600.0),
+            1.0,
+            QLThumbnailGenerationRequestRepresentationTypes::Thumbnail,
+        )
+    };
+    // The completion handler runs on a QuickLook queue; hand the image back
+    // as TIFF bytes (an NSImage wrapping one bitmap, so this is cheap).
+    let (tx, rx) = std::sync::mpsc::sync_channel::<Option<Vec<u8>>>(1);
+    let handler = block2::RcBlock::new(
+        move |rep: *mut QLThumbnailRepresentation, _err: *mut NSError| {
+            let tiff = unsafe { rep.as_ref() }
+                .and_then(|rep| unsafe { rep.NSImage() }.TIFFRepresentation())
+                .map(|data| data.to_vec());
+            let _ = tx.try_send(tiff);
+        },
+    );
+    let generator = unsafe { QLThumbnailGenerator::sharedGenerator() };
+    unsafe { generator.generateBestRepresentationForRequest_completionHandler(&request, &handler) };
+    // Belt and braces: never wait on QuickLook indefinitely.
+    let tiff = match rx.recv_timeout(Duration::from_secs(10)) {
+        Ok(tiff) => tiff?,
+        Err(_) => {
+            unsafe { generator.cancelRequest(&request) };
+            return None;
+        }
+    };
 
-    let decoded = image::open(&png).ok()?;
+    let decoded = image::load_from_memory(&tiff).ok()?;
     let decoded = decoded.thumbnail(600, 600); // bound memory; keeps aspect
     let rgba = decoded.to_rgba8();
     let (w, h) = rgba.dimensions();
