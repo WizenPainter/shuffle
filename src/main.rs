@@ -12282,6 +12282,11 @@ impl Shuffle {
         self.tab(pane).scroll_handle.scroll_to_item(item, ScrollStrategy::Center);
         // Keyboard scrolling shows the overlay scrollbar too.
         self.mark_scrolled(pane, cx);
+        // Repaint now. Don't lean on the scrollbar fade ticker: its timer
+        // shares GPUI's background thread pool, so if that pool is saturated
+        // (e.g. by hung QuickLook calls) the ticker never fires and the new
+        // selection doesn't show until something else (a mouse move) repaints.
+        cx.notify();
         self.focus_entry(pane, target, cx);
     }
 
@@ -12374,9 +12379,32 @@ impl Shuffle {
         if (!force && !prefs().preview) || lookup_preview(&path).is_some() {
             return;
         }
+        // One QuickLook run per path at a time.
+        if !PREVIEW_PENDING.with(|s| s.borrow_mut().insert(path.clone())) {
+            return;
+        }
         cx.spawn(async move |this, cx| {
+            // Debounce: holding an arrow key focuses a new item every few ms.
+            // Only preview the item the selection settles on, rather than
+            // queueing a QuickLook request for every row passed over.
+            cx.background_executor()
+                .timer(Duration::from_millis(120))
+                .await;
+            let still_focused = this
+                .update(cx, |this, _| {
+                    this.panes
+                        .iter()
+                        .flat_map(|p| p.tabs.iter())
+                        .any(|t| t.anchor.as_deref() == Some(path.as_path()))
+                })
+                .unwrap_or(false);
+            if !still_focused {
+                PREVIEW_PENDING.with(|s| s.borrow_mut().remove(&path));
+                return;
+            }
             let p = path.clone();
             let img = cx.background_spawn(async move { build_preview(&p) }).await;
+            PREVIEW_PENDING.with(|s| s.borrow_mut().remove(&path));
             let _ = this.update(cx, |_, cx| {
                 PREVIEW_CACHE.with(|c| {
                     c.borrow_mut().insert(path, img);
@@ -20234,6 +20262,8 @@ thread_local! {
     /// Cache of generated file previews. `None` = generation failed/unavailable.
     static PREVIEW_CACHE: RefCell<HashMap<PathBuf, Option<Arc<RenderImage>>>> =
         RefCell::new(HashMap::new());
+    /// Local previews currently being generated (so they aren't started twice).
+    static PREVIEW_PENDING: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
     /// Cache of gathered file information.
     static INFO_CACHE: RefCell<HashMap<PathBuf, FileInfo>> = RefCell::new(HashMap::new());
 }
@@ -20359,8 +20389,9 @@ fn remote_preview_temp(remote: &Path) -> PathBuf {
         .join(format!("{:016x}-{name}", h.finish()))
 }
 
-/// Generate a preview image for any file via macOS QuickLook (`qlmanage -t`),
-/// then decode it into a GPUI `RenderImage`. Runs off the render thread.
+/// Generate a preview image for any file via macOS QuickLook
+/// (`QLThumbnailGenerator`), then decode it into a GPUI `RenderImage`. Runs off
+/// the render thread; blocks it until QuickLook answers.
 fn build_preview(path: &Path) -> Option<Arc<RenderImage>> {
     // In-process QuickLook (no qlmanage spawn, no shared temp file).
     ql_thumbnail(path, 1200.0)
