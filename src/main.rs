@@ -1079,6 +1079,37 @@ impl Keymap {
     fn set(&mut self, a: KeyAction, b: Option<String>) {
         self.binds[a.id()] = b;
     }
+    /// Other actions that share `a`'s keystroke in the same context (the
+    /// palette's editing keys only act while it's open, so they never clash
+    /// with browsing keys), plus a note when it shadows a fixed browsing key.
+    fn conflicts(&self, a: KeyAction) -> (Vec<KeyAction>, Option<&'static str>) {
+        let Some(ks) = self.get(a) else { return (Vec::new(), None) };
+        let others = KeyAction::ALL
+            .iter()
+            .copied()
+            .filter(|o| *o != a && o.is_palette() == a.is_palette() && self.get(*o) == Some(ks))
+            .collect();
+        // Keys the browser handles itself (they lose to a binding).
+        const FIXED: &[(&str, &str)] = &[
+            ("space", "Space (preview)"),
+            ("shift-space", "⇧Space (Quick Look)"),
+            ("enter", "↩ (rename)"),
+            ("backspace", "⌫ (enclosing folder)"),
+            ("delete", "fn⌫ (Move to Trash)"),
+            ("escape", "Esc (clear selection)"),
+            ("up", "↑"),
+            ("down", "↓"),
+            ("left", "←"),
+            ("right", "→"),
+            ("home", "Home"),
+            ("end", "End"),
+            ("pageup", "PgUp"),
+            ("pagedown", "PgDn"),
+        ];
+        let fixed = if a.is_palette() { None } else { FIXED.iter().find(|(k, _)| *k == ks).map(|(_, l)| *l) };
+        (others, fixed)
+    }
+
     /// The action bound to keystroke `ks`, if any.
     fn action_for(&self, ks: &str) -> Option<KeyAction> {
         KeyAction::ALL.iter().copied().find(|a| self.get(*a) == Some(ks))
@@ -2191,9 +2222,18 @@ impl Settings {
         let t = theme();
         let km = keymap();
         let mut rows: Vec<AnyElement> = Vec::new();
+        let mut clashing = 0usize;
         for action in KeyAction::ALL.iter().copied() {
             let recording = self.recording == Some(action);
             let binding = km.get(action);
+            let (others, fixed) = km.conflicts(action);
+            let conflict = !recording && (!others.is_empty() || fixed.is_some());
+            clashing += usize::from(conflict);
+            let note = conflict.then(|| {
+                let mut names: Vec<String> = others.iter().map(|o| o.label().to_string()).collect();
+                names.extend(fixed.map(|f| format!("built-in {f}")));
+                format!("Also used by {} — only one will run", names.join(", "))
+            });
             // The binding chip: shows the keystroke, "Unbound", or a recording hint.
             let (chip_text, chip_dim) = if recording {
                 ("Press keys… (⌫ clear, esc cancel)".to_string(), false)
@@ -2210,7 +2250,14 @@ impl Settings {
                     .justify_between()
                     .gap_4()
                     .py_1()
-                    .child(div().text_color(rgb(t.text)).child(action.label()))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .min_w_0()
+                            .child(div().text_color(rgb(t.text)).child(action.label()))
+                            .children(note.map(|n| div().text_xs().text_color(rgb(RENAME_ERR_COLOR)).child(n))),
+                    )
                     .child(
                         div()
                             .id(("kb", action.id()))
@@ -2223,7 +2270,13 @@ impl Settings {
                             .text_xs()
                             .bg(rgb(t.surface))
                             .border_1()
-                            .border_color(if recording { rgb(t.accent) } else { rgb(t.border) })
+                            .border_color(if recording {
+                                rgb(t.accent)
+                            } else if conflict {
+                                rgb(RENAME_ERR_COLOR)
+                            } else {
+                                rgb(t.border)
+                            })
                             .text_color(if chip_dim { rgb(t.text_dim) } else { rgb(t.text) })
                             .hover(|s| s.border_color(rgb(t.accent)))
                             .child(chip_text)
@@ -2242,6 +2295,22 @@ impl Settings {
                 "Click a shortcut, then press the keys. \u{232b} clears it; Esc cancels.",
             )
             .into_any_element(),
+            if clashing > 0 {
+                div()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(RENAME_ERR_COLOR))
+                    .text_xs()
+                    .text_color(rgb(RENAME_ERR_COLOR))
+                    .child(format!(
+                        "⚠ {clashing} shortcuts conflict — marked in red below. Rebind or clear one of each pair."
+                    ))
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            },
             settings_section("Shortcuts", None, rows),
             div()
                 .pt_1()
@@ -24717,6 +24786,21 @@ mod tests {
         let s = img.size(0);
         assert!(s.width.0 > 0 && s.height.0 > 0);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn keymap_conflicts() {
+        let mut k = Keymap::defaults();
+        // Defaults are conflict-free (⌘A in the palette and the browser is
+        // fine: different contexts).
+        for a in KeyAction::ALL {
+            let (others, fixed) = k.conflicts(*a);
+            assert!(others.is_empty() && fixed.is_none(), "{} conflicts by default", a.key());
+        }
+        k.set(KeyAction::Duplicate, Some("cmd-c".into()));
+        assert!(k.conflicts(KeyAction::CopyFiles).0 == vec![KeyAction::Duplicate]);
+        k.set(KeyAction::GetInfo, Some("space".into()));
+        assert!(k.conflicts(KeyAction::GetInfo).1.is_some());
     }
 
     #[test]
