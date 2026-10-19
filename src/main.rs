@@ -380,6 +380,8 @@ struct Prefs {
     /// more see-through; the default is nearly opaque so it doesn't read as a
     /// confusing floating pane over the explorer.
     palette_opacity: u8,
+    /// Show dotfiles (.DS_Store, .git, …). Off by default, like Finder.
+    show_hidden: bool,
 }
 
 impl Default for Prefs {
@@ -402,6 +404,7 @@ impl Default for Prefs {
             ssh_configured: false,
             waterfall: false,
             palette_opacity: 92,
+            show_hidden: false,
         }
     }
 }
@@ -429,6 +432,7 @@ thread_local! {
         ssh_configured: false,
         waterfall: false,
         palette_opacity: 92,
+        show_hidden: false,
     }) };
 }
 
@@ -449,6 +453,7 @@ fn set_active_prefs(p: Prefs) {
 
 /// Apply prefs everywhere: update the render copy, persist, store in the global.
 fn apply_prefs(p: Prefs, cx: &mut App) {
+    SHOW_HIDDEN.store(p.show_hidden, Ordering::Relaxed);
     set_active_prefs(p);
     save_prefs(&p);
     cx.set_global(PrefsGlobal(p));
@@ -763,6 +768,7 @@ enum KeyAction {
     BatchRename,
     Undo,
     Redo,
+    ToggleHidden,
     CopyFiles,
     CutFiles,
     PasteFiles,
@@ -822,6 +828,7 @@ impl KeyAction {
         KeyAction::BatchRename,
         KeyAction::Undo,
         KeyAction::Redo,
+        KeyAction::ToggleHidden,
         KeyAction::CopyFiles,
         KeyAction::CutFiles,
         KeyAction::PasteFiles,
@@ -898,6 +905,7 @@ impl KeyAction {
             KeyAction::BatchRename => "batch_rename",
             KeyAction::Undo => "undo",
             KeyAction::Redo => "redo",
+            KeyAction::ToggleHidden => "toggle_hidden",
             KeyAction::CopyFiles => "copy_files",
             KeyAction::CutFiles => "cut_files",
             KeyAction::PasteFiles => "paste_files",
@@ -957,6 +965,7 @@ impl KeyAction {
             KeyAction::BatchRename => "Rename selected items…",
             KeyAction::Undo => "Undo last file operation",
             KeyAction::Redo => "Redo",
+            KeyAction::ToggleHidden => "Show / hide hidden files",
             KeyAction::CopyFiles => "Copy files",
             KeyAction::CutFiles => "Cut files (paste moves them)",
             KeyAction::PasteFiles => "Paste files",
@@ -1006,6 +1015,8 @@ impl KeyAction {
             KeyAction::BatchRename => Some("cmd-shift-r"),
             KeyAction::Undo => Some("cmd-z"),
             KeyAction::Redo => Some("cmd-shift-z"),
+            // gpui reports ⇧⌘. as "cmd->" (shifted punctuation keeps no ⇧).
+            KeyAction::ToggleHidden => Some("cmd->"),
             KeyAction::Open => Some("cmd-down"),
             KeyAction::MoveToTrash => Some("cmd-backspace"),
             KeyAction::NewFolder => Some("cmd-shift-n"),
@@ -9509,6 +9520,14 @@ impl Shuffle {
             }
             KeyAction::Undo => self.undo_last(cx),
             KeyAction::Redo => self.redo_last(cx),
+            KeyAction::ToggleHidden => {
+                let mut np = prefs();
+                np.show_hidden = !np.show_hidden;
+                let shown = np.show_hidden;
+                apply_prefs(np, cx);
+                self.refresh_all_panes(cx);
+                self.set_notice(if shown { "Showing hidden files" } else { "Hiding hidden files" }.into(), cx);
+            }
             KeyAction::CopyFiles | KeyAction::CutFiles => {
                 let targets = self.action_targets(pane);
                 if !targets.is_empty() && self.tab(pane).remote.is_none() {
@@ -20735,9 +20754,17 @@ const LISTING_CAP: usize = 500_000;
 /// come from one readdir; the stats then run in parallel on the rayon pool —
 /// they dominate on big folders, and on network mounts overlapping them hides
 /// the per-request round trip.
+/// Mirror of `Prefs::show_hidden` that the background listing threads read.
+static SHOW_HIDDEN: AtomicBool = AtomicBool::new(false);
+
+/// Whether a listing should include `name` (dotfiles only when shown).
+fn listed_name(name: &std::ffi::OsStr) -> bool {
+    SHOW_HIDDEN.load(Ordering::Relaxed) || name.as_encoded_bytes().first() != Some(&b'.')
+}
+
 fn read_entries(dir: &Path) -> Vec<Entry> {
     let names: Vec<OsString> = match fs::read_dir(dir) {
-        Ok(rd) => rd.flatten().take(LISTING_CAP).map(|e| e.file_name()).collect(),
+        Ok(rd) => rd.flatten().map(|e| e.file_name()).filter(|n| listed_name(n)).take(LISTING_CAP).collect(),
         Err(_) => Vec::new(),
     };
     let mut entries: Vec<Entry> = names
@@ -20766,7 +20793,7 @@ fn read_entries(dir: &Path) -> Vec<Entry> {
 fn read_entries_fast(dir: &Path) -> Vec<Entry> {
     let mut entries: Vec<Entry> = Vec::new();
     if let Ok(read_dir) = fs::read_dir(dir) {
-        for entry in read_dir.flatten().take(LISTING_CAP) {
+        for entry in read_dir.flatten().filter(|e| listed_name(&e.file_name())).take(LISTING_CAP) {
             let name = entry.file_name().to_string_lossy().into_owned();
             let is_dir = match entry.file_type() {
                 Ok(t) if t.is_dir() => true,
@@ -22661,8 +22688,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity
+            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\nshow_hidden={}\n",
+            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity, p.show_hidden
         );
         let _ = fs::write(&file, body);
     }
@@ -22812,6 +22839,7 @@ fn load_prefs() -> Prefs {
                     "ssh_use_system" => p.ssh_use_system = on,
                     "ssh_configured" => p.ssh_configured = on,
                     "waterfall" => p.waterfall = on,
+                    "show_hidden" => p.show_hidden = on,
                     "palette_opacity" => {
                         if let Ok(n) = v.trim().parse::<u8>() {
                             p.palette_opacity = n.clamp(20, 100);
@@ -23171,6 +23199,7 @@ fn main() {
 
         // Load feature prefs (terminal / preview / info), all off by default.
         let saved_prefs = load_prefs();
+        SHOW_HIDDEN.store(saved_prefs.show_hidden, Ordering::Relaxed);
         set_active_prefs(saved_prefs);
         cx.set_global(PrefsGlobal(saved_prefs));
 
