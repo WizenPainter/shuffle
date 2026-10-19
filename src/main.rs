@@ -794,6 +794,9 @@ enum KeyAction {
     ShortcutHelp,
     PreviewScrollUp,
     PreviewScrollDown,
+    PreviewZoomIn,
+    PreviewZoomOut,
+    PreviewZoomReset,
     // Command-palette (Cmd+P) text editing. These act only while the palette is
     // open, so they're excluded from the normal (global) key dispatch.
     PaletteCursorStart,
@@ -854,6 +857,9 @@ impl KeyAction {
         KeyAction::ShortcutHelp,
         KeyAction::PreviewScrollUp,
         KeyAction::PreviewScrollDown,
+        KeyAction::PreviewZoomIn,
+        KeyAction::PreviewZoomOut,
+        KeyAction::PreviewZoomReset,
         KeyAction::PaletteCursorStart,
         KeyAction::PaletteCursorEnd,
         KeyAction::PaletteSelectAll,
@@ -931,6 +937,9 @@ impl KeyAction {
             KeyAction::ShortcutHelp => "shortcut_help",
             KeyAction::PreviewScrollUp => "preview_scroll_up",
             KeyAction::PreviewScrollDown => "preview_scroll_down",
+            KeyAction::PreviewZoomIn => "preview_zoom_in",
+            KeyAction::PreviewZoomOut => "preview_zoom_out",
+            KeyAction::PreviewZoomReset => "preview_zoom_reset",
             KeyAction::PaletteCursorStart => "palette_cursor_start",
             KeyAction::PaletteCursorEnd => "palette_cursor_end",
             KeyAction::PaletteSelectAll => "palette_select_all",
@@ -991,6 +1000,9 @@ impl KeyAction {
             KeyAction::ShortcutHelp => "Keyboard shortcuts",
             KeyAction::PreviewScrollUp => "Scroll preview up",
             KeyAction::PreviewScrollDown => "Scroll preview down",
+            KeyAction::PreviewZoomIn => "Zoom preview in",
+            KeyAction::PreviewZoomOut => "Zoom preview out",
+            KeyAction::PreviewZoomReset => "Zoom preview to fit",
             KeyAction::PaletteCursorStart => "Palette: cursor to start",
             KeyAction::PaletteCursorEnd => "Palette: cursor to end",
             KeyAction::PaletteSelectAll => "Palette: select all",
@@ -1047,6 +1059,9 @@ impl KeyAction {
             KeyAction::ShortcutHelp => Some("f1"),
             KeyAction::PreviewScrollUp => Some("alt-up"),
             KeyAction::PreviewScrollDown => Some("alt-down"),
+            KeyAction::PreviewZoomIn => Some("cmd-="),
+            KeyAction::PreviewZoomOut => Some("cmd--"),
+            KeyAction::PreviewZoomReset => Some("cmd-0"),
             KeyAction::PaletteCursorStart => Some("cmd-left"),
             KeyAction::PaletteCursorEnd => Some("cmd-right"),
             KeyAction::PaletteSelectAll => Some("cmd-a"),
@@ -2915,21 +2930,23 @@ fn info_row(label: &str, value: &str) -> impl IntoElement {
 
 /// Pretty-print a stored keystroke string ("cmd-shift-p") with Mac symbols.
 fn pretty_keystroke(s: &str) -> String {
-    let parts: Vec<&str> = s.split('-').collect();
-    if parts.len() == 1 {
-        return key_symbol(parts[0]);
-    }
+    // Peel modifier prefixes off the front; what's left is the key (which can
+    // itself be "-", as in "cmd--").
     let mut out = String::new();
-    for m in &parts[..parts.len() - 1] {
-        out.push_str(match *m {
-            "cmd" => "⌘",
-            "ctrl" => "⌃",
-            "alt" => "⌥",
-            "shift" => "⇧",
-            o => o,
-        });
+    let mut rest = s;
+    loop {
+        let sym = [("cmd-", "⌘"), ("ctrl-", "⌃"), ("alt-", "⌥"), ("shift-", "⇧")]
+            .iter()
+            .find(|(m, _)| rest.starts_with(m) && rest.len() > m.len());
+        match sym {
+            Some((m, sym)) => {
+                out.push_str(sym);
+                rest = &rest[m.len()..];
+            }
+            None => break,
+        }
     }
-    out.push_str(&key_symbol(parts[parts.len() - 1]));
+    out.push_str(&key_symbol(rest));
     out
 }
 
@@ -4060,6 +4077,9 @@ struct Shuffle {
     /// Inspector width, and an in-progress drag of its edge (x, width at grab).
     preview_w: f32,
     preview_drag: Option<(f32, f32)>,
+    /// PDF preview zoom (1.0 = fit width) and its page scroll.
+    pdf_zoom: f32,
+    pdf_scroll: UniformListScrollHandle,
     /// The row the mouse is currently over: (pane, path). Enter renames it
     /// even when nothing is selected (point-and-rename).
     hovered: Option<(usize, PathBuf)>,
@@ -4437,6 +4457,8 @@ impl Shuffle {
             preview_scroll: ScrollHandle::new(),
             preview_w: PREVIEW_W_DEFAULT,
             preview_drag: None,
+            pdf_zoom: 1.0,
+            pdf_scroll: UniformListScrollHandle::new(),
             hovered: None,
             drop_hover: None,
             remote_error: None,
@@ -9751,6 +9773,9 @@ impl Shuffle {
             }
             KeyAction::PreviewScrollUp => self.scroll_preview(false, cx),
             KeyAction::PreviewScrollDown => self.scroll_preview(true, cx),
+            KeyAction::PreviewZoomIn => self.zoom_pdf(1, cx),
+            KeyAction::PreviewZoomOut => self.zoom_pdf(-1, cx),
+            KeyAction::PreviewZoomReset => self.zoom_pdf(0, cx),
             KeyAction::Refresh => {
                 let dir = self.tab(pane).current_dir.clone();
                 if self.tab(pane).remote.is_none() && cloud_kind(&dir).is_some() && cloudctl_path().is_some() {
@@ -12481,6 +12506,11 @@ impl Shuffle {
             self.preview_for = Some(path.clone());
             self.preview_text_scroll = UniformListScrollHandle::new();
             self.preview_scroll = ScrollHandle::new();
+            self.pdf_scroll = UniformListScrollHandle::new();
+            self.pdf_zoom = 1.0;
+            if is_pdf(&path) && prefs().preview_pages {
+                self.ensure_pdf_meta(path.clone(), cx);
+            }
         }
         if cached_preview(&path).is_some() {
             self.preview_loading = None;
@@ -12546,7 +12576,9 @@ impl Shuffle {
     /// everything else by pixels.
     fn scroll_preview(&mut self, down: bool, cx: &mut Context<Self>) {
         let step = if down { -120.0 } else { 120.0 };
-        for h in [&self.preview_text_scroll.0.borrow().base_handle, &self.preview_scroll] {
+        let text = self.preview_text_scroll.0.borrow().base_handle.clone();
+        let pdf = self.pdf_scroll.0.borrow().base_handle.clone();
+        for h in [&text, &pdf, &self.preview_scroll] {
             let o = h.offset();
             let max = h.max_offset();
             let y = (f32::from(o.y) + step).clamp(-f32::from(max.height), 0.0);
@@ -12592,7 +12624,13 @@ impl Shuffle {
     fn render_preview_body(&self, sel: &Path, cx: &Context<Self>) -> AnyElement {
         let t = theme();
         let p = prefs();
-        // PDFs page through natively rendered pages when the pager is on.
+        // Local PDFs: every page in a continuous, zoomable scroll.
+        if p.preview_pages && is_pdf(sel) && self.active_tab().remote.is_none() {
+            if let Some(Some(meta)) = cached_pdf_meta(sel) {
+                return self.render_pdf_view(sel, meta, cx);
+            }
+        }
+        // Remote PDFs page through the downloaded copy's pages.
         if p.preview_pages && is_pdf(sel) {
             let count = lookup_pdf_count(sel);
             let page = self.preview_page.min(count.unwrap_or(1).saturating_sub(1));
@@ -12811,6 +12849,143 @@ impl Shuffle {
             }
             PreviewContent::Nothing => preview_placeholder(sel, "No preview"),
         }
+    }
+
+    // ----- PDF continuous view -----
+
+    /// Read a PDF's page count / page size in the background (once per mtime).
+    fn ensure_pdf_meta(&self, path: PathBuf, cx: &mut Context<Self>) {
+        if cached_pdf_meta(&path).is_some() {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let p = path.clone();
+            let (mtime, meta) = cx
+                .background_spawn(async move { (fs::metadata(&p).ok().and_then(|m| m.modified().ok()), pdf_meta(&p)) })
+                .await;
+            let _ = this.update(cx, |_, cx| {
+                PDF_META.with(|m| m.borrow_mut().insert(path, (mtime, meta)));
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Render one page at `width` px in the background, once.
+    fn ensure_pdf_page_at(&self, path: PathBuf, page: usize, width: u32, cx: &mut Context<Self>) {
+        let key = (path, page, width);
+        if !PDF_INFLIGHT.with(|f| f.borrow_mut().insert(key.clone())) {
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            let k = key.clone();
+            let img = cx.background_spawn(async move { render_pdf_page_cg(&k.0, k.1, k.2) }).await;
+            let _ = this.update(cx, |_, cx| {
+                PDF_INFLIGHT.with(|f| f.borrow_mut().remove(&key));
+                if let Some(img) = img {
+                    cache_pdf_page(key, img);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// ⌘= / ⌘- / ⌘0: zoom the PDF preview (1.0 = fit width).
+    fn zoom_pdf(&mut self, step: i32, cx: &mut Context<Self>) {
+        const LEVELS: [f32; 9] = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0];
+        let cur = LEVELS.iter().position(|z| (*z - self.pdf_zoom).abs() < 0.01).unwrap_or(2) as i32;
+        self.pdf_zoom = if step == 0 { 1.0 } else { LEVELS[(cur + step).clamp(0, LEVELS.len() as i32 - 1) as usize] };
+        cx.notify();
+    }
+
+    /// Every page of a PDF in one continuous, lazily rendered scroll, with a
+    /// zoom pill (− 100% + Fit) and the current page number.
+    fn render_pdf_view(&self, sel: &Path, meta: PdfMeta, cx: &Context<Self>) -> AnyElement {
+        let t = theme();
+        let view_w = PDF_VIEW_W.with(|w| w.get()).max(200.0);
+        let page_w = ((view_w - 20.0) * self.pdf_zoom).max(80.0);
+        let page_h = page_w * (meta.h / meta.w) as f32;
+        let item_h = page_h + 10.0;
+        let width_px = pdf_width_bucket(page_w);
+        let scrolled = -f32::from(self.pdf_scroll.0.borrow().base_handle.offset().y);
+        let current = ((scrolled + item_h * 0.4) / item_h).floor().max(0.0) as usize + 1;
+        let path = sel.to_path_buf();
+        let list = uniform_list(
+            "pdf-pages",
+            meta.count,
+            cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                range
+                    .map(|ix| {
+                        let (img, sharp) = cached_pdf_page(&path, ix, width_px);
+                        if !sharp {
+                            this.ensure_pdf_page_at(path.clone(), ix, width_px, cx);
+                        }
+                        let page = div()
+                            .w(px(page_w))
+                            .h(px(page_h))
+                            .bg(rgb(0xffffff))
+                            .shadow_sm()
+                            .when_some(img, |d, img| d.child(img_el(img)));
+                        div().w_full().h(px(item_h)).flex().justify_center().pt(px(5.0)).child(page).into_any_element()
+                    })
+                    .collect()
+            }),
+        )
+        .w(px(page_w + 20.0))
+        .h_full()
+        .track_scroll(self.pdf_scroll.clone());
+        let btn = |id: &'static str, label: String| {
+            div()
+                .id(id)
+                .px_1p5()
+                .rounded_full()
+                .cursor_pointer()
+                .text_color(rgba(0xffffffee))
+                .hover(|s| s.bg(rgba(0xffffff33)))
+                .child(label)
+        };
+        div()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .rounded_md()
+            .bg(Theme::alpha(t.text, 0x10))
+            .overflow_hidden()
+            // Measure the view so pages lay out at "fit width".
+            .child(
+                gpui::canvas(move |b, _, _| PDF_VIEW_W.with(|w| w.set(f32::from(b.size.width))), |_, _, _, _| {})
+                    .absolute()
+                    .size_full(),
+            )
+            .child(
+                div()
+                    .id("pdf-hscroll")
+                    .size_full()
+                    .when(self.pdf_zoom > 1.0, |d| d.overflow_x_scroll())
+                    .flex()
+                    .when(self.pdf_zoom <= 1.0, |d| d.justify_center())
+                    .child(list),
+            )
+            .child(
+                div().absolute().bottom_2().left_0().right_0().flex().justify_center().child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1()
+                        .py_0p5()
+                        .rounded_full()
+                        .bg(rgba(0x000000b0))
+                        .text_xs()
+                        .child(div().px_1().text_color(rgba(0xffffffcc)).child(format!("{} / {}", current.min(meta.count), meta.count)))
+                        .child(btn("pdf-zoom-out", "−".into()).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_pdf(-1, cx))))
+                        .child(div().text_color(rgba(0xffffffdd)).child(format!("{}%", (self.pdf_zoom * 100.0).round())))
+                        .child(btn("pdf-zoom-in", "+".into()).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_pdf(1, cx))))
+                        .child(btn("pdf-zoom-fit", "Fit".into()).on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.zoom_pdf(0, cx)))),
+                ),
+            )
+            .into_any_element()
     }
 
     /// The ‹ 2 / 14 › pager over a PDF preview.
@@ -20662,6 +20837,214 @@ fn cache_preview(path: PathBuf, stamp: (Option<SystemTime>, u64), content: Arc<P
     });
 }
 
+// ----- PDF continuous view: Core Graphics page rendering + bounded cache ---
+
+/// A PDF's page count and its first page's size in points (pages are laid out
+/// at that aspect; nearly every PDF is uniform).
+#[derive(Clone, Copy)]
+struct PdfMeta {
+    count: usize,
+    w: f64,
+    h: f64,
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGPDFDocumentCreateWithURL(url: *const std::ffi::c_void) -> *mut std::ffi::c_void;
+    fn CGPDFDocumentRelease(doc: *mut std::ffi::c_void);
+    fn CGPDFDocumentGetNumberOfPages(doc: *mut std::ffi::c_void) -> usize;
+    fn CGPDFDocumentGetPage(doc: *mut std::ffi::c_void, page: usize) -> *mut std::ffi::c_void;
+    fn CGPDFPageGetBoxRect(page: *mut std::ffi::c_void, rect_box: i32) -> CgRect;
+    fn CGPDFPageGetRotationAngle(page: *mut std::ffi::c_void) -> i32;
+    fn CGColorSpaceCreateDeviceRGB() -> *mut std::ffi::c_void;
+    fn CGColorSpaceRelease(cs: *mut std::ffi::c_void);
+    fn CGBitmapContextCreate(
+        data: *mut std::ffi::c_void,
+        width: usize,
+        height: usize,
+        bits_per_component: usize,
+        bytes_per_row: usize,
+        space: *mut std::ffi::c_void,
+        bitmap_info: u32,
+    ) -> *mut std::ffi::c_void;
+    fn CGContextRelease(ctx: *mut std::ffi::c_void);
+    fn CGContextSetRGBFillColor(ctx: *mut std::ffi::c_void, r: f64, g: f64, b: f64, a: f64);
+    fn CGContextFillRect(ctx: *mut std::ffi::c_void, rect: CgRect);
+    fn CGContextScaleCTM(ctx: *mut std::ffi::c_void, sx: f64, sy: f64);
+    fn CGContextTranslateCTM(ctx: *mut std::ffi::c_void, tx: f64, ty: f64);
+    fn CGContextRotateCTM(ctx: *mut std::ffi::c_void, angle: f64);
+    fn CGContextDrawPDFPage(ctx: *mut std::ffi::c_void, page: *mut std::ffi::c_void);
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CgRect {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+}
+
+/// Open a PDF with Core Graphics (memory-mapped; cheap). Null on failure.
+fn cg_pdf_open(path: &Path) -> *mut std::ffi::c_void {
+    let Some(s) = path.to_str() else { return std::ptr::null_mut() };
+    let url = NSURL::fileURLWithPath(&NSString::from_str(s));
+    // NSURL is toll-free bridged to CFURLRef.
+    unsafe { CGPDFDocumentCreateWithURL(&*url as *const NSURL as *const std::ffi::c_void) }
+}
+
+/// A page's visible size in points, honoring its rotation.
+fn cg_page_size(page: *mut std::ffi::c_void) -> (f64, f64) {
+    const CROP_BOX: i32 = 1;
+    let r = unsafe { CGPDFPageGetBoxRect(page, CROP_BOX) };
+    let rot = unsafe { CGPDFPageGetRotationAngle(page) }.rem_euclid(360);
+    if rot == 90 || rot == 270 { (r.h, r.w) } else { (r.w, r.h) }
+}
+
+fn pdf_meta(path: &Path) -> Option<PdfMeta> {
+    let doc = cg_pdf_open(path);
+    if doc.is_null() {
+        return None;
+    }
+    let out = unsafe {
+        let count = CGPDFDocumentGetNumberOfPages(doc);
+        let page = CGPDFDocumentGetPage(doc, 1);
+        let meta = (!page.is_null() && count > 0).then(|| {
+            let (w, h) = cg_page_size(page);
+            PdfMeta { count, w: w.max(1.0), h: h.max(1.0) }
+        });
+        CGPDFDocumentRelease(doc);
+        meta
+    };
+    out
+}
+
+/// Render page `page` (0-based) `px_w` pixels wide on white, straight into
+/// BGRA — no AppKit, no TIFF round-trip, safe on a worker thread.
+fn render_pdf_page_cg(path: &Path, page: usize, px_w: u32) -> Option<Arc<RenderImage>> {
+    const CROP_BOX: i32 = 1;
+    const BGRA: u32 = 2 | (2 << 12); // premultiplied-first, 32-bit little-endian
+    let doc = cg_pdf_open(path);
+    if doc.is_null() {
+        return None;
+    }
+    let result = unsafe {
+        let pg = CGPDFDocumentGetPage(doc, page + 1);
+        if pg.is_null() {
+            CGPDFDocumentRelease(doc);
+            return None;
+        }
+        let (pw, ph) = cg_page_size(pg);
+        let scale = f64::from(px_w) / pw.max(1.0);
+        let (w, h) = (px_w as usize, ((ph * scale).round() as usize).clamp(1, 12_000));
+        let mut buf = vec![0u8; w * h * 4];
+        let cs = CGColorSpaceCreateDeviceRGB();
+        let ctx = CGBitmapContextCreate(buf.as_mut_ptr().cast(), w, h, 8, w * 4, cs, BGRA);
+        CGColorSpaceRelease(cs);
+        if ctx.is_null() {
+            CGPDFDocumentRelease(doc);
+            return None;
+        }
+        CGContextSetRGBFillColor(ctx, 1.0, 1.0, 1.0, 1.0);
+        CGContextFillRect(ctx, CgRect { x: 0.0, y: 0.0, w: w as f64, h: h as f64 });
+        CGContextScaleCTM(ctx, scale, scale);
+        // Map the page's crop box (with rotation) onto the bitmap.
+        let r = CGPDFPageGetBoxRect(pg, CROP_BOX);
+        let rot = CGPDFPageGetRotationAngle(pg).rem_euclid(360);
+        match rot {
+            90 => {
+                CGContextTranslateCTM(ctx, 0.0, ph);
+                CGContextRotateCTM(ctx, -std::f64::consts::FRAC_PI_2);
+            }
+            180 => {
+                CGContextTranslateCTM(ctx, pw, ph);
+                CGContextRotateCTM(ctx, std::f64::consts::PI);
+            }
+            270 => {
+                CGContextTranslateCTM(ctx, pw, 0.0);
+                CGContextRotateCTM(ctx, std::f64::consts::FRAC_PI_2);
+            }
+            _ => {}
+        }
+        CGContextTranslateCTM(ctx, -r.x, -r.y);
+        CGContextDrawPDFPage(ctx, pg);
+        CGContextRelease(ctx);
+        CGPDFDocumentRelease(doc);
+        image::RgbaImage::from_raw(w as u32, h as u32, buf)
+    };
+    result.map(|b| Arc::new(RenderImage::new(vec![image::Frame::new(b)])))
+}
+
+/// Pixel widths pages are rendered at; the view picks the smallest that's
+/// sharp for its zoom (×2 for Retina), so zooming re-renders only when needed.
+const PDF_WIDTHS: [u32; 5] = [700, 1000, 1400, 2000, 2800];
+
+fn pdf_width_bucket(display_w: f32) -> u32 {
+    let need = (display_w * 2.0) as u32;
+    PDF_WIDTHS.iter().copied().find(|w| *w >= need).unwrap_or(PDF_WIDTHS[PDF_WIDTHS.len() - 1])
+}
+
+thread_local! {
+    static PDF_META: RefCell<HashMap<PathBuf, (Option<SystemTime>, Option<PdfMeta>)>> = RefCell::new(HashMap::new());
+    /// Rendered pages, most recent last: ((path, page, width), image).
+    static PDF_PAGES: RefCell<Vec<((PathBuf, usize, u32), Arc<RenderImage>)>> = const { RefCell::new(Vec::new()) };
+    /// Pages being rendered right now (so each is requested once).
+    static PDF_INFLIGHT: RefCell<HashSet<(PathBuf, usize, u32)>> = RefCell::new(HashSet::new());
+}
+
+/// Rendered pages stay under this many bytes in total.
+const PDF_CACHE_BYTES: usize = 220 * 1024 * 1024;
+
+fn cached_pdf_meta(path: &Path) -> Option<Option<PdfMeta>> {
+    let mtime = fs::metadata(path).ok().and_then(|m| m.modified().ok());
+    PDF_META.with(|m| m.borrow().get(path).filter(|(t, _)| *t == mtime).map(|(_, v)| *v))
+}
+
+/// A rendered page at `width`, or the nearest other width already rendered
+/// (shown while the sharp one renders, so zooming never flashes blank).
+fn cached_pdf_page(path: &Path, page: usize, width: u32) -> (Option<Arc<RenderImage>>, bool) {
+    PDF_PAGES.with(|c| {
+        let mut c = c.borrow_mut();
+        if let Some(ix) = c.iter().position(|((p, n, w), _)| p == path && *n == page && *w == width) {
+            let hit = c.remove(ix);
+            let img = hit.1.clone();
+            c.push(hit);
+            return (Some(img), true);
+        }
+        let near = c
+            .iter()
+            .filter(|((p, n, _), _)| p == path && *n == page)
+            .min_by_key(|((_, _, w), _)| (i64::from(*w) - i64::from(width)).abs())
+            .map(|(_, img)| img.clone());
+        (near, false)
+    })
+}
+
+fn cache_pdf_page(key: (PathBuf, usize, u32), img: Arc<RenderImage>) {
+    PDF_PAGES.with(|c| {
+        let mut c = c.borrow_mut();
+        c.retain(|(k, _)| *k != key);
+        c.push((key, img));
+        let cost = |img: &Arc<RenderImage>| {
+            let s = img.size(0);
+            (s.width.0.max(0) as usize) * (s.height.0.max(0) as usize) * 4
+        };
+        while c.len() > 1 && c.iter().map(|(_, i)| cost(i)).sum::<usize>() > PDF_CACHE_BYTES {
+            c.remove(0);
+        }
+    });
+}
+
+thread_local! {
+    /// Width of the PDF view as last painted (pages lay out to fit it).
+    static PDF_VIEW_W: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+}
+
+/// A rendered page filling its box.
+fn img_el(handle: Arc<RenderImage>) -> AnyElement {
+    img(ImageSource::Render(handle)).size_full().into_any_element()
+}
+
 /// Whether the active theme is dark (picks the code-highlighting palette).
 fn theme_is_dark() -> bool {
     let bg = theme().bg;
@@ -24786,6 +25169,37 @@ mod tests {
         let s = img.size(0);
         assert!(s.width.0 > 0 && s.height.0 > 0);
         let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn pdf_meta_and_cg_render() {
+        let d = scratch("pdf");
+        let txt = d.join("doc.txt");
+        let body: String = (0..400).map(|i| format!("line {i}\n")).collect();
+        fs::write(&txt, body).unwrap();
+        let out = Command::new("/usr/sbin/cupsfilter").arg(&txt).output().unwrap();
+        let pdf = d.join("doc.pdf");
+        fs::write(&pdf, out.stdout).unwrap();
+        let meta = pdf_meta(&pdf).expect("meta");
+        assert!(meta.count >= 2, "multi-page: {}", meta.count);
+        assert!(meta.h > meta.w, "portrait page");
+        let img = render_pdf_page_cg(&pdf, 1, 700).expect("render page 2");
+        let s = img.size(0);
+        assert_eq!(s.width.0, 700);
+        assert!((s.height.0 as f64 - 700.0 * meta.h / meta.w).abs() <= 1.0);
+        assert!(render_pdf_page_cg(&pdf, meta.count + 5, 700).is_none());
+        assert_eq!(pdf_width_bucket(300.0), 700);
+        assert_eq!(pdf_width_bucket(600.0), 1400);
+        assert_eq!(pdf_width_bucket(5000.0), 2800);
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn pretty_keystroke_handles_minus() {
+        assert_eq!(pretty_keystroke("cmd--"), "⌘-");
+        assert_eq!(pretty_keystroke("cmd-shift-z"), "⌘⇧Z");
+        assert_eq!(pretty_keystroke("-"), "-");
+        assert_eq!(pretty_keystroke("f1"), "F1");
     }
 
     #[test]
