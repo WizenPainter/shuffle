@@ -20,6 +20,12 @@ objc2-foundation = { version = "0.3", features = ["NSString", "NSData", "NSFileM
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPDFImageRep", "NSGraphics", "NSGraphicsContext", "NSResponder", "NSView", "NSEvent", "NSApplication", "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSSharingService"] }
 # Reach the underlying NSView so we can start native OS drag sessions (drag files out to Finder/other apps).
 raw-window-handle = "0.6"
+# Live folder watching (FSEvents backend on macOS).
+notify = "8"
+# Channel the watcher thread uses to hand change batches to the UI's async task.
+futures = "0.3"
+# statfs(2), to tell network mounts (polled) from local disks (FSEvents).
+libc = "0.2"
 
 # Ships as a universal binary (arm64 + x86_64) via release.sh so it runs on
 # both Apple Silicon and Intel Macs. Build with a thin release profile while

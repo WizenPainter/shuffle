@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local};
@@ -3573,6 +3573,18 @@ struct Tab {
     /// Generation of the latest load, so a stale background metadata fill is
     /// discarded if the user navigated away.
     load_gen: u64,
+    /// The folder `entries` currently lists (`None` until a listing lands).
+    /// Re-listing that same folder keeps the old rows up until the new ones
+    /// arrive; a different folder starts from an empty list.
+    listed: Option<PathBuf>,
+    /// A load is in flight (from `reload_pane` until its stat pass lands).
+    loading: bool,
+    /// The watcher saw more changes while `loading`: reload once it finishes
+    /// (rather than restarting, which a constantly-written folder would starve).
+    reload_queued: bool,
+    /// An item to scroll into view once the listing that contains it arrives
+    /// (revealing a just-created file before its folder has re-listed).
+    pending_reveal: Option<PathBuf>,
     /// Last time this tab's list scrolled; drives the scrollbar's fade-out.
     last_scroll: Instant,
     /// Bumped per scroll so the fade-out animation restarts from opaque.
@@ -3590,11 +3602,10 @@ struct Tab {
 
 impl Tab {
     fn new(dir: PathBuf) -> Self {
-        // Fast first paint; full metadata is filled in from the background.
-        let entries = read_entries_fast(&dir);
+        // Starts empty: the listing is read off the UI thread by `reload_pane`.
         Tab {
             current_dir: dir.clone(),
-            entries,
+            entries: Vec::new(),
             history: vec![dir.clone()],
             hist_pos: 0,
             deepest: Some(dir),
@@ -3618,6 +3629,10 @@ impl Tab {
             col_chain: Vec::new(),
             col_active: 0,
             load_gen: 0,
+            listed: None,
+            loading: false,
+            reload_queued: false,
+            pending_reveal: None,
             last_scroll: Instant::now(),
             scroll_epoch: 0,
             dir_sig: None,
@@ -3766,6 +3781,11 @@ struct Shuffle {
     confirm_delete: Option<(usize, Vec<PathBuf>)>,
     /// Monotonic counter tagging each directory load (for stale-result guards).
     next_load_gen: u64,
+    /// Live FSEvents watching of the shown folders (`None` if it couldn't start;
+    /// the 1 s poller then covers everything).
+    watcher: Option<FolderWatcher>,
+    /// The folder set last handed to `watcher`.
+    watch_dirs: Vec<PathBuf>,
     /// In-progress marquee (box) selection: (pane, start, current) window coords.
     marquee: Option<(usize, (f32, f32), (f32, f32))>,
     /// A left-press on a draggable row: (pane, path, press position). Promoted to
@@ -3924,12 +3944,29 @@ impl Shuffle {
         })
         .detach();
         // Watch the visible folders for outside changes (a finishing download,
-        // files created/deleted by other apps): poll each pane's directory —
-        // and in Column view every open column — once a second, off-thread so
-        // a slow network mount can't stall a frame, and reload whatever
-        // changed. The reload re-applies the tab's sort and any active filter,
-        // so new files land in the right spot immediately. Background tabs are
-        // caught the moment they're shown (their stored signature is stale).
+        // a file growing in place, files created/deleted by other apps) via
+        // FSEvents: the watcher thread sends coalesced batches, drained here on
+        // the main thread, and each affected pane/column is re-listed. The
+        // reload re-applies the tab's sort and any active filter, so new files
+        // land in the right spot immediately.
+        let (fs_tx, mut fs_rx) = futures::channel::mpsc::unbounded::<FsBatch>();
+        let watcher = FolderWatcher::spawn(fs_tx);
+        let covered = watcher.as_ref().map(|w| w.covered.clone());
+        cx.spawn(async move |this, cx| {
+            use futures::StreamExt;
+            while let Some(batch) = fs_rx.next().await {
+                if this.update(cx, |this, cx| this.apply_fs_batch(batch, cx)).is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+        // Fallback for what FSEvents can't see — network mounts, cloud folders
+        // (providers add files without events), anything that failed to watch:
+        // poll each such pane directory — and in Column view every open column
+        // — once a second, off-thread so a slow network mount can't stall a
+        // frame, and reload whatever changed. Background tabs are re-listed the
+        // moment they're shown.
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
@@ -3954,15 +3991,15 @@ impl Shuffle {
                     Err(_) => break,
                 };
                 let sampled = dirs.clone();
+                let covered = covered.clone();
                 let sigs = cx
                     .background_spawn(async move {
+                        // Folders FSEvents covers report `None` (no change).
+                        let cov = covered.as_ref().map(|c| c.lock().unwrap().clone()).unwrap_or_default();
+                        let sig = |d: &PathBuf| if cov.contains(d) { None } else { dir_sig(d) };
                         sampled
                             .iter()
-                            .map(|d| {
-                                d.as_ref().map(|(root, chain)| {
-                                    (dir_sig(root), chain.iter().map(|c| dir_sig(c)).collect::<Vec<_>>())
-                                })
-                            })
+                            .map(|d| d.as_ref().map(|(root, chain)| (sig(root), chain.iter().map(sig).collect::<Vec<_>>())))
                             .collect::<Vec<_>>()
                     })
                     .await;
@@ -3971,8 +4008,9 @@ impl Shuffle {
                         let (Some((dir, chain)), Some((root_sig, chain_sigs))) = (d, sig) else {
                             continue;
                         };
-                        // Skip if the pane went away or navigated meanwhile.
-                        if pane >= this.panes.len() || this.tab(pane).current_dir != dir {
+                        // Skip if the pane went away or navigated meanwhile, or
+                        // is mid-load (its signature is re-stamped on landing).
+                        if pane >= this.panes.len() || this.tab(pane).current_dir != dir || this.tab(pane).loading {
                             continue;
                         }
                         match (this.tab(pane).dir_sig, root_sig) {
@@ -4110,6 +4148,8 @@ impl Shuffle {
             sort_menu: None,
             confirm_delete: None,
             next_load_gen: 0,
+            watcher,
+            watch_dirs: Vec::new(),
             marquee: None,
             drag_candidate: None,
             server_dialog: None,
@@ -4306,8 +4346,12 @@ impl Shuffle {
         self.reload_pane(pane, cx);
     }
 
-    /// Load (or reload) a pane's directory: a near-instant cheap pass for first
-    /// paint, then a background pass that fills in sizes/dates without blocking.
+    /// Load (or reload) a pane's directory without blocking the UI thread on
+    /// disk I/O: a cheap pass (names + folder bit) for first paint, then a
+    /// parallel stat pass that fills in sizes/dates. Both run on the background
+    /// executor; a newer load (`load_gen`) makes older results drop on the floor.
+    /// Re-listing the folder already shown keeps its rows up until the new ones
+    /// land, so a refresh never flickers.
     fn reload_pane(&mut self, pane: usize, cx: &mut Context<Self>) {
         // Remote (SFTP) tabs load over the network on a background thread.
         if self.tab(pane).remote.is_some() {
@@ -4316,40 +4360,230 @@ impl Shuffle {
         }
         let dir = self.tab(pane).current_dir.clone();
         ensure_dynamic_sidebar_icons(); // pick up newly-mounted volumes/cloud
-        // Stamp the mtime *before* reading so a change racing the read bumps
-        // it again and the watcher catches it on the next tick.
-        self.tab_mut(pane).dir_sig = dir_sig(&dir);
-        self.tab_mut(pane).entries = read_entries_fast(&dir);
         self.next_load_gen += 1;
         let gen = self.next_load_gen;
-        self.tab_mut(pane).load_gen = gen;
-        self.sort_tab(pane);
-        if self.tab(pane).find_query.is_some() {
-            self.recompute_find(pane);
+        let same_dir = self.tab(pane).listed.as_deref() == Some(dir.as_path());
+        {
+            let tab = self.tab_mut(pane);
+            tab.load_gen = gen;
+            tab.loading = true;
+            tab.reload_queued = false;
         }
-        cx.notify();
-        self.prewarm_icons(cx);
 
-        // Fill full metadata in the background, then swap it in if still current.
+        let slot: Arc<(Mutex<Option<Listing>>, Condvar)> = Arc::default();
+        let fast = {
+            let (slot, d) = (slot.clone(), dir.clone());
+            cx.background_spawn(async move {
+                // Stamp the signature *before* reading so a change racing the
+                // read bumps it again and the poller catches it next tick.
+                let sig = dir_sig(&d);
+                let entries = read_entries_fast(&d);
+                *slot.0.lock().unwrap() = Some((sig, entries));
+                slot.1.notify_all();
+            })
+        };
+        if !same_dir {
+            // A different folder: give the cheap pass a moment so local folders
+            // paint in this same frame instead of flashing empty. A slow mount
+            // just misses the budget and shows an empty list until it lands.
+            let ready = {
+                let guard = slot.0.lock().unwrap();
+                let (mut guard, _) = slot.1.wait_timeout_while(guard, FAST_LOAD_BUDGET, |v| v.is_none()).unwrap();
+                guard.take()
+            };
+            match ready {
+                Some((sig, entries)) => self.finish_fast_load(pane, sig, entries, cx),
+                None => {
+                    let tab = self.tab_mut(pane);
+                    tab.entries.clear();
+                    tab.find_results.clear();
+                    tab.listed = None;
+                    cx.notify();
+                }
+            }
+        }
+
         cx.spawn(async move |this, cx| {
+            fast.await;
+            let pending = slot.0.lock().unwrap().take(); // None = applied above
+            let current = this
+                .update(cx, |this, cx| {
+                    if !this.load_is_current(pane, gen, &dir) {
+                        return false;
+                    }
+                    if let Some((sig, entries)) = pending {
+                        this.finish_fast_load(pane, sig, entries, cx);
+                    }
+                    true
+                })
+                .unwrap_or(false);
+            if !current {
+                return;
+            }
+            // Fill full metadata in the background, then swap it in if still current.
             let d = dir.clone();
             let full = cx.background_spawn(async move { read_entries(&d) }).await;
             let _ = this.update(cx, |this, cx| {
-                if pane < this.panes.len()
-                    && this.tab(pane).load_gen == gen
-                    && this.tab(pane).current_dir == dir
-                {
-                    this.tab_mut(pane).entries = full;
-                    this.sort_tab(pane);
-                    if this.tab(pane).find_query.is_some() {
-                        this.recompute_find(pane);
-                    }
-                    cx.notify();
-                    this.prewarm_icons(cx);
+                if !this.load_is_current(pane, gen, &dir) {
+                    return;
+                }
+                this.apply_listing(pane, full, true, cx);
+                this.tab_mut(pane).loading = false;
+                if std::mem::take(&mut this.tab_mut(pane).reload_queued) {
+                    this.reload_pane(pane, cx);
                 }
             });
         })
         .detach();
+    }
+
+    /// Whether load `gen` of `dir` is still the one `pane` is waiting for.
+    fn load_is_current(&self, pane: usize, gen: u64, dir: &Path) -> bool {
+        pane < self.panes.len() && self.tab(pane).load_gen == gen && self.tab(pane).current_dir == dir
+    }
+
+    /// Swap in a load's cheap (no-stat) listing along with the folder
+    /// signature that was taken just before it.
+    fn finish_fast_load(&mut self, pane: usize, sig: Option<DirSig>, entries: Vec<Entry>, cx: &mut Context<Self>) {
+        self.tab_mut(pane).dir_sig = sig;
+        self.apply_listing(pane, entries, false, cx);
+    }
+
+    /// Install a fresh listing of the pane's current folder: re-apply the sort
+    /// and filter, keep the selection pointed at things that still exist, and
+    /// finish any pending reveal. `full` = the stat pass (sizes/dates known).
+    fn apply_listing(&mut self, pane: usize, mut entries: Vec<Entry>, full: bool, cx: &mut Context<Self>) {
+        let dir = self.tab(pane).current_dir.clone();
+        let same_dir = self.tab(pane).listed.as_deref() == Some(dir.as_path());
+        // Previous display order, for the selection fallback.
+        let old: Vec<String> = if same_dir {
+            self.tab(pane).entries.iter().map(|e| e.name.clone()).collect()
+        } else {
+            Vec::new()
+        };
+        if same_dir && !full {
+            // Re-listing the folder we're showing: carry over the sizes/dates
+            // we already know, so rows don't blank to "--" (or jump around in
+            // a size/date sort) until the stat pass lands.
+            let known: HashMap<&str, &Entry> =
+                self.tab(pane).entries.iter().filter(|e| e.loaded).map(|e| (e.name.as_str(), e)).collect();
+            for e in &mut entries {
+                if let Some(k) = known.get(e.name.as_str()).filter(|k| k.is_dir == e.is_dir) {
+                    e.size = k.size;
+                    e.modified = k.modified;
+                    e.created = k.created;
+                    e.loaded = true;
+                }
+            }
+        }
+        if full {
+            validate_listing_caches(&dir, &entries);
+        }
+        {
+            let tab = self.tab_mut(pane);
+            tab.entries = entries;
+            tab.listed = Some(dir.clone());
+        }
+        self.sort_tab(pane);
+        if self.tab(pane).find_query.is_some() {
+            self.recompute_find(pane);
+        }
+        if same_dir {
+            self.reselect_after_reload(pane, &old, cx);
+        }
+        if let Some(p) = self.tab_mut(pane).pending_reveal.take() {
+            self.scroll_to_path(pane, &p, cx);
+        }
+        cx.notify();
+        self.prewarm_icons(cx);
+    }
+
+    /// After a re-listing of the same folder: drop selected items that are
+    /// gone, and if the anchor vanished move it to the nearest surviving row
+    /// above it (see [`fallback_anchor`]). Only this folder's items are
+    /// touched — a Column-view selection can live in a deeper folder.
+    fn reselect_after_reload(&mut self, pane: usize, old: &[String], cx: &mut Context<Self>) {
+        let dir = self.tab(pane).current_dir.clone();
+        let tab = self.tab_mut(pane);
+        if tab.selection.is_empty() && tab.anchor.is_none() {
+            return;
+        }
+        let present: HashSet<&str> = tab.entries.iter().map(|e| e.name.as_str()).collect();
+        let here = |p: &Path| p.parent() == Some(dir.as_path());
+        let name_of = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        tab.selection.retain(|p| !here(p) || present.contains(name_of(p).as_str()));
+        let fate = match &tab.anchor {
+            Some(a) if here(a) => fallback_anchor(old, &name_of(a), |n| present.contains(n)),
+            _ => AnchorFallback::Keep,
+        };
+        match fate {
+            AnchorFallback::Keep => {}
+            AnchorFallback::Clear => tab.anchor = None,
+            AnchorFallback::Move(i) => {
+                let p = dir.join(&old[i]);
+                if tab.selection.is_empty() {
+                    tab.selection.insert(p.clone());
+                }
+                self.focus_entry(pane, p, cx);
+            }
+        }
+    }
+
+    /// Point the folder watcher at what's on screen: each pane's active local
+    /// folder, plus every open column in Column view. Cheap when nothing
+    /// changed (called every frame); hidden tabs aren't watched — they're
+    /// re-listed when shown.
+    fn sync_watches(&mut self) {
+        let Some(w) = &self.watcher else { return };
+        let mut dirs: Vec<PathBuf> = Vec::new();
+        for p in &self.panes {
+            let t = p.active_tab();
+            if t.remote.is_some() {
+                continue;
+            }
+            dirs.push(t.current_dir.clone());
+            if t.view == ViewMode::Columns {
+                dirs.extend(t.col_chain.iter().cloned());
+            }
+        }
+        if dirs != self.watch_dirs {
+            w.set(dirs.clone());
+            self.watch_dirs = dirs;
+        }
+    }
+
+    /// React to a coalesced batch of filesystem changes: drop caches for the
+    /// changed paths and re-list each pane / column showing an affected folder.
+    fn apply_fs_batch(&mut self, batch: FsBatch, cx: &mut Context<Self>) {
+        for p in &batch.paths {
+            invalidate_path_caches(p);
+        }
+        let mut columns_changed = false;
+        for pane in 0..self.panes.len() {
+            let tab = self.tab(pane);
+            if tab.remote.is_some() {
+                continue;
+            }
+            if batch.dirs.contains(&tab.current_dir) {
+                forget_column_listing(&tab.current_dir.clone());
+                if self.tab(pane).loading {
+                    // Let the in-flight load finish, then go again.
+                    self.tab_mut(pane).reload_queued = true;
+                } else {
+                    self.reload_pane(pane, cx);
+                }
+            }
+            let tab = self.tab(pane);
+            if tab.view == ViewMode::Columns {
+                for c in tab.col_chain.iter().filter(|c| batch.dirs.contains(*c)) {
+                    forget_column_listing(c);
+                    columns_changed = true;
+                }
+            }
+        }
+        if columns_changed {
+            cx.notify();
+        }
     }
 
     /// Load a remote SFTP directory listing on a background thread, then swap
@@ -4383,6 +4617,7 @@ impl Shuffle {
                 match result {
                     Ok(entries) => {
                         this.tab_mut(pane).entries = entries;
+                        this.tab_mut(pane).listed = Some(dir.clone());
                         this.remote_error = None;
                         this.sort_tab(pane);
                         if this.tab(pane).find_query.is_some() {
@@ -4580,8 +4815,19 @@ impl Shuffle {
     /// Scroll an item into view in `pane`, select it, and make it the focused
     /// entry (inspector target / rename target).
     fn reveal_in_pane(&mut self, pane: usize, path: PathBuf, cx: &mut Context<Self>) {
+        if !self.scroll_to_path(pane, &path, cx) {
+            // Not listed yet (the folder is still re-reading): scroll once it is.
+            self.tab_mut(pane).pending_reveal = Some(path.clone());
+        }
+        self.tab_mut(pane).selection = std::iter::once(path.clone()).collect();
+        self.focus_entry(pane, path, cx);
+    }
+
+    /// Scroll `path` to the middle of the pane's list. `false` if it isn't in
+    /// the current listing.
+    fn scroll_to_path(&mut self, pane: usize, path: &Path, cx: &mut Context<Self>) -> bool {
         let paths = self.display_paths(pane);
-        if let Some(ix) = paths.iter().position(|p| p == &path) {
+        if let Some(ix) = paths.iter().position(|p| p == path) {
             let (view, off) = {
                 let tab = self.tab(pane);
                 let off = usize::from(
@@ -4597,9 +4843,9 @@ impl Shuffle {
             };
             self.tab(pane).scroll_handle.scroll_to_item(item, ScrollStrategy::Center);
             self.mark_scrolled(pane, cx);
+            return true;
         }
-        self.tab_mut(pane).selection = std::iter::once(path.clone()).collect();
-        self.focus_entry(pane, path, cx);
+        false
     }
 
     /// Scroll a freshly-created item into view, select it, and open the name
@@ -6083,13 +6329,16 @@ impl Shuffle {
         }
         cx.spawn(async move |this, cx| {
             let d = dir.clone();
-            let size = cx.background_spawn(async move { dir_total_size(&d) }).await;
+            let (mtime, size) = cx
+                .background_spawn(async move {
+                    // mtime first: a change racing the walk leaves a newer one
+                    // on disk, so the next listing invalidates this total.
+                    let mtime = fs::metadata(&d).and_then(|m| m.modified()).ok();
+                    (mtime, dir_total_size(&d))
+                })
+                .await;
             let _ = this.update(cx, |_, cx| {
-                FOLDER_SIZE
-                    .get_or_init(|| Mutex::new(HashMap::new()))
-                    .lock()
-                    .unwrap()
-                    .insert(dir.clone(), size);
+                folder_size_store(dir.clone(), mtime, size);
                 FOLDER_SIZE_PENDING
                     .get_or_init(|| Mutex::new(HashSet::new()))
                     .lock()
@@ -9576,6 +9825,7 @@ impl Shuffle {
             tab.content_for = None;
             tab.selection.clear();
             tab.anchor = None;
+            tab.pending_reveal = None;
             tab.col_chain.clear();
             tab.col_active = 0;
         }
@@ -10330,8 +10580,9 @@ impl Shuffle {
         }
         cx.notify();
         self.prewarm_icons(cx);
-        // If this tab only got the fast pass, finish loading its metadata.
-        if self.tab(pane).entries.iter().any(|e| !e.loaded) {
+        // Re-list it: a hidden tab isn't watched, so its folder may have
+        // changed (or it never finished loading). Its rows stay up meanwhile.
+        if self.tab(pane).remote.is_none() || self.tab(pane).listed.is_none() {
             self.reload_pane(pane, cx);
         }
     }
@@ -10591,7 +10842,7 @@ impl Shuffle {
                 None => return,
             }
         };
-        let paths: Vec<PathBuf> = column_entries(&dir)
+        let paths: Vec<PathBuf> = column_entries(&dir, cx)
             .iter()
             .map(|e| dir.join(&e.name))
             .collect();
@@ -11183,7 +11434,7 @@ impl Shuffle {
 
         // Up / down within column k.
         let dir = dirs[k].clone();
-        let entries = column_entries(&dir);
+        let entries = column_entries(&dir, cx);
         if entries.is_empty() {
             return;
         }
@@ -11203,7 +11454,7 @@ impl Shuffle {
     /// Select entry `idx` in column `k` of the Column view (keyboard-driven).
     fn column_set(&mut self, pane: usize, k: usize, dirs: &[PathBuf], idx: usize, cx: &mut Context<Self>) {
         let dir = dirs[k].clone();
-        let entries = column_entries(&dir);
+        let entries = column_entries(&dir, cx);
         let Some(e) = entries.get(idx) else { return };
         let target = dir.join(&e.name);
         let is_dir = e.is_dir;
@@ -11229,11 +11480,9 @@ impl Shuffle {
         }
         cx.spawn(async move |this, cx| {
             let p = path.clone();
-            let info = cx.background_spawn(async move { gather_info(&p) }).await;
+            let (info, fp) = cx.background_spawn(async move { (gather_info(&p), fingerprint(&p)) }).await;
             let _ = this.update(cx, |_, cx| {
-                INFO_CACHE.with(|c| {
-                    c.borrow_mut().insert(path, info);
-                });
+                info_cache_insert(path, info, fp);
                 cx.notify();
             });
         })
@@ -13939,7 +14188,7 @@ impl Shuffle {
 
         let mut cols: Vec<AnyElement> = Vec::new();
         for (i, dir) in dirs.iter().enumerate() {
-            let entries = column_entries(dir);
+            let entries = column_entries(dir, cx);
             let next_dir = dirs.get(i + 1).cloned();
             let mut rows: Vec<AnyElement> = Vec::new();
             for e in &entries {
@@ -14286,6 +14535,8 @@ impl Render for Shuffle {
         let t = theme();
         // Kick off any pending waterfall folder reads before rendering the tree.
         self.ensure_waterfall_loaded(cx);
+        // Keep the folder watcher on whatever is now on screen.
+        self.sync_watches();
         // Main row: sidebar | content (canvas) | optional inspector.
         let mut main_row = div()
             .flex()
@@ -15300,9 +15551,21 @@ fn cached_dataless(path: &Path) -> bool {
         }
     }
     let v = is_dataless(path);
-    map.lock().unwrap().insert(path.to_path_buf(), (v, Instant::now()));
+    let mut m = map.lock().unwrap();
+    // Bounded: past the cap, drop expired entries (and if that's not enough,
+    // everything — it's only a 3 s TTL cache).
+    if m.len() >= DATALESS_STAT_CAP {
+        m.retain(|_, (_, at)| at.elapsed() <= TTL);
+        if m.len() >= DATALESS_STAT_CAP {
+            m.clear();
+        }
+    }
+    m.insert(path.to_path_buf(), (v, Instant::now()));
     v
 }
+
+/// Most paths `DATALESS_STAT` holds.
+const DATALESS_STAT_CAP: usize = 20_000;
 
 /// Files to act on for a cloud download/evict: `path` itself when it's a file,
 /// or the matching descendants when it's a folder. `want_dataless` selects
@@ -16534,23 +16797,191 @@ fn read_subdirs(dir: &Path) -> (Vec<PathBuf>, Option<SystemTime>) {
     (out, mtime)
 }
 
+/// A size-capped map with least-recently-used eviction. Once over `cap` it
+/// drops the oldest quarter in one go, so eviction stays amortized O(1).
+struct Lru<K, V> {
+    map: HashMap<K, (V, u64)>,
+    tick: u64,
+    cap: usize,
+}
+
+impl<K: std::hash::Hash + Eq, V> Lru<K, V> {
+    fn new(cap: usize) -> Self {
+        Lru { map: HashMap::new(), tick: 0, cap: cap.max(4) }
+    }
+
+    fn get<Q>(&mut self, k: &Q) -> Option<&V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.tick += 1;
+        let tick = self.tick;
+        self.map.get_mut(k).map(|(v, t)| {
+            *t = tick;
+            &*v
+        })
+    }
+
+    fn insert(&mut self, k: K, v: V) {
+        self.tick += 1;
+        self.map.insert(k, (v, self.tick));
+        if self.map.len() > self.cap {
+            let mut ticks: Vec<u64> = self.map.values().map(|(_, t)| *t).collect();
+            let cut = self.map.len() / 4;
+            let (_, &mut nth, _) = ticks.select_nth_unstable(cut);
+            self.map.retain(|_, (_, t)| *t > nth);
+        }
+    }
+
+    fn remove<Q>(&mut self, k: &Q) -> Option<V>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: std::hash::Hash + Eq + ?Sized,
+    {
+        self.map.remove(k).map(|(v, _)| v)
+    }
+
+    fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+/// A file's identity for cache validation: size + mtime from one `stat`
+/// (following symlinks, like the listing). Anything cached against a stale
+/// fingerprint is dropped.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Fingerprint {
+    size: u64,
+    mtime: Option<SystemTime>,
+}
+
+fn fingerprint(path: &Path) -> Option<Fingerprint> {
+    let m = fs::metadata(path).ok()?;
+    Some(Fingerprint { size: m.len(), mtime: m.modified().ok() })
+}
+
+impl Entry {
+    fn fingerprint(&self) -> Fingerprint {
+        Fingerprint { size: self.size, mtime: self.modified }
+    }
+}
+
 /// Recursively-summed folder sizes for List view, computed off-thread and
 /// cached (a folder can hold millions of files; we never walk on the render
 /// thread). `u64::MAX` is a sentinel: the folder blew past the entry cap, so we
-/// show "--" rather than a wrong number.
-static FOLDER_SIZE: OnceLock<Mutex<HashMap<PathBuf, u64>>> = OnceLock::new();
+/// show "--" rather than a wrong number. Each total is stored with the folder's
+/// mtime at the time of the walk: a re-listing that shows a newer mtime (a
+/// child added/removed) or a watcher event inside it drops the total.
+static FOLDER_SIZE: OnceLock<Mutex<Lru<PathBuf, (Option<SystemTime>, u64)>>> = OnceLock::new();
 static FOLDER_SIZE_PENDING: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
 /// Stop summing a folder past this many entries (bounds cost on huge trees like
 /// `/` or a home with node_modules); such folders show "--".
 const FOLDER_SIZE_CAP: usize = 400_000;
+/// How many folder totals are kept.
+const FOLDER_SIZE_CACHE_CAP: usize = 4096;
+
+fn folder_sizes() -> std::sync::MutexGuard<'static, Lru<PathBuf, (Option<SystemTime>, u64)>> {
+    FOLDER_SIZE.get_or_init(|| Mutex::new(Lru::new(FOLDER_SIZE_CACHE_CAP))).lock().unwrap()
+}
 
 fn folder_size_lookup(path: &Path) -> Option<u64> {
-    FOLDER_SIZE
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap()
-        .get(path)
-        .copied()
+    folder_sizes().get(path).map(|(_, size)| *size)
+}
+
+fn folder_size_store(dir: PathBuf, mtime: Option<SystemTime>, size: u64) {
+    folder_sizes().insert(dir, (mtime, size));
+}
+
+/// Something changed at `path`: every cached folder total that includes it
+/// (each ancestor) is now wrong.
+fn forget_folder_sizes_above(path: &Path) {
+    let mut sizes = folder_sizes();
+    for a in path.ancestors() {
+        sizes.remove(a);
+    }
+}
+
+thread_local! {
+    /// Fingerprint + last-use tick for each `INFO_CACHE` entry, so a reload
+    /// can drop info for files that changed and the cache stays bounded.
+    static INFO_META: RefCell<Lru<PathBuf, Option<Fingerprint>>> = RefCell::new(Lru::new(INFO_CACHE_CAP));
+}
+
+/// How many files' gathered info is kept.
+const INFO_CACHE_CAP: usize = 1024;
+
+/// Cache gathered info for `path`, stamped with its fingerprint. Info evicted
+/// from the bounded metadata map is dropped from `INFO_CACHE` too.
+fn info_cache_insert(path: PathBuf, info: FileInfo, fp: Option<Fingerprint>) {
+    INFO_META.with(|m| {
+        let mut m = m.borrow_mut();
+        m.insert(path.clone(), fp);
+        INFO_CACHE.with(|c| {
+            let mut c = c.borrow_mut();
+            c.insert(path, info);
+            if c.len() > m.len() {
+                c.retain(|k, _| m.map.contains_key(k));
+            }
+        });
+    });
+}
+
+fn info_cache_forget(path: &Path) {
+    INFO_META.with(|m| m.borrow_mut().remove(path));
+    INFO_CACHE.with(|c| c.borrow_mut().remove(path));
+}
+
+/// A fresh stat'd listing of `dir` arrived: drop cached folder totals and file
+/// info whose fingerprint no longer matches what's on disk. Walks the (small,
+/// bounded) caches rather than the listing, so a 100k-entry folder costs no
+/// more than an empty one when nothing in it is cached.
+fn validate_listing_caches(dir: &Path, entries: &[Entry]) {
+    let in_dir = |p: &Path| p.parent() == Some(dir);
+    let name_of = |p: &Path| p.file_name().map(|n| n.to_string_lossy().into_owned());
+    let stale_sizes: Vec<(PathBuf, String, Option<SystemTime>)> = folder_sizes()
+        .map
+        .iter()
+        .filter(|(p, _)| in_dir(p))
+        .filter_map(|(p, ((m, _), _))| Some((p.clone(), name_of(p)?, *m)))
+        .collect();
+    let stale_info: Vec<(PathBuf, String, Option<Fingerprint>)> = INFO_META.with(|m| {
+        m.borrow()
+            .map
+            .iter()
+            .filter(|(p, _)| in_dir(p))
+            .filter_map(|(p, (fp, _))| Some((p.clone(), name_of(p)?, *fp)))
+            .collect()
+    });
+    if stale_sizes.is_empty() && stale_info.is_empty() {
+        return;
+    }
+    let by_name: HashMap<&str, &Entry> = entries.iter().map(|e| (e.name.as_str(), e)).collect();
+    let mut sizes = folder_sizes();
+    for (p, name, mtime) in stale_sizes {
+        if by_name.get(name.as_str()).map(|e| e.modified) != Some(mtime) {
+            sizes.remove(&p);
+        }
+    }
+    drop(sizes);
+    for (p, name, fp) in stale_info {
+        if by_name.get(name.as_str()).map(|e| e.fingerprint()) != fp {
+            info_cache_forget(&p);
+        }
+    }
+}
+
+/// The watcher saw a change at `path`: drop everything cached about it (and
+/// about the folders whose totals/counts include it).
+fn invalidate_path_caches(path: &Path) {
+    forget_folder_sizes_above(path);
+    info_cache_forget(path);
+    if let Some(parent) = path.parent() {
+        info_cache_forget(parent);
+    }
+    if let Some(m) = DATALESS_STAT.get() {
+        m.lock().unwrap().remove(path);
+    }
 }
 
 /// Total bytes of all files under `dir` (jwalk, parallel, symlinks not
@@ -17932,30 +18363,47 @@ fn format_size(is_dir: bool, size: u64) -> String {
     }
 }
 
+/// A cheap listing plus the folder signature taken just before it was read.
+type Listing = (Option<DirSig>, Vec<Entry>);
+
+/// How long navigating to a folder waits on the UI thread for its cheap
+/// listing before painting an empty list and letting it arrive async. Local
+/// folders list well inside this (no empty flash); a slow or dead network
+/// mount can never stall a frame for longer.
+const FAST_LOAD_BUDGET: Duration = Duration::from_millis(12);
+
+/// Most entries a single listing will hold. A folder past this (millions of
+/// files dumped by some tool) is cut off rather than allowed to eat memory and
+/// stall the stat pass for minutes.
+const LISTING_CAP: usize = 500_000;
+
 /// Read a directory's entries with full metadata (one `stat` per entry), sorted
-/// directories-first then case-insensitive by name. This is the slow path; the
-/// UI shows `read_entries_fast` first and swaps this in from the background.
+/// directories-first then by natural name. This is the slow path; the UI shows
+/// `read_entries_fast` first and swaps this in from the background. The names
+/// come from one readdir; the stats then run in parallel on the rayon pool —
+/// they dominate on big folders, and on network mounts overlapping them hides
+/// the per-request round trip.
 fn read_entries(dir: &Path) -> Vec<Entry> {
-    let mut entries: Vec<Entry> = Vec::new();
-    if let Ok(read_dir) = fs::read_dir(dir) {
-        for entry in read_dir.flatten() {
-            let name = entry.file_name().to_string_lossy().into_owned();
+    let names: Vec<OsString> = match fs::read_dir(dir) {
+        Ok(rd) => rd.flatten().take(LISTING_CAP).map(|e| e.file_name()).collect(),
+        Err(_) => Vec::new(),
+    };
+    let mut entries: Vec<Entry> = names
+        .par_iter()
+        .with_min_len(64)
+        .map(|n| {
             // One stat, following symlinks: gives is_dir, size, and mtime.
-            let md = fs::metadata(entry.path()).ok();
-            let is_dir = md.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-            let size = md.as_ref().map(|m| m.len()).unwrap_or(0);
-            let modified = md.as_ref().and_then(|m| m.modified().ok());
-            let created = md.as_ref().and_then(|m| m.created().ok());
-            entries.push(Entry {
-                name,
-                is_dir,
-                size,
-                modified,
-                created,
+            let md = fs::metadata(dir.join(n)).ok();
+            Entry {
+                name: n.to_string_lossy().into_owned(),
+                is_dir: md.as_ref().map(|m| m.is_dir()).unwrap_or(false),
+                size: md.as_ref().map(|m| m.len()).unwrap_or(0),
+                modified: md.as_ref().and_then(|m| m.modified().ok()),
+                created: md.as_ref().and_then(|m| m.created().ok()),
                 loaded: true,
-            });
-        }
-    }
+            }
+        })
+        .collect();
     sort_default(&mut entries);
     entries
 }
@@ -17966,7 +18414,7 @@ fn read_entries(dir: &Path) -> Vec<Entry> {
 fn read_entries_fast(dir: &Path) -> Vec<Entry> {
     let mut entries: Vec<Entry> = Vec::new();
     if let Ok(read_dir) = fs::read_dir(dir) {
-        for entry in read_dir.flatten() {
+        for entry in read_dir.flatten().take(LISTING_CAP) {
             let name = entry.file_name().to_string_lossy().into_owned();
             let is_dir = match entry.file_type() {
                 Ok(t) if t.is_dir() => true,
@@ -17988,36 +18436,164 @@ fn read_entries_fast(dir: &Path) -> Vec<Entry> {
     entries
 }
 
-/// The default ordering (folders first, then case-insensitive by name). Uses
-/// `sort_by_cached_key` so each name is lowercased once, not on every compare.
+/// Finder-style "natural" comparison of two already case-folded names: runs of
+/// digits compare by numeric value ("file2" < "file10"); leading zeros only
+/// break a tie when the names are otherwise equal ("a01" < "a1", yet
+/// "a1b" < "a01c"); everything else compares bytewise (i.e. by code point,
+/// since the input is UTF-8 — accents aren't folded, so "é" sorts after "z").
+fn natural_compare(a: &[u8], b: &[u8]) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (mut i, mut j) = (0, 0);
+    let mut zeros_tie = Ordering::Equal;
+    while i < a.len() && j < b.len() {
+        if a[i].is_ascii_digit() && b[j].is_ascii_digit() {
+            let (na, ea) = take_number(a, i);
+            let (nb, eb) = take_number(b, j);
+            // Fewer significant digits = smaller number; equal lengths compare
+            // digit by digit.
+            let ord = na.len().cmp(&nb.len()).then_with(|| na.cmp(nb));
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            if zeros_tie == Ordering::Equal {
+                zeros_tie = a[i..ea].cmp(&b[j..eb]);
+            }
+            i = ea;
+            j = eb;
+        } else {
+            if a[i] != b[j] {
+                return a[i].cmp(&b[j]);
+            }
+            i += 1;
+            j += 1;
+        }
+    }
+    (a.len() - i).cmp(&(b.len() - j)).then(zeros_tie)
+}
+
+/// The digit run starting at `start`: (its significant digits — leading zeros
+/// stripped — and the index just past the run).
+fn take_number(bytes: &[u8], start: usize) -> (&[u8], usize) {
+    let mut end = start;
+    while end < bytes.len() && bytes[end].is_ascii_digit() {
+        end += 1;
+    }
+    let mut sig = start;
+    while sig < end && bytes[sig] == b'0' {
+        sig += 1;
+    }
+    (&bytes[sig..end], end)
+}
+
+/// Precomputed name sort key: case-folded once (so a sort doesn't re-lowercase
+/// on every comparison), ordered naturally, then by the raw name so names that
+/// fold the same ("Readme" / "README") still get one deterministic order.
+#[derive(PartialEq, Eq)]
+struct NatKey {
+    folded: String,
+    raw: String,
+}
+
+impl NatKey {
+    fn new(name: &str) -> Self {
+        let folded = if name.is_ascii() { name.to_ascii_lowercase() } else { name.to_lowercase() };
+        NatKey { folded, raw: name.to_string() }
+    }
+}
+
+impl Ord for NatKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        natural_compare(self.folded.as_bytes(), other.folded.as_bytes()).then_with(|| self.raw.cmp(&other.raw))
+    }
+}
+
+impl PartialOrd for NatKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// The default ordering (folders first, then natural name). Uses
+/// `sort_by_cached_key` so each key is built once, not on every compare.
 fn sort_default(entries: &mut [Entry]) {
-    entries.sort_by_cached_key(|e| (!e.is_dir, e.name.to_lowercase()));
+    entries.sort_by_cached_key(|e| (!e.is_dir, NatKey::new(&e.name)));
 }
 
 thread_local! {
     /// Cache of directory listings for Column view, so it isn't re-read from
-    /// disk on every frame. Cleared whenever the filesystem might have changed.
-    static COL_ENTRIES: RefCell<HashMap<PathBuf, Vec<Entry>>> = RefCell::new(HashMap::new());
+    /// disk on every frame: dir → (listing, stale). A stale listing is still
+    /// shown while a background read refreshes it (no empty-column flash).
+    static COL_ENTRIES: RefCell<HashMap<PathBuf, (Vec<Entry>, bool)>> = RefCell::new(HashMap::new());
+    /// Folders with a background column read in flight (one read per folder).
+    static COL_PENDING: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
+    /// In-flight folders that changed again mid-read: their result is stored
+    /// still-stale so the next frame reads once more.
+    static COL_REDIRTY: RefCell<HashSet<PathBuf>> = RefCell::new(HashSet::new());
 }
 
-/// Directory listing for a column (cached). Default sort (folders first, name).
-fn column_entries(dir: &Path) -> Vec<Entry> {
-    if let Some(v) = COL_ENTRIES.with(|c| c.borrow().get(dir).cloned()) {
-        return v;
+/// How many folder listings Column view keeps cached.
+const COL_CACHE_CAP: usize = 64;
+
+/// Directory listing for a column (cached; default sort). Never touches the
+/// disk on the calling (UI) thread: a miss, or a listing marked stale by a
+/// refresh or the watcher, kicks off one background read for that folder and
+/// repaints when it lands. Meanwhile the old listing (or an empty column) shows.
+fn column_entries(dir: &Path, cx: &Context<Shuffle>) -> Vec<Entry> {
+    let (hit, stale) = COL_ENTRIES.with(|c| match c.borrow().get(dir) {
+        Some((v, stale)) => (Some(v.clone()), *stale),
+        None => (None, true),
+    });
+    if stale && COL_PENDING.with(|p| p.borrow_mut().insert(dir.to_path_buf())) {
+        let dir = dir.to_path_buf();
+        cx.spawn(async move |this, cx| {
+            let d = dir.clone();
+            // Columns only show name + icon, so the cheap (no-stat) read is enough.
+            let v = cx.background_spawn(async move { read_entries_fast(&d) }).await;
+            COL_PENDING.with(|p| p.borrow_mut().remove(&dir));
+            let stale = COL_REDIRTY.with(|r| r.borrow_mut().remove(&dir));
+            store_column_listing(dir, v, stale);
+            let _ = this.update(cx, |_, cx| cx.notify());
+        })
+        .detach();
     }
-    // Columns only show name + icon, so the cheap (no-stat) read is enough.
-    let v = read_entries_fast(dir);
-    COL_ENTRIES.with(|c| c.borrow_mut().insert(dir.to_path_buf(), v.clone()));
-    v
+    hit.unwrap_or_default()
 }
 
+fn store_column_listing(dir: PathBuf, v: Vec<Entry>, stale: bool) {
+    COL_ENTRIES.with(|c| {
+        let mut c = c.borrow_mut();
+        if c.len() >= COL_CACHE_CAP && !c.contains_key(&dir) {
+            // Shed stale listings first; if that's not enough, start over.
+            c.retain(|_, (_, s)| !*s);
+            if c.len() >= COL_CACHE_CAP {
+                c.clear();
+            }
+        }
+        c.insert(dir, (v, stale));
+    });
+}
+
+/// Mark every cached column listing stale: each is re-read in the background
+/// the next time it's shown, and keeps showing until then.
 fn clear_column_cache() {
-    COL_ENTRIES.with(|c| c.borrow_mut().clear());
+    COL_ENTRIES.with(|c| {
+        for (_, s) in c.borrow_mut().values_mut() {
+            *s = true;
+        }
+    });
+    COL_PENDING.with(|p| COL_REDIRTY.with(|r| r.borrow_mut().extend(p.borrow().iter().cloned())));
 }
 
-/// Drop one folder's cached column listing so the next frame re-reads it.
+/// Mark one folder's cached column listing stale so the next frame re-reads it.
 fn forget_column_listing(dir: &Path) {
-    COL_ENTRIES.with(|c| c.borrow_mut().remove(dir));
+    COL_ENTRIES.with(|c| {
+        if let Some((_, s)) = c.borrow_mut().get_mut(dir) {
+            *s = true;
+        }
+    });
+    if COL_PENDING.with(|p| p.borrow().contains(dir)) {
+        COL_REDIRTY.with(|r| r.borrow_mut().insert(dir.to_path_buf()));
+    }
 }
 
 /// What the folder watcher compares to spot outside changes. The folder's
@@ -18048,27 +18624,241 @@ fn dir_sig(dir: &Path) -> Option<DirSig> {
     Some(DirSig { mtime, names })
 }
 
-/// Sort a directory listing in place by the given criterion/direction. Uses
-/// `sort_by_cached_key` for name/kind so strings are lowercased once per item
-/// (not on every comparison) — important for large folders.
-fn sort_entries(entries: &mut [Entry], key: SortKey, asc: bool) {
-    match key {
-        SortKey::None => {
-            sort_default(entries);
-            return;
-        }
-        SortKey::Name => entries.sort_by_cached_key(|e| e.name.to_lowercase()),
-        SortKey::Kind => {
-            entries.sort_by_cached_key(|e| {
-                (kind_label(&e.name, e.is_dir).to_lowercase(), e.name.to_lowercase())
-            });
-        }
-        SortKey::Modified => entries.sort_by_key(|e| e.modified),
-        SortKey::Created => entries.sort_by_key(|e| e.created),
-        SortKey::Size => entries.sort_by_key(|e| e.size),
+/// How long the folder watcher gathers FSEvents before handing them over as
+/// one batch: a big copy or an unzip produces thousands of events, but the UI
+/// should re-list each affected folder once.
+const WATCH_COALESCE: Duration = Duration::from_millis(100);
+
+/// One coalesced batch of filesystem changes for the UI.
+#[derive(Default, Debug)]
+struct FsBatch {
+    /// Watched folders (as the panes name them) whose contents changed.
+    dirs: HashSet<PathBuf>,
+    /// The changed paths themselves, for cache invalidation.
+    paths: Vec<PathBuf>,
+}
+
+enum WatchMsg {
+    /// Replace the watched set with these folders.
+    Set(Vec<PathBuf>),
+    Event(notify::Result<notify::Event>),
+}
+
+/// Live folder watching through FSEvents (the `notify` crate), so a new
+/// download, an in-place write that grows a file, or a delete from another app
+/// shows up within ~100 ms. Each shown folder is watched non-recursively; a
+/// dedicated thread owns the watcher (re-targeting restarts the FSEvents
+/// stream — kept off the UI thread), coalesces events, and sends batches over
+/// a channel that an async task on the main thread drains.
+///
+/// Network mounts aren't watched (FSEvents only sees changes made from this
+/// Mac); they, cloud folders, and anything that failed to watch stay on the
+/// 1 s signature poller. `covered` is the set the poller can skip.
+struct FolderWatcher {
+    tx: std::sync::mpsc::Sender<WatchMsg>,
+    covered: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+impl FolderWatcher {
+    fn spawn(out: futures::channel::mpsc::UnboundedSender<FsBatch>) -> Option<Self> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let events = tx.clone();
+        let watcher = notify::recommended_watcher(move |res| {
+            let _ = events.send(WatchMsg::Event(res));
+        })
+        .ok()?;
+        let covered: Arc<Mutex<HashSet<PathBuf>>> = Arc::default();
+        let cov = covered.clone();
+        std::thread::Builder::new()
+            .name("folder-watch".into())
+            .spawn(move || watch_loop(watcher, rx, out, cov))
+            .ok()?;
+        Some(FolderWatcher { tx, covered })
     }
-    if !asc {
-        entries.reverse();
+
+    fn set(&self, dirs: Vec<PathBuf>) {
+        let _ = self.tx.send(WatchMsg::Set(dirs));
+    }
+}
+
+/// The watcher thread: apply re-targets, fold events into batches, and flush
+/// each batch [`WATCH_COALESCE`] after its first event.
+fn watch_loop(
+    mut watcher: notify::RecommendedWatcher,
+    rx: std::sync::mpsc::Receiver<WatchMsg>,
+    out: futures::channel::mpsc::UnboundedSender<FsBatch>,
+    covered: Arc<Mutex<HashSet<PathBuf>>>,
+) {
+    use std::sync::mpsc::RecvTimeoutError;
+    // Shown folder → the canonical path it's watched under. FSEvents reports
+    // real paths (`/tmp/x` arrives as `/private/tmp/x`), so events are matched
+    // against the canonical side.
+    let mut watched: HashMap<PathBuf, PathBuf> = HashMap::new();
+    let mut batch: Option<(Instant, FsBatch)> = None;
+    loop {
+        // Flush first, so a constant event stream can't starve the deadline.
+        if batch.as_ref().is_some_and(|(t0, _)| t0.elapsed() >= WATCH_COALESCE) {
+            let (_, b) = batch.take().unwrap();
+            if out.unbounded_send(b).is_err() {
+                return; // UI is gone
+            }
+        }
+        let msg = match &batch {
+            Some((t0, _)) => match rx.recv_timeout(WATCH_COALESCE.saturating_sub(t0.elapsed())) {
+                Ok(m) => m,
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return,
+            },
+            None => match rx.recv() {
+                Ok(m) => m,
+                Err(_) => return,
+            },
+        };
+        match msg {
+            WatchMsg::Set(dirs) => retarget_watches(&mut watcher, &mut watched, dirs, &covered),
+            WatchMsg::Event(Ok(ev)) => {
+                if matches!(ev.kind, notify::EventKind::Access(_)) {
+                    continue;
+                }
+                for p in ev.paths {
+                    // Finder's view-settings droppings aren't worth a re-list.
+                    if p.file_name().is_some_and(|n| n == ".DS_Store") {
+                        continue;
+                    }
+                    let parent = p.parent();
+                    let hits: Vec<PathBuf> = watched
+                        .iter()
+                        .filter(|(_, canon)| Some(canon.as_path()) == parent || **canon == p)
+                        .map(|(shown, _)| shown.clone())
+                        .collect();
+                    if hits.is_empty() {
+                        continue;
+                    }
+                    let (_, b) = batch.get_or_insert_with(|| (Instant::now(), FsBatch::default()));
+                    b.dirs.extend(hits);
+                    b.paths.push(p);
+                }
+            }
+            WatchMsg::Event(Err(_)) => {}
+        }
+    }
+}
+
+/// Point the watcher at exactly `dirs` (one FSEvents stream restart, and only
+/// if something changed).
+fn retarget_watches(
+    watcher: &mut notify::RecommendedWatcher,
+    watched: &mut HashMap<PathBuf, PathBuf>,
+    dirs: Vec<PathBuf>,
+    covered: &Mutex<HashSet<PathBuf>>,
+) {
+    use notify::Watcher;
+    let want: HashSet<PathBuf> = dirs.into_iter().collect();
+    let gone: Vec<PathBuf> = watched.keys().filter(|d| !want.contains(*d)).cloned().collect();
+    let new: Vec<PathBuf> = want.iter().filter(|d| !watched.contains_key(*d)).cloned().collect();
+    if gone.is_empty() && new.is_empty() {
+        return;
+    }
+    let mut cov = covered.lock().unwrap();
+    let mut paths = watcher.paths_mut();
+    for d in gone {
+        cov.remove(&d);
+        if let Some(canon) = watched.remove(&d) {
+            // Two panes can show one folder under different spellings.
+            if !watched.values().any(|c| *c == canon) {
+                let _ = paths.remove(&canon);
+            }
+        }
+    }
+    for d in new {
+        if is_network_path(&d) {
+            continue;
+        }
+        let Ok(canon) = d.canonicalize() else { continue };
+        let already = watched.values().any(|c| *c == canon);
+        if already || paths.add(&canon, notify::RecursiveMode::NonRecursive).is_ok() {
+            // Cloud folders also keep polling: providers can add files
+            // without any event we'd see.
+            if cloud_kind(&d).is_none() {
+                cov.insert(d.clone());
+            }
+            watched.insert(d, canon);
+        }
+    }
+    // Errors only when nothing is left to watch.
+    let _ = paths.commit();
+}
+
+/// Whether `dir` lives on a network mount (SMB/AFP/NFS/WebDAV…). Only
+/// `/Volumes`, `/Network` and `/net` can hold one, so other paths skip the
+/// `statfs`; a mount we can't `statfs` is treated as network (i.e. polled).
+fn is_network_path(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if !["/Volumes/", "/Network/", "/net/"].iter().any(|r| dir.starts_with(r)) {
+        return false;
+    }
+    let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else {
+        return true;
+    };
+    let mut st: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut st) } != 0 {
+        return true;
+    }
+    st.f_flags & libc::MNT_LOCAL as u32 == 0
+}
+
+/// Sort a directory listing in place by the given criterion/direction. Keys
+/// are built once per item (`sort_by_cached_key`), which matters for large
+/// folders. Every criterion tie-breaks on the natural name — always A→Z, even
+/// when the primary order is descending — so items with equal dates/sizes/kinds
+/// keep one stable order across reloads instead of following readdir order.
+fn sort_entries(entries: &mut [Entry], key: SortKey, asc: bool) {
+    use std::cmp::Reverse;
+    fn by<K: Ord>(entries: &mut [Entry], asc: bool, primary: impl Fn(&Entry) -> K) {
+        if asc {
+            entries.sort_by_cached_key(|e| (primary(e), NatKey::new(&e.name)));
+        } else {
+            entries.sort_by_cached_key(|e| (Reverse(primary(e)), NatKey::new(&e.name)));
+        }
+    }
+    match key {
+        SortKey::None => sort_default(entries),
+        SortKey::Name if asc => entries.sort_by_cached_key(|e| NatKey::new(&e.name)),
+        SortKey::Name => entries.sort_by_cached_key(|e| Reverse(NatKey::new(&e.name))),
+        SortKey::Kind => by(entries, asc, |e| kind_label(&e.name, e.is_dir).to_lowercase()),
+        SortKey::Modified => by(entries, asc, |e| e.modified),
+        SortKey::Created => by(entries, asc, |e| e.created),
+        SortKey::Size => by(entries, asc, |e| e.size),
+    }
+}
+
+/// Where a tab's selection anchor should land after its folder is re-listed.
+#[derive(Debug, PartialEq)]
+enum AnchorFallback {
+    /// Still there (or not something we can place): leave it alone.
+    Keep,
+    /// It vanished: move to this index of the *previous* listing.
+    Move(usize),
+    /// It vanished and nothing near it survived.
+    Clear,
+}
+
+/// Pick the anchor's fate after a reload (pure, so it's testable). `old` is the
+/// previous listing in display order and `exists` says whether a name is in the
+/// new one. A vanished anchor falls back to the nearest surviving row *before*
+/// it — so deleting with the keyboard walks up the list — else the nearest one
+/// after it.
+fn fallback_anchor(old: &[String], anchor: &str, exists: impl Fn(&str) -> bool) -> AnchorFallback {
+    if exists(anchor) {
+        return AnchorFallback::Keep;
+    }
+    let Some(at) = old.iter().position(|n| n == anchor) else {
+        return AnchorFallback::Keep;
+    };
+    let before = (0..at).rev().find(|&i| exists(&old[i]));
+    match before.or_else(|| (at + 1..old.len()).find(|&i| exists(&old[i]))) {
+        Some(i) => AnchorFallback::Move(i),
+        None => AnchorFallback::Clear,
     }
 }
 
@@ -20160,6 +20950,203 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn entry(name: &str, is_dir: bool, size: u64, modified: Option<SystemTime>) -> Entry {
+        Entry { name: name.into(), is_dir, size, modified, created: None, loaded: true }
+    }
+
+    fn names(entries: &[Entry]) -> Vec<&str> {
+        entries.iter().map(|e| e.name.as_str()).collect()
+    }
+
+    fn nat_sorted(list: &[&str]) -> Vec<String> {
+        let mut v: Vec<String> = list.iter().map(|s| s.to_string()).collect();
+        v.sort_by_cached_key(|n| NatKey::new(n));
+        v
+    }
+
+    #[test]
+    fn natural_sort_numbers_case_and_unicode() {
+        // Digit runs compare numerically, not lexically.
+        assert_eq!(nat_sorted(&["file10", "file2", "file1"]), ["file1", "file2", "file10"]);
+        assert_eq!(nat_sorted(&["v1.10", "v1.9", "v1.2"]), ["v1.2", "v1.9", "v1.10"]);
+        // Equal numbers: leading zeros only break the tie, deterministically.
+        assert_eq!(nat_sorted(&["a1", "a01", "a001"]), ["a001", "a01", "a1"]);
+        assert_eq!(nat_sorted(&["a01c", "a1b"]), ["a1b", "a01c"]);
+        // Case-insensitive, with the raw name settling exact folds.
+        assert_eq!(nat_sorted(&["banana", "Apple", "cherry"]), ["Apple", "banana", "cherry"]);
+        assert_eq!(nat_sorted(&["readme", "README", "Readme"]), ["README", "Readme", "readme"]);
+        // Non-ASCII names fold case too (Ö/ö sort together), numbers included.
+        assert_eq!(nat_sorted(&["öl10", "Öl2", "ÖL1"]), ["ÖL1", "Öl2", "öl10"]);
+        assert_eq!(nat_sorted(&["Ärger", "zebra", "ärger"]), ["zebra", "Ärger", "ärger"]);
+        // Huge digit runs don't overflow.
+        assert_eq!(
+            nat_sorted(&["x99999999999999999999999", "x100000000000000000000000"]),
+            ["x99999999999999999999999", "x100000000000000000000000"]
+        );
+        assert_eq!(natural_compare(b"abc", b"abc"), std::cmp::Ordering::Equal);
+        assert_eq!(natural_compare(b"ab", b"abc"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn sort_ties_break_by_natural_name_deterministically() {
+        let t = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1000));
+        let later = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(2000));
+        let base = vec![
+            entry("file10", false, 5, t),
+            entry("File2", false, 5, t),
+            entry("dir", true, 0, later),
+            entry("file1", false, 9, t),
+        ];
+        // Any input order gives the same output, for every key and direction.
+        for key in [SortKey::None, SortKey::Name, SortKey::Kind, SortKey::Modified, SortKey::Size] {
+            for asc in [true, false] {
+                let mut a = base.clone();
+                let mut b: Vec<Entry> = base.iter().rev().cloned().collect();
+                sort_entries(&mut a, key, asc);
+                sort_entries(&mut b, key, asc);
+                assert_eq!(names(&a), names(&b), "{:?} asc={asc}", key.label());
+            }
+        }
+        let mut v = base.clone();
+        sort_entries(&mut v, SortKey::None, true);
+        assert_eq!(names(&v), ["dir", "file1", "File2", "file10"]);
+        // Equal sizes keep natural A→Z even when sorting descending.
+        sort_entries(&mut v, SortKey::Size, false);
+        assert_eq!(names(&v), ["file1", "File2", "file10", "dir"]);
+        sort_entries(&mut v, SortKey::Modified, false);
+        assert_eq!(names(&v), ["dir", "file1", "File2", "file10"]);
+        sort_entries(&mut v, SortKey::Name, false);
+        assert_eq!(names(&v), ["file10", "File2", "file1", "dir"]);
+    }
+
+    #[test]
+    fn parallel_read_entries_matches_disk() {
+        let d = scratch("par-read");
+        for i in 0..300 {
+            fs::write(d.join(format!("f{i}.txt")), vec![b'x'; i]).unwrap();
+        }
+        fs::create_dir(d.join("sub")).unwrap();
+        let full = read_entries(&d);
+        assert_eq!(full.len(), 301);
+        assert!(full.iter().all(|e| e.loaded));
+        // Folders first, then natural order.
+        assert_eq!(full[0].name, "sub");
+        assert!(full[0].is_dir);
+        assert_eq!(names(&full[1..4]), ["f0.txt", "f1.txt", "f2.txt"]);
+        assert_eq!(full[300].name, "f299.txt");
+        for e in &full[1..] {
+            let i: u64 = e.name[1..e.name.len() - 4].parse().unwrap();
+            assert_eq!(e.size, i, "{}", e.name);
+            assert!(e.modified.is_some());
+        }
+        // Same names and order as the cheap pass.
+        assert_eq!(names(&full), names(&read_entries_fast(&d)));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn caches_invalidate_on_fingerprint_change() {
+        let d = scratch("cache-fp");
+        let sub = d.join("sub");
+        let file = d.join("a.txt");
+        fs::create_dir(&sub).unwrap();
+        fs::write(&file, "one").unwrap();
+        let sub_mtime = fs::metadata(&sub).unwrap().modified().ok();
+        folder_size_store(sub.clone(), sub_mtime, 42);
+        info_cache_insert(file.clone(), gather_info(&file), fingerprint(&file));
+        // Unchanged listing: both survive.
+        validate_listing_caches(&d, &read_entries(&d));
+        assert_eq!(folder_size_lookup(&sub), Some(42));
+        assert!(lookup_info(&file).is_some());
+        // A child added to `sub` bumps its mtime; the file grows in place.
+        std::thread::sleep(Duration::from_millis(20));
+        fs::write(sub.join("new"), "x").unwrap();
+        fs::write(&file, "longer").unwrap();
+        validate_listing_caches(&d, &read_entries(&d));
+        assert_eq!(folder_size_lookup(&sub), None);
+        assert!(lookup_info(&file).is_none());
+        // Watcher-path invalidation drops every ancestor's total.
+        folder_size_store(d.clone(), None, 7);
+        folder_size_store(sub.clone(), None, 7);
+        invalidate_path_caches(&sub.join("new"));
+        assert_eq!((folder_size_lookup(&d), folder_size_lookup(&sub)), (None, None));
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn lru_evicts_least_recently_used() {
+        let mut c: Lru<u32, u32> = Lru::new(8);
+        for i in 0..8 {
+            c.insert(i, i);
+        }
+        // Touch 0 so it's the most recent; inserting past the cap evicts the
+        // oldest quarter (1 and 2), not 0.
+        assert_eq!(c.get(&0), Some(&0));
+        c.insert(100, 100);
+        assert!(c.len() <= 8);
+        assert_eq!(c.get(&0), Some(&0));
+        assert_eq!(c.get(&1), None);
+        assert_eq!(c.get(&100), Some(&100));
+    }
+
+    #[test]
+    fn anchor_falls_back_to_previous_row() {
+        let old: Vec<String> = ["a", "b", "c", "d"].iter().map(|s| s.to_string()).collect();
+        let alive = |keep: &'static [&'static str]| move |n: &str| keep.contains(&n);
+        assert_eq!(fallback_anchor(&old, "c", alive(&["a", "b", "c", "d"])), AnchorFallback::Keep);
+        // "c" deleted → the row above it.
+        assert_eq!(fallback_anchor(&old, "c", alive(&["a", "b", "d"])), AnchorFallback::Move(1));
+        // "b" and "c" deleted → still walks up past the gap.
+        assert_eq!(fallback_anchor(&old, "c", alive(&["a", "d"])), AnchorFallback::Move(0));
+        // Nothing above survives → the next row below.
+        assert_eq!(fallback_anchor(&old, "a", alive(&["c", "d"])), AnchorFallback::Move(2));
+        assert_eq!(fallback_anchor(&old, "b", alive(&[])), AnchorFallback::Clear);
+        // An anchor the old listing never had (e.g. just created) is left be.
+        assert_eq!(fallback_anchor(&old, "zz", alive(&["a"])), AnchorFallback::Keep);
+    }
+
+    #[test]
+    fn watcher_reports_new_and_growing_files() {
+        let d = scratch("watch");
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let w = FolderWatcher::spawn(tx).expect("watcher");
+        w.set(vec![d.clone()]);
+        // Wait until the thread has the folder watched.
+        let t0 = Instant::now();
+        while !w.covered.lock().unwrap().contains(&d) {
+            assert!(t0.elapsed() < Duration::from_secs(2), "watch never registered");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        let next_batch = |rx: &mut futures::channel::mpsc::UnboundedReceiver<FsBatch>| {
+            let t0 = Instant::now();
+            loop {
+                if let Ok(b) = rx.try_recv() {
+                    return Some(b);
+                }
+                if t0.elapsed() > Duration::from_secs(2) {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let f = d.join("download.part");
+        fs::write(&f, "abc").unwrap();
+        let b = next_batch(&mut rx).expect("no event for a new file within 2 s");
+        assert!(b.dirs.contains(&d), "{b:?}");
+        // Drain, then an in-place append (a growing download) reports too.
+        std::thread::sleep(Duration::from_millis(300));
+        while rx.try_recv().is_ok() {}
+        {
+            use std::io::Write;
+            let mut h = fs::OpenOptions::new().append(true).open(&f).unwrap();
+            h.write_all(b"more bytes").unwrap();
+        }
+        let b = next_batch(&mut rx).expect("no event for an in-place write within 2 s");
+        assert!(b.dirs.contains(&d), "{b:?}");
+        let _ = fs::remove_dir_all(&d);
     }
 
     #[test]
