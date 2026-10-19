@@ -18,6 +18,8 @@ image = { version = "0.25", features = ["tiff"] }
 objc2 = "0.6"
 objc2-foundation = { version = "0.3", features = ["NSString", "NSData", "NSFileManager", "NSURL", "NSArray"] }
 objc2-app-kit = { version = "0.3", features = ["NSWorkspace", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSPDFImageRep", "NSGraphics", "NSGraphicsContext", "NSResponder", "NSView", "NSEvent", "NSApplication", "NSPasteboard", "NSPasteboardItem", "NSDragging", "NSDraggingItem", "NSDraggingSession", "NSSharingService"] }
+# macOS file-op syscalls: renamex_np(RENAME_EXCL), copyfile, clonefile, F_FULLFSYNC.
+libc = "0.2"
 # Reach the underlying NSView so we can start native OS drag sessions (drag files out to Finder/other apps).
 raw-window-handle = "0.6"
 
