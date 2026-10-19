@@ -762,6 +762,31 @@ enum KeyAction {
     GetInfo,
     BatchRename,
     Undo,
+    CopyFiles,
+    CutFiles,
+    PasteFiles,
+    PasteMove,
+    GoParent,
+    OpenNewTab,
+    Back,
+    Forward,
+    DeletePermanently,
+    ViewList,
+    ViewIcons,
+    ViewColumns,
+    ViewGallery,
+    GoTo,
+    GoHome,
+    GoDesktop,
+    GoDownloads,
+    GoDocuments,
+    GoApplications,
+    NextTab,
+    PrevTab,
+    QuickLook,
+    ShortcutHelp,
+    PreviewScrollUp,
+    PreviewScrollDown,
     // Command-palette (Cmd+P) text editing. These act only while the palette is
     // open, so they're excluded from the normal (global) key dispatch.
     PaletteCursorStart,
@@ -795,6 +820,31 @@ impl KeyAction {
         KeyAction::GetInfo,
         KeyAction::BatchRename,
         KeyAction::Undo,
+        KeyAction::CopyFiles,
+        KeyAction::CutFiles,
+        KeyAction::PasteFiles,
+        KeyAction::PasteMove,
+        KeyAction::GoParent,
+        KeyAction::OpenNewTab,
+        KeyAction::Back,
+        KeyAction::Forward,
+        KeyAction::DeletePermanently,
+        KeyAction::ViewList,
+        KeyAction::ViewIcons,
+        KeyAction::ViewColumns,
+        KeyAction::ViewGallery,
+        KeyAction::GoTo,
+        KeyAction::GoHome,
+        KeyAction::GoDesktop,
+        KeyAction::GoDownloads,
+        KeyAction::GoDocuments,
+        KeyAction::GoApplications,
+        KeyAction::NextTab,
+        KeyAction::PrevTab,
+        KeyAction::QuickLook,
+        KeyAction::ShortcutHelp,
+        KeyAction::PreviewScrollUp,
+        KeyAction::PreviewScrollDown,
         KeyAction::PaletteCursorStart,
         KeyAction::PaletteCursorEnd,
         KeyAction::PaletteSelectAll,
@@ -845,6 +895,31 @@ impl KeyAction {
             KeyAction::GetInfo => "get_info",
             KeyAction::BatchRename => "batch_rename",
             KeyAction::Undo => "undo",
+            KeyAction::CopyFiles => "copy_files",
+            KeyAction::CutFiles => "cut_files",
+            KeyAction::PasteFiles => "paste_files",
+            KeyAction::PasteMove => "paste_move",
+            KeyAction::GoParent => "go_parent",
+            KeyAction::OpenNewTab => "open_new_tab",
+            KeyAction::Back => "back",
+            KeyAction::Forward => "forward",
+            KeyAction::DeletePermanently => "delete_permanently",
+            KeyAction::ViewList => "view_list",
+            KeyAction::ViewIcons => "view_icons",
+            KeyAction::ViewColumns => "view_columns",
+            KeyAction::ViewGallery => "view_gallery",
+            KeyAction::GoTo => "go_to",
+            KeyAction::GoHome => "go_home",
+            KeyAction::GoDesktop => "go_desktop",
+            KeyAction::GoDownloads => "go_downloads",
+            KeyAction::GoDocuments => "go_documents",
+            KeyAction::GoApplications => "go_applications",
+            KeyAction::NextTab => "next_tab",
+            KeyAction::PrevTab => "prev_tab",
+            KeyAction::QuickLook => "quick_look",
+            KeyAction::ShortcutHelp => "shortcut_help",
+            KeyAction::PreviewScrollUp => "preview_scroll_up",
+            KeyAction::PreviewScrollDown => "preview_scroll_down",
             KeyAction::PaletteCursorStart => "palette_cursor_start",
             KeyAction::PaletteCursorEnd => "palette_cursor_end",
             KeyAction::PaletteSelectAll => "palette_select_all",
@@ -878,6 +953,31 @@ impl KeyAction {
             KeyAction::GetInfo => "Get Info",
             KeyAction::BatchRename => "Rename selected items…",
             KeyAction::Undo => "Undo last file operation",
+            KeyAction::CopyFiles => "Copy files",
+            KeyAction::CutFiles => "Cut files (paste moves them)",
+            KeyAction::PasteFiles => "Paste files",
+            KeyAction::PasteMove => "Move pasted files here",
+            KeyAction::GoParent => "Enclosing folder",
+            KeyAction::OpenNewTab => "Open folder in new tab",
+            KeyAction::Back => "Back",
+            KeyAction::Forward => "Forward",
+            KeyAction::DeletePermanently => "Delete immediately…",
+            KeyAction::ViewList => "View as List",
+            KeyAction::ViewIcons => "View as Icons",
+            KeyAction::ViewColumns => "View as Columns",
+            KeyAction::ViewGallery => "View as Gallery",
+            KeyAction::GoTo => "Go to folder…",
+            KeyAction::GoHome => "Go to Home",
+            KeyAction::GoDesktop => "Go to Desktop",
+            KeyAction::GoDownloads => "Go to Downloads",
+            KeyAction::GoDocuments => "Go to Documents",
+            KeyAction::GoApplications => "Go to Applications",
+            KeyAction::NextTab => "Next tab",
+            KeyAction::PrevTab => "Previous tab",
+            KeyAction::QuickLook => "Quick Look",
+            KeyAction::ShortcutHelp => "Keyboard shortcuts",
+            KeyAction::PreviewScrollUp => "Scroll preview up",
+            KeyAction::PreviewScrollDown => "Scroll preview down",
             KeyAction::PaletteCursorStart => "Palette: cursor to start",
             KeyAction::PaletteCursorEnd => "Palette: cursor to end",
             KeyAction::PaletteSelectAll => "Palette: select all",
@@ -896,11 +996,41 @@ impl KeyAction {
             KeyAction::Find => Some("/"),
             KeyAction::SelectAll => Some("cmd-a"),
             KeyAction::Refresh => Some("cmd-r"),
-            KeyAction::SwitchPane => Some("ctrl-tab"),
+            KeyAction::SwitchPane => Some("alt-tab"),
             KeyAction::Share => Some("cmd-shift-s"),
             KeyAction::GetInfo => Some("cmd-i"),
             KeyAction::BatchRename => Some("cmd-shift-r"),
             KeyAction::Undo => Some("cmd-z"),
+            KeyAction::Open => Some("cmd-down"),
+            KeyAction::MoveToTrash => Some("cmd-backspace"),
+            KeyAction::NewFolder => Some("cmd-shift-n"),
+            KeyAction::Duplicate => Some("cmd-d"),
+            KeyAction::Rename => Some("f2"),
+            KeyAction::CopyFiles => Some("cmd-c"),
+            KeyAction::CutFiles => Some("cmd-x"),
+            KeyAction::PasteFiles => Some("cmd-v"),
+            KeyAction::PasteMove => Some("cmd-alt-v"),
+            KeyAction::GoParent => Some("cmd-up"),
+            KeyAction::OpenNewTab => Some("cmd-enter"),
+            KeyAction::Back => Some("cmd-["),
+            KeyAction::Forward => Some("cmd-]"),
+            KeyAction::DeletePermanently => Some("cmd-alt-backspace"),
+            KeyAction::ViewList => Some("cmd-1"),
+            KeyAction::ViewIcons => Some("cmd-2"),
+            KeyAction::ViewColumns => Some("cmd-3"),
+            KeyAction::ViewGallery => Some("cmd-4"),
+            KeyAction::GoTo => Some("cmd-shift-g"),
+            KeyAction::GoHome => Some("cmd-shift-h"),
+            KeyAction::GoDesktop => Some("cmd-shift-d"),
+            KeyAction::GoDownloads => Some("cmd-alt-l"),
+            KeyAction::GoDocuments => Some("cmd-shift-o"),
+            KeyAction::GoApplications => Some("cmd-shift-a"),
+            KeyAction::NextTab => Some("ctrl-tab"),
+            KeyAction::PrevTab => Some("ctrl-shift-tab"),
+            KeyAction::QuickLook => Some("cmd-y"),
+            KeyAction::ShortcutHelp => Some("f1"),
+            KeyAction::PreviewScrollUp => Some("alt-up"),
+            KeyAction::PreviewScrollDown => Some("alt-down"),
             KeyAction::PaletteCursorStart => Some("cmd-left"),
             KeyAction::PaletteCursorEnd => Some("cmd-right"),
             KeyAction::PaletteSelectAll => Some("cmd-a"),
@@ -3850,6 +3980,15 @@ struct Shuffle {
     info_panel: Option<InfoPanel>,
     /// The open "Rename N Items" dialog, if any.
     batch_rename: Option<BatchRename>,
+    /// Items put on the pasteboard by ⌘X: a paste of the same items moves
+    /// them instead of copying.
+    clipboard_cut: Option<Vec<PathBuf>>,
+    /// The pending delete confirmation is "Delete Immediately" (no Trash).
+    delete_permanent: bool,
+    /// Where a ⇧-arrow range selection started: (pane, item).
+    kb_pivot: Option<(usize, PathBuf)>,
+    /// The F1 shortcut reference, with its filter text, when open.
+    shortcut_help: Option<String>,
 }
 
 /// Which cloud store a path belongs to, for routing download/evict.
@@ -4170,6 +4309,10 @@ impl Shuffle {
             saved_session: String::new(),
             info_panel: None,
             batch_rename: None,
+            clipboard_cut: None,
+            delete_permanent: false,
+            kb_pivot: None,
+            shortcut_help: None,
         }
     }
 
@@ -4753,6 +4896,7 @@ impl Shuffle {
         }
         paths.sort();
         self.confirm_delete = Some((pane, paths));
+        self.delete_permanent = false;
         cx.notify();
     }
 
@@ -4779,6 +4923,21 @@ impl Shuffle {
                     },
                     cx,
                 );
+            } else if std::mem::take(&mut self.delete_permanent) {
+                // ⌥⌘⌫: gone for good (the dialog said so) — no Trash, no undo.
+                let mut failed = 0;
+                for p in &paths {
+                    let r = if fs::symlink_metadata(p).is_ok_and(|m| m.is_dir()) {
+                        fs::remove_dir_all(p)
+                    } else {
+                        fs::remove_file(p)
+                    };
+                    failed += usize::from(r.is_err());
+                }
+                if failed > 0 {
+                    self.remote_error = Some(format!("Couldn't delete {}", items_label(failed)));
+                }
+                self.refresh_pane(pane, cx);
             } else {
                 self.trash_items(pane, &paths, cx);
             }
@@ -5157,6 +5316,180 @@ impl Shuffle {
                         }))),
                 ),
         )
+    }
+
+    // ----- shortcut reference (F1) -----
+
+    /// Every shortcut: the live keymap (so it reflects rebinding) plus the
+    /// fixed browsing keys. Typing filters by action or key.
+    fn render_shortcut_help(&self, cx: &Context<Self>) -> impl IntoElement {
+        let t = theme();
+        let q = self.shortcut_help.clone().unwrap_or_default().to_lowercase();
+        let km = keymap();
+        let mut rows: Vec<(String, String)> = KeyAction::ALL
+            .iter()
+            .filter(|a| !a.is_palette())
+            .filter_map(|a| km.get(*a).map(|b| (a.label().to_string(), pretty_keystroke(b))))
+            .collect();
+        rows.extend(
+            [
+                ("Move the selection", "↑ ↓ ← →"),
+                ("Extend the selection", "⇧ + arrows"),
+                ("First / last item", "Home / End"),
+                ("Page up / down", "PgUp / PgDn"),
+                ("Show / hide the preview", "Space"),
+                ("System Quick Look", "⇧Space"),
+                ("Rename", "↩"),
+                ("Enclosing folder", "⌫"),
+                ("Move to Trash", "fn ⌫"),
+                ("Clear the selection", "Esc"),
+                ("Filter this folder", "type any letter"),
+                ("Palette actions for a result", "⌘K (in the palette)"),
+            ]
+            .iter()
+            .map(|(a, k)| (a.to_string(), k.to_string())),
+        );
+        rows.retain(|(a, k)| q.is_empty() || a.to_lowercase().contains(&q) || k.to_lowercase().contains(&q));
+        rows.sort_by(|a, b| a.0.cmp(&b.0));
+        let list = div()
+            .id("shortcut-list")
+            .flex_1()
+            .min_h_0()
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .children(rows.into_iter().map(|(action, keys)| {
+                div()
+                    .flex()
+                    .items_center()
+                    .h(px(26.0))
+                    .px_2()
+                    .rounded_md()
+                    .hover(|s| s.bg(rgb(t.hover)))
+                    .child(div().flex_1().min_w_0().truncate().text_color(rgb(t.text)).child(action))
+                    .child(
+                        div()
+                            .flex_none()
+                            .px_1p5()
+                            .rounded_sm()
+                            .bg(rgb(t.hover))
+                            .text_xs()
+                            .text_color(rgb(t.text_muted))
+                            .child(keys),
+                    )
+            }));
+        modal_backdrop(cx.listener(|this, _, _, cx| {
+            this.shortcut_help = None;
+            cx.notify();
+        }))
+        .child(
+            div()
+                .w(px(520.0))
+                .h(px(560.0))
+                .flex()
+                .flex_col()
+                .gap_3()
+                .p_5()
+                .rounded_lg()
+                .bg(rgb(t.surface))
+                .border_1()
+                .border_color(rgb(t.border_strong))
+                .shadow_lg()
+                .text_sm()
+                .on_mouse_down(MouseButton::Left, |_, _, cx: &mut App| cx.stop_propagation())
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(div().flex_1().text_color(rgb(t.text)).font_weight(FontWeight::SEMIBOLD).child("Keyboard Shortcuts"))
+                        .child(div().text_xs().text_color(rgb(t.text_dim)).child("Rebind in Settings · F1 / Esc to close")),
+                )
+                .child(
+                    div()
+                        .h(px(26.0))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .rounded_md()
+                        .bg(rgb(t.bg))
+                        .border_1()
+                        .border_color(rgb(t.border_strong))
+                        .text_color(rgb(if q.is_empty() { t.text_dim } else { t.text }))
+                        .child(if q.is_empty() { "Type to filter…".to_string() } else { q.clone() }),
+                )
+                .child(list),
+        )
+    }
+
+    /// The slim status bar under the panes: shortcut hint, clipboard state,
+    /// and what's selected (with its size) — like Strata's footer.
+    fn render_footer(&self, cx: &Context<Self>) -> AnyElement {
+        let t = theme();
+        let pane = self.active_pane;
+        let tab = self.tab(pane);
+        let total = tab.entries.len();
+        let sel = tab.selection.len();
+        let summary = if sel == 0 {
+            items_label(total)
+        } else {
+            let dir = &tab.current_dir;
+            let (mut files, mut folders, mut bytes) = (0usize, 0usize, 0u64);
+            if sel <= 5000 {
+                for e in tab.entries.iter() {
+                    if tab.selection.contains(&dir.join(&e.name)) {
+                        if e.is_dir {
+                            folders += 1;
+                        } else {
+                            files += 1;
+                            bytes += e.size;
+                        }
+                    }
+                }
+            }
+            let mut parts = Vec::new();
+            if folders > 0 {
+                parts.push(if folders == 1 { "1 folder".to_string() } else { format!("{folders} folders") });
+            }
+            if files > 0 {
+                parts.push(if files == 1 { "1 file".to_string() } else { format!("{files} files") });
+            }
+            let what = if parts.is_empty() { items_label(sel) } else { parts.join(", ") };
+            if bytes > 0 {
+                format!("{what} selected ({}) of {total}", format_size(false, bytes))
+            } else {
+                format!("{what} selected of {total}")
+            }
+        };
+        let clip = self.clipboard_cut.as_ref().map(|c| format!("✂ {} to move", items_label(c.len())));
+        div()
+            .flex_none()
+            .h(px(24.0))
+            .px_3()
+            .flex()
+            .items_center()
+            .gap_3()
+            .border_t_1()
+            .border_color(rgb(t.border))
+            .bg(rgb(t.bg))
+            .text_xs()
+            .text_color(rgb(t.text_dim))
+            .child(
+                div()
+                    .id("footer-help")
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(rgb(t.text)))
+                    .child("F1 · Shortcuts")
+                    .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
+                        this.shortcut_help = Some(String::new());
+                        cx.notify();
+                    })),
+            )
+            .child(div().flex_1())
+            .children(clip.map(|c| {
+                div().px_1p5().rounded_full().bg(Theme::alpha(t.accent, 0x33)).text_color(rgb(t.text)).child(c)
+            }))
+            .child(div().text_color(rgb(t.text_muted)).child(summary))
+            .into_any_element()
     }
 
     // ----- Batch rename -----
@@ -6765,6 +7098,7 @@ impl Shuffle {
             nodes.push(mi_danger("Delete from Server", Some("⌫"), move |this, _, cx| {
                 this.close_context_menu(cx);
                 this.confirm_delete = Some((pane, vec![p.clone()]));
+                this.delete_permanent = false;
                 cx.notify();
             }));
             nodes.push(MenuNode::Sep);
@@ -7218,10 +7552,12 @@ impl Shuffle {
     fn render_confirm_delete(&self, cx: &Context<Self>) -> impl IntoElement {
         let t = theme();
         let (_, paths) = self.confirm_delete.as_ref().expect("only when open");
-        let msg = if paths.len() == 1 {
-            format!("Move “{}” to the Trash?", path_label(&paths[0]))
+        let permanent = self.delete_permanent;
+        let what = if paths.len() == 1 { format!("“{}”", path_label(&paths[0])) } else { format!("{} items", paths.len()) };
+        let msg = if permanent {
+            format!("Delete {what} immediately?")
         } else {
-            format!("Move {} items to the Trash?", paths.len())
+            format!("Move {what} to the Trash?")
         };
 
         div()
@@ -7257,7 +7593,11 @@ impl Shuffle {
                         div()
                             .text_xs()
                             .text_color(rgb(t.text_muted))
-                            .child("They can be recovered from the Trash."),
+                            .child(if permanent {
+                                "This can’t be undone — they won’t go to the Trash."
+                            } else {
+                                "They can be recovered from the Trash."
+                            }),
                     )
                     .child(
                         div()
@@ -7290,7 +7630,7 @@ impl Shuffle {
                                     .text_color(rgb(0xffffff))
                                     .bg(rgb(0xd9544f))
                                     .hover(|s| s.bg(rgb(0xc6433e)))
-                                    .child("Move to Trash")
+                                    .child(if permanent { "Delete" } else { "Move to Trash" })
                                     .on_click(cx.listener(|this, _: &ClickEvent, _, cx| {
                                         this.perform_delete(cx);
                                     })),
@@ -8707,6 +9047,67 @@ impl Shuffle {
         }
     }
 
+    /// Where ⌘V lands: the focused column's folder in Column view, else the
+    /// pane's folder.
+    fn paste_destination(&self, pane: usize) -> PathBuf {
+        let tab = self.tab(pane);
+        if tab.view == ViewMode::Columns && tab.col_active > 0 {
+            if let Some(d) = tab.col_chain.get(tab.col_active - 1) {
+                return d.clone();
+            }
+        }
+        tab.current_dir.clone()
+    }
+
+    /// Extend the selection from the pivot to `delta` rows away (⇧-arrows,
+    /// ⇧Home/End, ⇧PgUp/PgDn) in List/Icons/Gallery.
+    fn extend_selection(&mut self, pane: usize, delta: i32, cx: &mut Context<Self>) {
+        let paths = self.display_paths(pane);
+        if paths.is_empty() {
+            return;
+        }
+        let cur = self.tab(pane).anchor.as_ref().and_then(|a| paths.iter().position(|p| p == a));
+        let pivot = match &self.kb_pivot {
+            Some((p, item)) if *p == pane => paths.iter().position(|x| x == item),
+            _ => None,
+        }
+        .or(cur)
+        .unwrap_or(0);
+        self.kb_pivot = Some((pane, paths[pivot].clone()));
+        let ni = (cur.unwrap_or(pivot) as i32 + delta).clamp(0, paths.len() as i32 - 1) as usize;
+        let (lo, hi) = (pivot.min(ni), pivot.max(ni));
+        let target = paths[ni].clone();
+        {
+            let tab = self.tab_mut(pane);
+            tab.selection = paths[lo..=hi].iter().cloned().collect();
+        }
+        let offset = usize::from(
+            self.tab(pane).find_query.is_none() && prefs().show_parent && self.tab(pane).current_dir.parent().is_some(),
+        );
+        let item = match self.tab(pane).view {
+            ViewMode::Icons => ni / self.icon_cols(pane),
+            _ => ni + offset,
+        };
+        self.tab(pane).scroll_handle.scroll_to_item(item, ScrollStrategy::Center);
+        self.mark_scrolled(pane, cx);
+        self.focus_entry(pane, target, cx);
+        // focus_entry set the anchor; keep the range we just built.
+        cx.notify();
+    }
+
+    /// Rows that fit in a pane's list viewport (for PgUp / PgDn).
+    fn page_rows(&self, pane: usize) -> i32 {
+        let st = self.tab(pane).scroll_handle.0.borrow();
+        let h = f32::from(st.base_handle.bounds().size.height);
+        let per = if self.tab(pane).view == ViewMode::Icons { 108.0 } else { ROW_H };
+        let rows = ((h / per).floor() as i32 - 1).max(1);
+        if self.tab(pane).view == ViewMode::Icons {
+            rows * self.icon_cols(pane) as i32
+        } else {
+            rows
+        }
+    }
+
     /// What a keyboard action acts on: the selection (sorted), else the
     /// focused item.
     fn action_targets(&self, pane: usize) -> Vec<PathBuf> {
@@ -8803,6 +9204,91 @@ impl Shuffle {
                 }
             }
             KeyAction::Undo => self.undo_last(cx),
+            KeyAction::CopyFiles | KeyAction::CutFiles => {
+                let targets = self.action_targets(pane);
+                if !targets.is_empty() && self.tab(pane).remote.is_none() {
+                    copy_files_to_pasteboard(&targets);
+                    let cut = action == KeyAction::CutFiles;
+                    let n = targets.len();
+                    self.clipboard_cut = cut.then_some(targets);
+                    let verb = if cut { "Cut" } else { "Copied" };
+                    self.set_notice(format!("{verb} {}{}", items_label(n), if cut { " — paste to move" } else { "" }), cx);
+                }
+            }
+            KeyAction::PasteFiles | KeyAction::PasteMove => {
+                if self.tab(pane).remote.is_some() {
+                    return;
+                }
+                let srcs = pasteboard_file_paths();
+                if srcs.is_empty() {
+                    self.set_notice("Nothing to paste".into(), cx);
+                    return;
+                }
+                let dest = self.paste_destination(pane);
+                // A paste after ⌘X (same items still on the pasteboard), or
+                // ⌥⌘V, moves; otherwise it copies.
+                let was_cut = self.clipboard_cut.as_ref().is_some_and(|c| {
+                    let mut a = c.clone();
+                    let mut b = srcs.clone();
+                    a.sort();
+                    b.sort();
+                    a == b
+                });
+                if action == KeyAction::PasteMove || was_cut {
+                    self.clipboard_cut = None;
+                    self.move_items(dest, srcs, cx);
+                } else {
+                    self.copy_items(dest, srcs, cx);
+                }
+            }
+            KeyAction::GoParent => {
+                if let Some(parent) = self.tab(pane).current_dir.parent().map(Path::to_path_buf) {
+                    let from = self.tab(pane).current_dir.clone();
+                    self.navigate_in(pane, parent, cx);
+                    self.reveal_in_pane(pane, from, cx);
+                }
+            }
+            KeyAction::OpenNewTab => {
+                if let Some(p) = anchor.filter(|p| p.is_dir()) {
+                    self.new_tab_in(pane, cx);
+                    self.navigate_in(pane, p, cx);
+                }
+            }
+            KeyAction::Back => self.go_back(pane, cx),
+            KeyAction::Forward => self.go_forward(pane, cx),
+            KeyAction::DeletePermanently => {
+                let targets = self.action_targets(pane);
+                if !targets.is_empty() && self.tab(pane).remote.is_none() {
+                    self.confirm_delete = Some((pane, targets));
+                    self.delete_permanent = true;
+                    cx.notify();
+                }
+            }
+            KeyAction::ViewList => self.set_view(pane, ViewMode::List, cx),
+            KeyAction::ViewIcons => self.set_view(pane, ViewMode::Icons, cx),
+            KeyAction::ViewColumns => self.set_view(pane, ViewMode::Columns, cx),
+            KeyAction::ViewGallery => self.set_view(pane, ViewMode::Gallery, cx),
+            KeyAction::GoTo => self.begin_path_edit(pane, window, cx),
+            KeyAction::GoHome => self.navigate_in(pane, home_dir(), cx),
+            KeyAction::GoDesktop => self.navigate_in(pane, home_dir().join("Desktop"), cx),
+            KeyAction::GoDownloads => self.navigate_in(pane, home_dir().join("Downloads"), cx),
+            KeyAction::GoDocuments => self.navigate_in(pane, home_dir().join("Documents"), cx),
+            KeyAction::GoApplications => self.navigate_in(pane, PathBuf::from("/Applications"), cx),
+            KeyAction::NextTab | KeyAction::PrevTab => {
+                let n = self.panes[pane].tabs.len();
+                if n > 1 {
+                    let a = self.panes[pane].active;
+                    let next = if action == KeyAction::NextTab { (a + 1) % n } else { (a + n - 1) % n };
+                    self.select_tab(pane, next, cx);
+                }
+            }
+            KeyAction::QuickLook => self.quick_look(pane),
+            KeyAction::ShortcutHelp => {
+                self.shortcut_help = Some(String::new());
+                cx.notify();
+            }
+            KeyAction::PreviewScrollUp => self.scroll_preview(false, cx),
+            KeyAction::PreviewScrollDown => self.scroll_preview(true, cx),
             KeyAction::Refresh => {
                 let dir = self.tab(pane).current_dir.clone();
                 if self.tab(pane).remote.is_none() && cloud_kind(&dir).is_some() && cloudctl_path().is_some() {
@@ -8860,6 +9346,23 @@ impl Shuffle {
             return;
         }
 
+        // The F1 shortcut reference: typing filters it; F1 / Esc close it.
+        if let Some(q) = self.shortcut_help.as_mut() {
+            match key {
+                "escape" | "f1" => self.shortcut_help = None,
+                "backspace" => {
+                    q.pop();
+                }
+                _ if !cmd => {
+                    if let Some(ch) = ks.key_char.as_ref().filter(|c| !c.chars().any(char::is_control)) {
+                        q.push_str(ch);
+                    }
+                }
+                _ => {}
+            }
+            cx.notify();
+            return;
+        }
         // The batch-rename dialog captures typing while open.
         if self.batch_rename.is_some() {
             self.handle_batch_key(ev, cx);
@@ -8921,6 +9424,7 @@ impl Shuffle {
             // Arrow keys move the selection within the active pane.
             if !cmd {
                 let pane = self.active_pane;
+                let shift = ks.modifiers.shift;
                 let delta = match key {
                     "up" => Some((0, -1)),
                     "down" => Some((0, 1)),
@@ -8928,9 +9432,71 @@ impl Shuffle {
                     "right" => Some((1, 0)),
                     _ => None,
                 };
+                let view = self.tab(pane).view;
+                let linear = view != ViewMode::Columns;
+                // ⇧-arrows extend the selection (List / Icons / Gallery).
+                if let (true, true, Some((dx, dy))) = (shift, linear, delta) {
+                    let step = if view == ViewMode::Icons { dx + dy * self.icon_cols(pane) as i32 } else { dy };
+                    if step != 0 {
+                        self.extend_selection(pane, step, cx);
+                    }
+                    return;
+                }
                 if let Some((dx, dy)) = delta {
+                    self.kb_pivot = None;
                     self.arrow_move(pane, dx, dy, cx);
                     return;
+                }
+                // Home / End / PgUp / PgDn (⇧ extends), like Strata.
+                if linear && matches!(key, "home" | "end" | "pageup" | "pagedown") {
+                    let n = self.display_paths(pane).len() as i32;
+                    let page = self.page_rows(pane);
+                    let step = match key {
+                        "home" => -n,
+                        "end" => n,
+                        "pageup" => -page,
+                        _ => page,
+                    };
+                    if shift {
+                        self.extend_selection(pane, step, cx);
+                    } else {
+                        self.kb_pivot = None;
+                        self.arrow_grid(pane, step, cx);
+                    }
+                    return;
+                }
+                // ⌫ goes up to the enclosing folder (trash is ⌘⌫).
+                if key == "backspace" && !shift {
+                    self.run_key_action(KeyAction::GoParent, window, cx);
+                    return;
+                }
+                // Esc clears the selection.
+                if key == "escape" {
+                    let tab = self.tab_mut(pane);
+                    if !tab.selection.is_empty() {
+                        tab.selection.clear();
+                        self.kb_pivot = None;
+                        cx.notify();
+                    }
+                    return;
+                }
+                // Type-to-filter: a printable key opens the folder filter
+                // with that character (Strata-style). Space is never captured.
+                if !ks.modifiers.control && !ks.modifiers.alt && key != "space" {
+                    if let Some(ch) = ks.key_char.as_ref().filter(|c| {
+                        c.chars().count() == 1 && c.chars().all(|c| !c.is_control() && !c.is_whitespace())
+                    }) {
+                        let ch = ch.clone();
+                        self.open_find(pane, cx);
+                        let tab = self.tab_mut(pane);
+                        if let Some(q) = tab.find_query.as_mut() {
+                            q.push_str(&ch);
+                            tab.find_cursor = q.chars().count();
+                        }
+                        self.recompute_find(pane);
+                        cx.notify();
+                        return;
+                    }
                 }
                 // Space shows / hides the preview pane (Strata-style);
                 // ⇧Space is system Quick Look.
@@ -8962,8 +9528,8 @@ impl Shuffle {
                     }
                 }
             }
-            // Backspace / Delete asks to move the selection to Trash.
-            if !cmd && (key == "backspace" || key == "delete") {
+            // Forward-delete (fn-⌫) still asks to move the selection to Trash.
+            if !cmd && key == "delete" {
                 self.request_delete(self.active_pane, cx);
             }
             return;
@@ -14887,6 +15453,7 @@ impl Render for Shuffle {
         }
 
         root = root.child(main_row);
+        root = root.child(self.render_footer(cx));
 
         // Terminal-mode command bar at the bottom.
         if prefs().terminal {
@@ -14913,6 +15480,9 @@ impl Render for Shuffle {
         }
         if self.batch_rename.is_some() {
             root = root.child(self.render_batch_rename(cx));
+        }
+        if self.shortcut_help.is_some() {
+            root = root.child(self.render_shortcut_help(cx));
         }
         if self.ssh_ask {
             root = root.child(self.render_ssh_prompt(cx));
@@ -20598,10 +21168,9 @@ fn save_keymap(k: &Keymap) {
         if let Some(parent) = file.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let body: String = KeyAction::ALL
-            .iter()
-            .map(|a| format!("{}={}\n", a.key(), k.get(*a).unwrap_or("")))
-            .collect();
+        let mut body = String::from(KEYMAP_VERSION_LINE);
+        body.push('\n');
+        body.extend(KeyAction::ALL.iter().map(|a| format!("{}={}\n", a.key(), k.get(*a).unwrap_or(""))));
         let _ = fs::write(&file, body);
     }
 }
@@ -20679,16 +21248,25 @@ fn load_icon_pack() -> Option<PathBuf> {
 }
 
 /// Load the keymap, starting from defaults and applying saved overrides.
+/// First line of keymap.txt since v2. Files without it come from before
+/// most actions had defaults: there an empty value just meant "unbound by
+/// default", so it's ignored rather than unbinding the new default.
+const KEYMAP_VERSION_LINE: &str = "#v2";
+
 fn load_keymap() -> Keymap {
     let mut k = Keymap::defaults();
     if let Some(file) = config_file("keymap.txt") {
         if let Ok(s) = fs::read_to_string(&file) {
+            let versioned = s.lines().next() == Some(KEYMAP_VERSION_LINE);
             for line in s.lines() {
                 let Some((name, val)) = line.split_once('=') else {
                     continue;
                 };
                 if let Some(a) = KeyAction::ALL.iter().copied().find(|a| a.key() == name.trim()) {
                     let v = val.trim();
+                    if v.is_empty() && !versioned {
+                        continue;
+                    }
                     k.set(a, if v.is_empty() { None } else { Some(v.to_string()) });
                 }
             }
