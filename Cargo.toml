@@ -12,6 +12,10 @@ chrono = "0.4"
 rayon = "1"
 # Fast parallel directory walking for index builds.
 jwalk = "0.8"
+# Palette file search: fzf-syntax multi-term fuzzy matching with match indices.
+nucleo-matcher = "0.3"
+# Fold NFD (macOS filenames) and NFC queries to one form so "café" matches.
+unicode-normalization = "0.1"
 # Decode the TIFF that NSImage hands us for file-type icons.
 image = { version = "0.25", features = ["tiff"] }
 # Fetch real macOS file icons via NSWorkspace (Apple Silicon / AppKit).

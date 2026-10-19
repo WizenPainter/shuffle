@@ -3600,6 +3600,10 @@ struct PaletteItem {
     subtitle: String,
     action: Action,
     is_dir: bool,
+    /// Matched characters to highlight, as byte ranges into `title` /
+    /// `subtitle` (empty when the row didn't come from the fuzzy index).
+    title_hl: Vec<std::ops::Range<usize>>,
+    subtitle_hl: Vec<std::ops::Range<usize>>,
 }
 
 /// One row in the main listing, with the metadata we display.
@@ -3930,6 +3934,15 @@ struct Shuffle {
     palette_scroll: ScrollHandle,
     /// In-memory fuzzy index of ~/ (None until the background build finishes).
     index: Option<Arc<FileIndex>>,
+    /// A (re)build is in flight; when the current index finished building;
+    /// and whether an in-app file operation has since made it stale.
+    index_building: bool,
+    index_built: Option<Instant>,
+    index_dirty: bool,
+    /// How long the last build took (scales the refresh interval).
+    index_build_time: Duration,
+    /// Folder visits behind the palette's frecency ranking.
+    visits: VisitLog,
     context_menu: Option<ContextMenu>,
     /// In-progress inline rename, if any.
     rename: Option<Rename>,
@@ -4324,6 +4337,11 @@ impl Shuffle {
             search_gen: 0,
             palette_scroll: ScrollHandle::new(),
             index: None,
+            index_building: false,
+            index_built: None,
+            index_dirty: false,
+            index_build_time: Duration::ZERO,
+            visits: VisitLog::load(),
             context_menu: None,
             rename: None,
             sort_menu: None,
@@ -6091,6 +6109,7 @@ impl Shuffle {
     }
 
     fn push_entry(&mut self, entry: UndoEntry, fresh: bool) {
+        self.index_dirty = true; // files changed: refresh the palette index soon
         if fresh {
             self.redo_stack.clear();
         }
@@ -8776,19 +8795,57 @@ impl Shuffle {
             )
     }
 
-    /// Build the ~/ fuzzy index on a background thread, then store it.
-    fn build_index(&self, cx: &mut Context<Self>) {
+    /// (Re)build the ~/ fuzzy index on a background thread, then swap it in.
+    /// The previous index keeps serving searches until the new one lands.
+    fn build_index(&mut self, cx: &mut Context<Self>) {
+        if self.index_building {
+            return;
+        }
+        self.index_building = true;
+        self.index_dirty = false;
         cx.spawn(async move |this, cx| {
+            let started = Instant::now();
             let index = cx
                 .background_spawn(async move { FileIndex::build(home_dir()) })
                 .await;
             this.update(cx, |this, cx| {
                 this.index = Some(Arc::new(index));
+                this.index_building = false;
+                this.index_built = Some(Instant::now());
+                this.index_build_time = started.elapsed();
+                // Re-run a live query against the fresh index — unless the
+                // user is already arrowing through the current results.
+                if this.palette_open
+                    && !this.query.trim().is_empty()
+                    && this.selected == 0
+                    && this.palette_actions.is_none()
+                {
+                    this.refresh_palette(cx);
+                }
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Rebuild the index in the background if it has gone stale: older than
+    /// `INDEX_MAX_AGE`, or `INDEX_DIRTY_AGE` after an in-app file operation —
+    /// both stretched for slow walks (big cloud drives) so the rebuild never
+    /// runs more than a small fraction of the time. Called when the palette
+    /// opens, so nothing re-walks the disk while nobody is searching.
+    fn refresh_index_if_stale(&mut self, cx: &mut Context<Self>) {
+        let Some(built) = self.index_built else {
+            return; // the first build is still running
+        };
+        let max_age = if self.index_dirty {
+            INDEX_DIRTY_AGE.max(self.index_build_time * 2)
+        } else {
+            INDEX_MAX_AGE.max(self.index_build_time * 10)
+        };
+        if built.elapsed() >= max_age {
+            self.build_index(cx);
+        }
     }
 
     /// Quietly ask GitHub for the latest published release and, if it's newer
@@ -9034,6 +9091,7 @@ impl Shuffle {
             self.palette_hist_pos = None;
             self.selected = 0;
             self.refresh_palette(cx);
+            self.refresh_index_if_stale(cx);
             window.focus(&self.focus);
         }
         cx.notify();
@@ -9071,6 +9129,8 @@ impl Shuffle {
             subtitle: path.to_string_lossy().into_owned(),
             action: Action::Open(path, true),
             is_dir: true,
+            title_hl: Vec::new(),
+            subtitle_hl: Vec::new(),
         }];
         self.palette_actions = Some(0); // land straight on the actions list
         window.focus(&self.focus);
@@ -9084,6 +9144,8 @@ impl Shuffle {
             subtitle: self.active_tab().current_dir.to_string_lossy().into_owned(),
             action: Action::CopyDir,
             is_dir: true,
+            title_hl: Vec::new(),
+            subtitle_hl: Vec::new(),
         }]
     }
 
@@ -9114,6 +9176,8 @@ impl Shuffle {
                     subtitle: base.to_string_lossy().into_owned(),
                     action: Action::None,
                     is_dir: false,
+                    title_hl: Vec::new(),
+                    subtitle_hl: Vec::new(),
                 }];
                 cx.notify();
                 return;
@@ -9157,6 +9221,8 @@ impl Shuffle {
                         subtitle,
                         action: Action::Open(path, is_dir),
                         is_dir,
+                        title_hl: Vec::new(),
+                        subtitle_hl: Vec::new(),
                     }
                 })
                 .collect();
@@ -9209,6 +9275,7 @@ impl Shuffle {
         self.selected = 0;
         cx.notify();
         let index = self.index.clone();
+        let frecency = self.visits.frecency(&home_dir());
         cx.spawn(async move |this, cx| {
             // Debounce: bail if a newer keystroke superseded us.
             cx.background_executor()
@@ -9221,7 +9288,10 @@ impl Shuffle {
             // In-memory index (fast, true fuzzy) once built; Spotlight until then.
             let qs = q.clone();
             let hits = match index {
-                Some(idx) => cx.background_spawn(async move { idx.search(&qs, 40) }).await,
+                Some(idx) => {
+                    cx.background_spawn(async move { idx.search(&qs, 40, &frecency) })
+                        .await
+                }
                 None => cx.background_spawn(async move { search_filesystem(&qs) }).await,
             };
             this.update(cx, |this, cx| {
@@ -9229,14 +9299,13 @@ impl Shuffle {
                     return;
                 }
                 let mut items = command_matches(&q);
-                items.extend(hits.into_iter().map(|(name, path, is_dir)| {
-                    let subtitle = path.to_string_lossy().into_owned();
-                    PaletteItem {
-                        title: name,
-                        subtitle,
-                        action: Action::Open(path, is_dir),
-                        is_dir,
-                    }
+                items.extend(hits.into_iter().map(|hit| PaletteItem {
+                    title: hit.name,
+                    subtitle: hit.path.to_string_lossy().into_owned(),
+                    action: Action::Open(hit.path, hit.is_dir),
+                    is_dir: hit.is_dir,
+                    title_hl: hit.title_hl,
+                    subtitle_hl: hit.subtitle_hl,
                 }));
                 this.palette_items = items;
                 this.selected = 0;
@@ -10188,7 +10257,12 @@ impl Shuffle {
                             .gap_2()
                             .min_w_0()
                             .flex_1()
-                            .child(div().flex_none().text_color(rgb(t.text)).child(item.title.clone()))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .text_color(rgb(t.text))
+                                    .child(highlighted_text(&item.title, &item.title_hl, t.accent)),
+                            )
                             .child(
                                 div()
                                     .flex_1()
@@ -10196,7 +10270,11 @@ impl Shuffle {
                                     .truncate()
                                     .text_xs()
                                     .text_color(rgb(t.text_muted))
-                                    .child(item.subtitle.clone()),
+                                    .child(highlighted_text(
+                                        &item.subtitle,
+                                        &item.subtitle_hl,
+                                        t.accent,
+                                    )),
                             ),
                     )
                     .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
@@ -10306,7 +10384,17 @@ impl Shuffle {
                     .child(palette_hint("↩", enter_label))
                     .when(has_actions, |f| f.child(palette_hint("⌘K", "Actions")))
                     .child(palette_hint("↑↓", "Navigate"))
-                    .child(palette_hint("esc", "Close")),
+                    .child(palette_hint("esc", "Close"))
+                    // Index status, right-aligned: file results may be
+                    // Spotlight-backed (still indexing) or incomplete.
+                    .children(
+                        match self.index.as_deref() {
+                            None => Some("Indexing…"),
+                            Some(idx) if idx.partial => Some("Partial index"),
+                            _ => None,
+                        }
+                        .map(|note| div().ml_auto().child(note)),
+                    ),
             );
 
         // Wrapper: positions the palette and hosts the ⌘K dropdown OUTSIDE the
@@ -10524,6 +10612,7 @@ impl Shuffle {
         // be treated as a (missing) local folder on next launch.
         if self.tab(pane).remote.is_none() {
             save_last_dir(&dir);
+            self.visits.record(&dir); // palette frecency
             self.recents.retain(|p| p != &dir);
             self.recents.insert(0, dir);
             self.recents.truncate(RECENTS_CAP);
@@ -21646,6 +21735,8 @@ fn command_matches(q: &str) -> Vec<PaletteItem> {
             subtitle: "Open Shuffle settings".to_string(),
             action: Action::OpenSettings,
             is_dir: false,
+            title_hl: Vec::new(),
+            subtitle_hl: Vec::new(),
         });
     }
     out
@@ -21713,22 +21804,72 @@ fn fuzzy_score(needle: &str, haystack: &str) -> Option<i32> {
     Some(score)
 }
 
+use nucleo_matcher::pattern::{Atom, AtomKind, CaseMatching, Normalization, Pattern};
+use nucleo_matcher::{Config as MatchConfig, Matcher, Utf32Str, Utf32String};
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+use std::ops::Range;
+
 /// One entry in the in-memory file index.
 struct IndexEntry {
-    name: String,
     path: PathBuf,
     is_dir: bool,
+    /// The path relative to the index root, folded (`fold_chars`) once at
+    /// build time so a keystroke never re-folds or allocates per entry.
+    key: Utf32String,
+    /// Char offset in `key` where the basename starts.
+    name_start: u32,
+    /// Path components below the root (1 = directly inside it).
+    depth: u16,
+}
+
+impl IndexEntry {
+    fn new(root: &Path, path: PathBuf, is_dir: bool) -> Self {
+        let rel = path.strip_prefix(root).unwrap_or(&path).to_string_lossy();
+        let depth = rel.matches('/').count().saturating_add(1).min(u16::MAX as usize) as u16;
+        let (key, name_start) = fold_key(&rel);
+        IndexEntry {
+            path,
+            is_dir,
+            key,
+            name_start,
+            depth,
+        }
+    }
+
+    /// The display basename (derived on demand; only a few are shown).
+    fn name(&self) -> String {
+        self.path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    }
 }
 
 /// A flat, in-memory index of everything under a root directory, used for fast
 /// fuzzy search without spawning Spotlight.
 struct FileIndex {
     entries: Vec<IndexEntry>,
+    /// What `IndexEntry::key` paths are relative to (home).
+    root: PathBuf,
+    /// The walk hit `INDEX_MAX_ENTRIES` or `INDEX_TIME_BUDGET` and stopped
+    /// early, so some files are missing (surfaced in the palette footer).
+    partial: bool,
 }
+
+/// Hard caps on one index build, so a pathological tree (a huge synced drive,
+/// a runaway generated folder) can't eat unbounded memory or walk forever.
+const INDEX_MAX_ENTRIES: usize = 1_000_000;
+const INDEX_TIME_BUDGET: Duration = Duration::from_secs(300);
+/// Index freshness (see `refresh_index_if_stale`).
+const INDEX_MAX_AGE: Duration = Duration::from_secs(60);
+const INDEX_DIRTY_AGE: Duration = Duration::from_secs(10);
 
 /// Non-hidden directory names we never descend into (huge + irrelevant to file
 /// search). Hidden dirs (dotfiles like .bun, .pyenv, .cargo, .git, .Trash) are
-/// skipped wholesale via `skip_hidden`, which removes the bulk of the noise.
+/// skipped wholesale via `skip_hidden`, which removes the bulk of the noise —
+/// that already covers the dot-named generated trees (.cache, .venv, .npm,
+/// .gradle, .m2, .cargo/registry, .rustup).
 ///
 /// The build-output/dependency dirs below are the big win on a developer
 /// machine: a single `~/Documents/Projects` can hide hundreds of thousands of
@@ -21749,6 +21890,8 @@ const SKIP_DIRS: &[&str] = &[
     // Vendored dependencies.
     "vendor",
     "bower_components",
+    "venv",          // Python virtualenvs not named .venv
+    "site-packages", // installed Python packages
 ];
 
 impl FileIndex {
@@ -21810,52 +21953,638 @@ impl FileIndex {
                 });
             });
 
+        let deadline = Instant::now() + INDEX_TIME_BUDGET;
         let mut entries = Vec::new();
-        for entry in walker {
+        let mut partial = false;
+        let mut walk = walker.into_iter();
+        for seen in 0usize.. {
+            let Some(entry) = walk.next() else { break };
+            if entries.len() >= INDEX_MAX_ENTRIES
+                || (seen % 4096 == 4095 && Instant::now() >= deadline)
+            {
+                partial = true;
+                // Winding the walk down waits on in-flight directory reads
+                // (slow on cloud drives); do that off this thread so the
+                // partial index lands now.
+                std::thread::spawn(move || drop(walk));
+                break;
+            }
             let Ok(e) = entry else { continue };
             if e.depth() == 0 {
                 continue; // the root itself
             }
             let is_dir = e.file_type().is_dir();
-            let name = e.file_name().to_string_lossy().into_owned();
-            entries.push(IndexEntry {
-                name,
-                path: e.path(),
-                is_dir,
-            });
+            entries.push(IndexEntry::new(&root, e.path(), is_dir));
         }
-        FileIndex { entries }
+        FileIndex {
+            entries,
+            root,
+            partial,
+        }
     }
 
-    /// Fuzzy-rank the index against `query` in parallel; return the top `limit`.
-    fn search(&self, query: &str, limit: usize) -> Vec<(String, PathBuf, bool)> {
-        let q: Vec<char> = query.chars().flat_map(|c| c.to_lowercase()).collect();
-        if q.is_empty() {
+    /// Rank the index against `query` in parallel; return the top `limit`.
+    ///
+    /// The query is whitespace-separated terms in any order, with fzf syntax
+    /// (`!neg`, `^prefix`, `suffix$`, `'exact`). Each term is tried against
+    /// the basename first, then the whole home-relative path; every term that
+    /// hits the basename lifts the entry a full tier, so "main shuffle" puts
+    /// `shuffle/src/main.rs` above files merely *under* a "main" folder.
+    /// Within a tier our name signals (exact / stem / prefix, coverage, depth,
+    /// dir) and nucleo's match quality order things, then `frecency` nudges
+    /// near-ties toward frequently/recently visited folders.
+    fn search(&self, query: &str, limit: usize, frecency: &Frecency) -> Vec<SearchHit> {
+        let q = PathQuery::parse(query);
+        if q.terms.is_empty() || limit == 0 {
             return Vec::new();
         }
-        let q_str: String = q.iter().collect();
-        let q_bigrams: Vec<(char, char)> = q.windows(2).map(|w| (w[0], w[1])).collect();
-        let mut scored: Vec<(i32, usize)> = self
-            .entries
-            .par_iter()
-            .enumerate()
-            .filter_map(|(i, e)| {
-                rank_entry(&q, &q_str, &q_bigrams, &e.name, &e.path, e.is_dir).map(|s| (s, i))
-            })
-            .collect();
-        scored.sort_unstable_by(|a, b| {
+        // Over-collect so the frecency nudge can still reorder near-ties.
+        let k = limit * 4;
+        let mut ranked = self.top_k(k, |e, m| rank_index_entry(&q, e, m));
+
+        // Typo fallback (single plain term only): bigram similarity on the
+        // name, for transposed/misspelled queries ("dcouments"). Only worth
+        // the extra pass when the fuzzy pass came up short on names that
+        // actually contain the term — on a big index a misspelling still
+        // "fuzzy-matches" plenty of long names letter by letter, so counting
+        // those would starve the fallback exactly when it's needed.
+        if let Some(bigrams) = &q.typo {
+            let needle = q.terms[0].needle_text();
+            let solid = ranked
+                .iter()
+                .filter(|&&(_, i)| {
+                    let e = &self.entries[i];
+                    name_signals(e.key.slice(e.name_start as usize..), needle) > 0
+                })
+                .count();
+            if solid < limit {
+                let q_len = q.terms[0].needle_text().len() as i64;
+                for (r, i) in self.top_k(k, |e, m| rank_typo(&q, bigrams, q_len, e, m)) {
+                    match ranked.iter_mut().find(|x| x.1 == i) {
+                        Some(x) => x.0 = x.0.max(r),
+                        None => ranked.push((r, i)),
+                    }
+                }
+            }
+        }
+
+        for (r, i) in ranked.iter_mut() {
+            let e = &self.entries[*i];
+            *r += frecency.bias(&e.path, e.is_dir);
+        }
+        ranked.sort_unstable_by(|a, b| {
             b.0.cmp(&a.0)
-                .then_with(|| self.entries[a.1].name.len().cmp(&self.entries[b.1].name.len()))
+                .then_with(|| self.name_len(a.1).cmp(&self.name_len(b.1)))
+                .then_with(|| a.1.cmp(&b.1))
         });
-        scored.truncate(limit);
-        scored
-            .into_iter()
-            .map(|(_, i)| {
-                let e = &self.entries[i];
-                (e.name.clone(), e.path.clone(), e.is_dir)
+        ranked.truncate(limit);
+
+        PATH_MATCHER.with(|m| {
+            let m = &mut *m.borrow_mut();
+            ranked
+                .into_iter()
+                .map(|(_, i)| {
+                    let e = &self.entries[i];
+                    let (title_hl, subtitle_hl) = highlight_hit(&q, &self.root, &e.path, m);
+                    SearchHit {
+                        name: e.name(),
+                        path: e.path.clone(),
+                        is_dir: e.is_dir,
+                        title_hl,
+                        subtitle_hl,
+                    }
+                })
+                .collect()
+        })
+    }
+
+    /// Folded basename length (chars) of entry `i`: the rank tie-breaker.
+    fn name_len(&self, i: usize) -> u32 {
+        let e = &self.entries[i];
+        e.key.len() as u32 - e.name_start
+    }
+
+    /// Score every entry with `rank` across the rayon pool, keeping only the
+    /// best `k` per chunk (bounded heaps, merged) instead of sorting every
+    /// match. Returns (rank, entry index), best first; ties break on shorter
+    /// basename, then index, so results are deterministic.
+    fn top_k(
+        &self,
+        k: usize,
+        rank: impl Fn(&IndexEntry, &mut Matcher) -> Option<i64> + Sync,
+    ) -> Vec<(i64, usize)> {
+        const CHUNK: usize = 4096;
+        self.entries
+            .par_chunks(CHUNK)
+            .enumerate()
+            .map(|(c, chunk)| {
+                PATH_MATCHER.with(|m| {
+                    let m = &mut *m.borrow_mut();
+                    let mut top = TopK::new(k);
+                    for (j, e) in chunk.iter().enumerate() {
+                        if let Some(r) = rank(e, m) {
+                            top.push(r, self.name_len(c * CHUNK + j), c * CHUNK + j);
+                        }
+                    }
+                    top
+                })
             })
+            .reduce(|| TopK::new(k), TopK::merge)
+            .into_sorted()
+    }
+}
+
+thread_local! {
+    /// One nucleo matcher (and its scratch matrices) per search thread,
+    /// reused across keystrokes instead of reallocated per query.
+    static PATH_MATCHER: RefCell<Matcher> =
+        RefCell::new(Matcher::new(MatchConfig::DEFAULT.match_paths()));
+}
+
+/// One ranked index hit, with match ranges (byte offsets into `name` and the
+/// full path string) for highlighting in the palette.
+struct SearchHit {
+    name: String,
+    path: PathBuf,
+    is_dir: bool,
+    title_hl: Vec<Range<usize>>,
+    subtitle_hl: Vec<Range<usize>>,
+}
+
+/// Bounded best-`cap` collector: a min-heap whose top is the current worst
+/// keeper, keyed on (rank, shorter name, lower index) for deterministic ties.
+struct TopK {
+    cap: usize,
+    heap: BinaryHeap<Reverse<(i64, Reverse<u32>, Reverse<usize>)>>,
+}
+
+impl TopK {
+    fn new(cap: usize) -> Self {
+        TopK {
+            cap,
+            heap: BinaryHeap::with_capacity(cap.min(1024) + 1),
+        }
+    }
+
+    fn push(&mut self, rank: i64, name_len: u32, idx: usize) {
+        let item = Reverse((rank, Reverse(name_len), Reverse(idx)));
+        if self.heap.len() < self.cap {
+            self.heap.push(item);
+        } else if self.heap.peek().is_some_and(|worst| item < *worst) {
+            self.heap.pop();
+            self.heap.push(item);
+        }
+    }
+
+    fn merge(mut self, other: TopK) -> TopK {
+        for Reverse((r, Reverse(n), Reverse(i))) in other.heap {
+            self.push(r, n, i);
+        }
+        self
+    }
+
+    fn into_sorted(self) -> Vec<(i64, usize)> {
+        // Ascending over `Reverse` = best first.
+        self.heap
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse((r, _, Reverse(i)))| (r, i))
             .collect()
     }
+}
+
+/// Every query term that matches the basename (not just the path) is worth a
+/// whole tier: name matches always outrank path-only ones, whatever the
+/// within-tier signals or frecency say.
+const NAME_TERM_TIER: i64 = 1 << 32;
+/// Typo-fallback hits compete inside the (single-term) name tier, scored
+/// on a similarity × 1500 scale: above letter-by-letter subsequence matches,
+/// below any name that contains the query outright (+1500 and up).
+const TYPO_TIER: i64 = NAME_TERM_TIER;
+/// Frecency may reorder similar matches, never override real text signals:
+/// at most a few matched characters' / path components' worth.
+const MAX_FRECENCY_BIAS: f64 = 48.0;
+const FRECENCY_BIAS_SCALE: f64 = 12.0;
+
+/// A parsed palette query: folded, then split into nucleo atoms.
+struct PathQuery {
+    /// Terms that must match (basename or path), in any order.
+    terms: Vec<Atom>,
+    /// `!term`s: an entry whose path contains any of these is dropped.
+    exclusions: Vec<Atom>,
+    /// Bigrams of the needle when the query is one plain fuzzy term without
+    /// a `/` (a name, not a path) — the only shape the typo fallback fits.
+    typo: Option<Vec<(char, char)>>,
+}
+
+impl PathQuery {
+    fn parse(query: &str) -> Self {
+        // Both sides are pre-folded, so case is already uniform — but we still
+        // ask for `Ignore`: nucleo-matcher 0.3's case-sensitive ASCII path for
+        // `^prefix`/`suffix$` compares the whole haystack instead of the
+        // anchored slice, so those atoms would never match. Smart
+        // normalization lets a plain "cafe" match "café".
+        let (exclusions, terms): (Vec<Atom>, Vec<Atom>) = Pattern::parse(
+            &fold_query(query),
+            CaseMatching::Ignore,
+            Normalization::Smart,
+        )
+        .atoms
+        .into_iter()
+        .partition(|a| a.negative);
+        let typo = (terms.len() == 1 && terms[0].kind == AtomKind::Fuzzy)
+            .then(|| terms[0].needle_text().chars().collect::<Vec<char>>())
+            .filter(|q| !q.contains(&'/'))
+            .map(|q| q.windows(2).map(|w| (w[0], w[1])).collect());
+        PathQuery {
+            terms,
+            exclusions,
+            typo,
+        }
+    }
+}
+
+/// Text rank of one entry, or `None` if a term misses or an exclusion hits.
+fn rank_index_entry(q: &PathQuery, e: &IndexEntry, m: &mut Matcher) -> Option<i64> {
+    let key = e.key.slice(..);
+    let name = e.key.slice(e.name_start as usize..);
+    for x in &q.exclusions {
+        x.score(key, m)?; // negative atoms score None when they match
+    }
+    let mut name_terms = 0i64;
+    let mut name_needles = 0i64;
+    let mut score = 0i64;
+    for t in &q.terms {
+        if let Some(s) = term_score(t, name, m) {
+            name_terms += 1;
+            name_needles += t.needle_text().len() as i64;
+            score += s as i64 + name_signals(name, t.needle_text());
+        } else {
+            score += term_score(t, key, m)? as i64;
+        }
+    }
+    // Coverage: the closer the name's length is to what matched it, the better
+    // ("Documents" beats "DocumentSymbolProvider.js" for "documents").
+    score -= (name.len() as i64 - name_needles).max(0) * 4;
+    // Depth: shallower paths (closer to home) rank higher.
+    score -= e.depth as i64 * 8;
+    if e.is_dir {
+        score += 40;
+    }
+    Some(name_terms * NAME_TERM_TIER + score)
+}
+
+/// `t`'s score on `hay`, or `None` if it misses or is too scattered.
+fn term_score(t: &Atom, hay: Utf32Str, m: &mut Matcher) -> Option<u16> {
+    t.score(hay, m).filter(|_| tight_enough(t, hay))
+}
+
+/// A fuzzy term only counts if its letters sit within a window of about
+/// twice its length. Otherwise the "match" is a few letters strewn across a
+/// long name or path ("finder2" through "…Finance and Risk… (2008).pdf") —
+/// and a scattered *name* match would even earn a whole tier. Nucleo's
+/// boundary bonuses score such strays about as well as real abbreviations,
+/// so this checks the span instead. Anchored/substring atoms are contiguous.
+fn tight_enough(t: &Atom, hay: Utf32Str) -> bool {
+    if t.kind != AtomKind::Fuzzy {
+        return true;
+    }
+    let needle = t.needle_text();
+    let (h, n) = (hay.len() as u32, needle.len() as u32);
+    let limit = 2 * n + 3;
+    if n <= 1 || h <= limit {
+        return true; // the whole haystack fits the window
+    }
+    // Minimum-window subsequence: a forward pass finds the next match end,
+    // a backward pass from there its latest start; then slide past it.
+    let mut found = false;
+    let mut start = 0;
+    loop {
+        let (mut i, mut j) = (start, 0);
+        while i < h && j < n {
+            if hay.get(i) == needle.get(j) {
+                j += 1;
+            }
+            i += 1;
+        }
+        if j < n {
+            break;
+        }
+        found = true;
+        let end = i - 1;
+        let (mut k, mut j) = (i, n);
+        while j > 0 {
+            k -= 1;
+            if hay.get(k) == needle.get(j - 1) {
+                j -= 1;
+            }
+        }
+        if end - k < limit {
+            return true;
+        }
+        start = k + 1;
+    }
+    // A match nucleo found that a plain char scan can't (normalization,
+    // e.g. "cafe" vs "café"): trust nucleo.
+    !found
+}
+
+/// Our strong basename signals for one term that matched the name: exact
+/// name, stem (name without extension), prefix, substring.
+fn name_signals(name: Utf32Str, needle: Utf32Str) -> i64 {
+    let mut s = 0;
+    if utf32_eq(name, needle) {
+        s += 100_000; // exact name match — always wins
+    } else if let Some(dot) = name.chars().enumerate().filter(|&(_, c)| c == '.').last() {
+        if dot.0 > 0 && utf32_eq(name.slice(..dot.0), needle) {
+            s += 60_000; // name without extension matches
+        }
+    }
+    if utf32_starts_with(name, needle) {
+        s += 5_000;
+    } else if (1..name.len()).any(|i| utf32_starts_with(name.slice(i..), needle)) {
+        s += 1_500;
+    }
+    s
+}
+
+/// Typo-fallback rank: bigram similarity of the (single) term to the name.
+fn rank_typo(
+    q: &PathQuery,
+    bigrams: &[(char, char)],
+    q_len: i64,
+    e: &IndexEntry,
+    m: &mut Matcher,
+) -> Option<i64> {
+    let name = e.key.slice(e.name_start as usize..);
+    let sim = name_bigram_dice(bigrams, name);
+    if sim < 0.5 {
+        return None;
+    }
+    let key = e.key.slice(..);
+    for x in &q.exclusions {
+        x.score(key, m)?;
+    }
+    let mut score = TYPO_TIER + (sim * 1500.0) as i64;
+    score -= (name.len() as i64 - q_len).max(0) * 4; // coverage
+    score -= e.depth as i64 * 8; // depth
+    if e.is_dir {
+        score += 40;
+    }
+    Some(score)
+}
+
+fn utf32_eq(a: Utf32Str, b: Utf32Str) -> bool {
+    a.len() == b.len() && a.chars().eq(b.chars())
+}
+
+fn utf32_starts_with(h: Utf32Str, n: Utf32Str) -> bool {
+    h.len() >= n.len() && h.chars().zip(n.chars()).all(|(a, b)| a == b)
+}
+
+/// Fold text for matching: lowercase, then canonically compose adjacent pairs
+/// (NFC-style), so the decomposed names macOS file systems hand back
+/// ("cafe" + U+0301) equal a typed, precomposed "café". With `spans`, also
+/// records each folded char's byte range in `text`, to map match indices back
+/// onto the original string for highlighting.
+fn fold_chars(text: &str, mut spans: Option<&mut Vec<Range<usize>>>) -> Vec<char> {
+    let mut out: Vec<char> = Vec::with_capacity(text.len());
+    for (start, ch) in text.char_indices() {
+        let end = start + ch.len_utf8();
+        for lc in ch.to_lowercase() {
+            let composed = out
+                .last()
+                .and_then(|&prev| unicode_normalization::char::compose(prev, lc));
+            if let Some(c) = composed {
+                *out.last_mut().unwrap() = c;
+                if let Some(last) = spans.as_deref_mut().and_then(|s| s.last_mut()) {
+                    last.end = end;
+                }
+            } else {
+                out.push(lc);
+                if let Some(s) = spans.as_deref_mut() {
+                    s.push(start..end);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// `fold_chars` as a string (for queries); ASCII takes a fast path.
+fn fold_query(text: &str) -> String {
+    if text.is_ascii() {
+        return text.to_ascii_lowercase();
+    }
+    fold_chars(text, None).into_iter().collect()
+}
+
+/// Fold a home-relative path into a matcher key + basename char offset.
+fn fold_key(rel: &str) -> (Utf32String, u32) {
+    if rel.is_ascii() {
+        let s = rel.to_ascii_lowercase();
+        let name_start = s.rfind('/').map_or(0, |i| i + 1) as u32;
+        return (Utf32String::Ascii(s.into_boxed_str()), name_start);
+    }
+    let chars = fold_chars(rel, None);
+    let name_start = chars.iter().rposition(|&c| c == '/').map_or(0, |i| i + 1) as u32;
+    // Built directly (not via `From<&str>`) so nucleo's grapheme collapsing
+    // can't shift char offsets away from what `fold_chars` produced.
+    let key = if chars.iter().all(char::is_ascii) {
+        Utf32String::Ascii(chars.into_iter().collect::<String>().into_boxed_str())
+    } else {
+        Utf32String::Unicode(chars.into_boxed_slice())
+    };
+    (key, name_start)
+}
+
+/// Match ranges for one hit as byte ranges into its title (the basename) and
+/// subtitle (the full path): basename-matched terms light up the title,
+/// path-only terms the subtitle. Re-runs the terms (with indices) on just
+/// the few displayed hits, so the hot scoring loop never tracks positions.
+fn highlight_hit(
+    q: &PathQuery,
+    root: &Path,
+    path: &Path,
+    m: &mut Matcher,
+) -> (Vec<Range<usize>>, Vec<Range<usize>>) {
+    let full = path.to_string_lossy();
+    let rel = path.strip_prefix(root).unwrap_or(path).to_string_lossy();
+    let rel_off = full.len().saturating_sub(rel.len());
+    let name_len = path.file_name().map_or(0, |n| n.to_string_lossy().len());
+    let name_off = full.len().saturating_sub(name_len);
+
+    let mut spans = Vec::with_capacity(rel.len());
+    let chars = fold_chars(&rel, Some(&mut spans));
+    let name_start = chars.iter().rposition(|&c| c == '/').map_or(0, |i| i + 1);
+    let hay = Utf32Str::Unicode(&chars);
+    let name = hay.slice(name_start..);
+
+    let (mut in_name, mut in_path, mut idx) = (Vec::new(), Vec::new(), Vec::new());
+    for t in &q.terms {
+        idx.clear();
+        if t.indices(name, m, &mut idx).is_some() && tight_enough(t, name) {
+            in_name.extend(idx.iter().map(|&i| name_start + i as usize));
+            continue;
+        }
+        idx.clear();
+        if t.indices(hay, m, &mut idx).is_some() && tight_enough(t, hay) {
+            in_path.extend(idx.iter().map(|&i| i as usize));
+        }
+    }
+    // Byte offsets: rel-relative spans → full path → (title) basename.
+    let to_ranges = |mut ix: Vec<usize>, shift: isize| -> Vec<Range<usize>> {
+        ix.sort_unstable();
+        ix.dedup();
+        let mut out: Vec<Range<usize>> = Vec::new();
+        for r in ix.into_iter().filter_map(|i| spans.get(i)) {
+            let r = (r.start as isize + shift) as usize..(r.end as isize + shift) as usize;
+            match out.last_mut() {
+                Some(last) if r.start <= last.end => last.end = last.end.max(r.end),
+                _ => out.push(r),
+            }
+        }
+        out
+    };
+    let title = to_ranges(in_name, rel_off as isize - name_off as isize);
+    let subtitle = to_ranges(in_path, rel_off as isize);
+    (title, subtitle)
+}
+
+/// Read-only frecency snapshot for search workers (which can't reach the
+/// UI-owned `VisitLog`): visited folders → visit score.
+#[derive(Default)]
+struct Frecency {
+    root: PathBuf,
+    folders: HashMap<PathBuf, f64>,
+}
+
+impl Frecency {
+    /// Bias for one hit from its nearest visited ancestor (decaying by half
+    /// per level up), capped at `MAX_FRECENCY_BIAS`. The root itself (and
+    /// anything above it) is ignored — it would bias every result equally.
+    fn bias(&self, path: &Path, is_dir: bool) -> i64 {
+        if self.folders.is_empty() {
+            return 0;
+        }
+        let nearest = if is_dir { Some(path) } else { path.parent() };
+        let root_len = self.root.as_os_str().len();
+        nearest
+            .into_iter()
+            .flat_map(Path::ancestors)
+            .take_while(|dir| dir.as_os_str().len() > root_len)
+            .enumerate()
+            .find_map(|(up, dir)| self.folders.get(dir).map(|f| f * 0.5f64.powi(up as i32)))
+            .map_or(0, |f| (f.ln_1p() * FRECENCY_BIAS_SCALE).min(MAX_FRECENCY_BIAS) as i64)
+    }
+}
+
+/// Persisted folder-visit log (`visits.txt`, `rank\tunix_secs\tpath` lines)
+/// behind palette frecency. Each visit adds 1 to a folder's rank; ranks are
+/// scaled down together once their total grows large (zoxide-style aging),
+/// and recency multiplies the rank at query time.
+#[derive(Default)]
+struct VisitLog {
+    folders: HashMap<PathBuf, (f64, u64)>,
+}
+
+const VISITS_FILE: &str = "visits.txt";
+const VISITS_CAP: usize = 500;
+const VISITS_MAX_TOTAL_RANK: f64 = 2_000.0;
+
+impl VisitLog {
+    fn load() -> Self {
+        let mut folders = HashMap::new();
+        if let Some(text) = config_file(VISITS_FILE).and_then(|f| fs::read_to_string(f).ok()) {
+            for line in text.lines() {
+                let mut parts = line.splitn(3, '\t');
+                let (Some(rank), Some(secs), Some(path)) = (parts.next(), parts.next(), parts.next())
+                else {
+                    continue;
+                };
+                if let (Ok(rank), Ok(secs)) = (rank.parse::<f64>(), secs.parse::<u64>()) {
+                    folders.insert(PathBuf::from(path), (rank, secs));
+                }
+            }
+        }
+        VisitLog { folders }
+    }
+
+    fn record(&mut self, dir: &Path) {
+        let now = unix_now();
+        let slot = self.folders.entry(dir.to_path_buf()).or_insert((0.0, now));
+        slot.0 += 1.0;
+        slot.1 = now;
+        let total: f64 = self.folders.values().map(|v| v.0).sum();
+        if total > VISITS_MAX_TOTAL_RANK {
+            let factor = 0.9 * VISITS_MAX_TOTAL_RANK / total;
+            self.folders.retain(|_, v| {
+                v.0 *= factor;
+                v.0 >= 0.5
+            });
+        }
+        if self.folders.len() > VISITS_CAP {
+            let mut scored: Vec<(f64, PathBuf)> = self
+                .folders
+                .iter()
+                .map(|(p, &(r, t))| (visit_frecency(r, t, now), p.clone()))
+                .collect();
+            scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for (_, p) in scored.into_iter().take(self.folders.len() - VISITS_CAP) {
+                self.folders.remove(&p);
+            }
+        }
+        self.save();
+    }
+
+    fn save(&self) {
+        let Some(path) = config_file(VISITS_FILE) else {
+            return;
+        };
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let mut out = String::new();
+        for (p, (rank, secs)) in &self.folders {
+            out.push_str(&format!("{rank:.3}\t{secs}\t{}\n", p.to_string_lossy()));
+        }
+        let _ = fs::write(&path, out);
+    }
+
+    /// Snapshot scores (rank × recency) for a search over `root`.
+    fn frecency(&self, root: &Path) -> Frecency {
+        let now = unix_now();
+        Frecency {
+            root: root.to_path_buf(),
+            folders: self
+                .folders
+                .iter()
+                .filter(|(p, _)| p.starts_with(root) && p.as_path() != root)
+                .map(|(p, &(r, t))| (p.clone(), visit_frecency(r, t, now)))
+                .collect(),
+        }
+    }
+}
+
+/// Recency-weighted visit score: recent visits count for much more.
+fn visit_frecency(rank: f64, last: u64, now: u64) -> f64 {
+    let age = now.saturating_sub(last);
+    let mult = if age < 3_600 {
+        4.0
+    } else if age < 86_400 {
+        2.0
+    } else if age < 7 * 86_400 {
+        0.5
+    } else {
+        0.25
+    };
+    rank * mult
+}
+
+fn unix_now() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn is_word_boundary(c: char) -> bool {
@@ -21863,10 +22592,10 @@ fn is_word_boundary(c: char) -> bool {
 }
 
 /// Allocation-free Sørensen–Dice over character bigrams: query bigrams are
-/// pre-computed (lowercased); the name is lowercased on the fly. Tolerant of
-/// typos/transpositions (e.g. "dcouments" vs "documents"). Fast enough to run
-/// on every index entry that fails the subsequence test.
-fn name_bigram_dice(q_bigrams: &[(char, char)], name: &str) -> f32 {
+/// pre-computed from the folded query; `name` is a folded index basename.
+/// Tolerant of typos/transpositions (e.g. "dcouments" vs "documents"). Fast
+/// enough to run on every index entry when the fuzzy pass comes up short.
+fn name_bigram_dice(q_bigrams: &[(char, char)], name: Utf32Str) -> f32 {
     let qn = q_bigrams.len();
     if qn == 0 {
         return 0.0;
@@ -21876,8 +22605,7 @@ fn name_bigram_dice(q_bigrams: &[(char, char)], name: &str) -> f32 {
     let mut inter = 0usize;
     let mut name_bigrams = 0usize;
     let mut prev: Option<char> = None;
-    for ch in name.chars() {
-        let lc = ch.to_ascii_lowercase();
+    for lc in name.chars() {
         if let Some(p) = prev {
             name_bigrams += 1;
             for i in 0..cap {
@@ -21896,38 +22624,10 @@ fn name_bigram_dice(q_bigrams: &[(char, char)], name: &str) -> f32 {
     2.0 * inter as f32 / (qn + name_bigrams) as f32
 }
 
-/// Rank one candidate: prefer a real subsequence match (`score_entry`); if it
-/// isn't a subsequence, fall back to typo-tolerant bigram similarity so
-/// transposed/misspelled queries still surface the right file.
-fn rank_entry(
-    q: &[char],
-    q_str: &str,
-    q_bigrams: &[(char, char)],
-    name: &str,
-    path: &Path,
-    is_dir: bool,
-) -> Option<i32> {
-    if let Some(s) = score_entry(q, q_str, name, path, is_dir) {
-        return Some(s);
-    }
-    let sim = name_bigram_dice(q_bigrams, name);
-    if sim < 0.5 {
-        return None;
-    }
-    let mut score = (sim * 1500.0) as i32;
-    let name_len = name.chars().count() as i32;
-    score -= (name_len - q.len() as i32).max(0) * 4; // coverage
-    score -= path.components().count() as i32 * 8; // depth
-    if is_dir {
-        score += 40;
-    }
-    Some(score)
-}
-
 /// Full ranking of one candidate: subsequence gate + strong exact/prefix
 /// bonuses, a coverage penalty (favor names close to the query length), and a
-/// path-depth penalty (shallower = closer to home = ranked higher). Shared by
-/// the in-memory index and the Spotlight fallback so ranking is consistent.
+/// path-depth penalty (shallower = closer to home = ranked higher). Used by
+/// the Spotlight fallback; mirrors the index's within-tier name signals.
 /// `q_str` is the lowercased query string; `q` its chars.
 fn score_entry(q: &[char], q_str: &str, name: &str, path: &Path, is_dir: bool) -> Option<i32> {
     let mut score = index_score(q, name)?;
@@ -22050,7 +22750,7 @@ fn palette_operator_search(
     } else if let Some(idx) = index {
         cands.reserve(idx.entries.len());
         for e in &idx.entries {
-            cands.push((e.name.clone(), e.path.clone(), e.is_dir));
+            cands.push((e.name(), e.path.clone(), e.is_dir));
         }
     }
 
@@ -22107,6 +22807,8 @@ fn palette_operator_search(
             subtitle: display_path(&path),
             action: Action::Open(path, is_dir),
             is_dir,
+            title_hl: Vec::new(),
+            subtitle_hl: Vec::new(),
         });
         if out.len() >= 40 {
             break;
@@ -22115,7 +22817,7 @@ fn palette_operator_search(
     out
 }
 
-fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
+fn search_filesystem(query: &str) -> Vec<SearchHit> {
     let mut child = match Command::new("mdfind")
         .arg("-name")
         .arg(query)
@@ -22160,9 +22862,37 @@ fn search_filesystem(query: &str) -> Vec<(String, PathBuf, bool)> {
         .into_iter()
         .map(|(_, name, path)| {
             let is_dir = path.is_dir();
-            (name, path, is_dir)
+            SearchHit {
+                name,
+                path,
+                is_dir,
+                title_hl: Vec::new(),
+                subtitle_hl: Vec::new(),
+            }
         })
         .collect()
+}
+
+/// Palette row text with matched characters (byte `ranges`) drawn bold in the
+/// accent color. Plain text when nothing matched.
+fn highlighted_text(text: &str, ranges: &[std::ops::Range<usize>], accent: u32) -> AnyElement {
+    let valid = |r: &&std::ops::Range<usize>| {
+        r.start < r.end
+            && r.end <= text.len()
+            && text.is_char_boundary(r.start)
+            && text.is_char_boundary(r.end)
+    };
+    if !ranges.iter().any(|r| valid(&r)) {
+        return text.to_string().into_any_element();
+    }
+    let style = gpui::HighlightStyle {
+        color: Some(rgb(accent).into()),
+        font_weight: Some(FontWeight::BOLD),
+        ..Default::default()
+    };
+    gpui::StyledText::new(text.to_string())
+        .with_highlights(ranges.iter().filter(valid).map(|r| (r.clone(), style)))
+        .into_any_element()
 }
 
 /// A short, human label for a path (last component; "/" → "Macintosh HD").
@@ -22866,19 +23596,20 @@ fn main() {
             t0.elapsed().as_millis()
         );
         let t1 = std::time::Instant::now();
-        let hits = index.search(&args[2], 10);
+        let hits = index.search(&args[2], 10, &VisitLog::load().frecency(&home_dir()));
         eprintln!(
-            "search {:?}: {} hits in {} µs",
+            "search {:?}: {} hits in {} µs{}",
             args[2],
             hits.len(),
-            t1.elapsed().as_micros()
+            t1.elapsed().as_micros(),
+            if index.partial { " (partial index)" } else { "" }
         );
-        for (name, path, is_dir) in hits {
+        for hit in hits {
             eprintln!(
                 "  {} {:<28} {}",
-                if is_dir { "DIR " } else { "file" },
-                name,
-                path.display()
+                if hit.is_dir { "DIR " } else { "file" },
+                hit.name,
+                hit.path.display()
             );
         }
         return;
@@ -23081,15 +23812,11 @@ fn main() {
 
     // Synthetic, disk-free validation of typo ranking.
     if args.len() >= 2 && args[1] == "--typo-test" {
-        let mk = |p: &str, is_dir: bool| {
-            let path = PathBuf::from(p);
-            IndexEntry {
-                name: path.file_name().unwrap().to_string_lossy().into_owned(),
-                path,
-                is_dir,
-            }
-        };
+        let root = PathBuf::from("/Users/guzma");
+        let mk = |p: &str, is_dir: bool| IndexEntry::new(&root, PathBuf::from(p), is_dir);
         let index = FileIndex {
+            root: root.clone(),
+            partial: false,
             entries: vec![
                 mk("/Users/guzma/Documents", true),
                 mk("/Users/guzma/Downloads", true),
@@ -23100,11 +23827,11 @@ fn main() {
             ],
         };
         for q in ["documents", "dcouments", "documnets", "dwnloads", "musc"] {
-            let hits = index.search(q, 3);
+            let hits = index.search(q, 3, &Frecency::default());
             eprintln!(
                 "{:?} -> {:?}",
                 q,
-                hits.iter().map(|h| h.0.clone()).collect::<Vec<_>>()
+                hits.iter().map(|h| h.name.clone()).collect::<Vec<_>>()
             );
         }
         return;
@@ -24000,5 +24727,175 @@ mod tests {
         for k in [SortKey::None, SortKey::Name, SortKey::Kind, SortKey::Modified, SortKey::Created, SortKey::Size] {
             assert!(sort_key_from_name(sort_key_name(k)) == Some(k));
         }
+    }
+
+    /// A synthetic index rooted at `/u` (paths given relative to it).
+    fn test_index(paths: &[(&str, bool)]) -> FileIndex {
+        let root = PathBuf::from("/u");
+        FileIndex {
+            entries: paths
+                .iter()
+                .map(|&(p, is_dir)| IndexEntry::new(&root, root.join(p), is_dir))
+                .collect(),
+            root,
+            partial: false,
+        }
+    }
+
+    /// Home-relative paths of the hits for `q`, best first.
+    fn hits(index: &FileIndex, q: &str) -> Vec<String> {
+        index
+            .search(q, 10, &Frecency::default())
+            .into_iter()
+            .map(|h| h.path.strip_prefix("/u").unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn search_multi_term_any_order() {
+        let index = test_index(&[
+            ("Projects/shuffle/src/main.rs", false),
+            ("Projects/other/main.rs", false),
+            ("Projects/shuffle/README.md", false),
+        ]);
+        for q in ["main shuffle", "shuffle main", "src shuf main"] {
+            assert_eq!(hits(&index, q), vec!["Projects/shuffle/src/main.rs"], "{q}");
+        }
+    }
+
+    #[test]
+    fn search_name_terms_outrank_path_terms() {
+        let index = test_index(&[
+            ("a/b/c/report/notes.txt", false),
+            ("deep/er/still/report.txt", false),
+        ]);
+        // "report" hits the second's basename (one tier up) despite depth.
+        assert_eq!(hits(&index, "report")[0], "deep/er/still/report.txt");
+        // A path term narrows to files under a matching folder.
+        assert_eq!(hits(&index, "report notes"), vec!["a/b/c/report/notes.txt"]);
+    }
+
+    #[test]
+    fn search_ignores_scattered_matches() {
+        let index = test_index(&[
+            (
+                "books/(Mathematics, Finance and Risk) Mark S. Joshi - The Concepts \
+                 and Practice of Mathematical Finance (2008).pdf",
+                false,
+            ),
+            ("Documents/Projects/finder2/src/main.rs", false),
+            ("Documents/Projects/finder2/src", true),
+            ("projects", true),
+        ]);
+        assert_eq!(hits(&index, "finder2 main.rs"), vec!["Documents/Projects/finder2/src/main.rs"]);
+        // A path-shaped single term matches the path, with no typo noise.
+        assert_eq!(hits(&index, "projects/finder2/src")[0], "Documents/Projects/finder2/src");
+        // Real abbreviations still count.
+        assert_eq!(hits(&index, "fndr2")[0], "Documents/Projects/finder2/src");
+    }
+
+    #[test]
+    fn search_fzf_operators() {
+        let index = test_index(&[
+            ("a/notes.md", false),
+            ("a/notes.txt", false),
+            ("a/old-notes.md", false),
+            ("old/todo.md", false),
+        ]);
+        let sorted = |q: &str| {
+            let mut v = hits(&index, q);
+            v.sort();
+            v
+        };
+        assert_eq!(sorted("notes !old"), vec!["a/notes.md", "a/notes.txt"]);
+        assert_eq!(sorted("^notes"), vec!["a/notes.md", "a/notes.txt"]);
+        assert_eq!(sorted("notes md$"), vec!["a/notes.md", "a/old-notes.md"]);
+        assert_eq!(hits(&index, "'d-no"), vec!["a/old-notes.md"]);
+        // Negation only: nothing to rank.
+        assert!(hits(&index, "!old").is_empty());
+    }
+
+    #[test]
+    fn search_folds_nfd_and_nfc() {
+        let index = test_index(&[
+            ("Docs/cafe\u{301}.txt", false), // NFD, as macOS stores it
+            ("Docs/Me\u{301}xico", true),
+            ("Docs/plain.txt", false),
+        ]);
+        assert_eq!(hits(&index, "café"), vec!["Docs/cafe\u{301}.txt"]);
+        assert_eq!(hits(&index, "CAFÉ"), vec!["Docs/cafe\u{301}.txt"]);
+        assert_eq!(hits(&index, "cafe\u{301}"), vec!["Docs/cafe\u{301}.txt"]);
+        assert_eq!(hits(&index, "cafe")[0], "Docs/cafe\u{301}.txt");
+        assert_eq!(hits(&index, "méx")[0], "Docs/Me\u{301}xico");
+        assert_eq!(fold_query("Cafe\u{301}"), "café");
+    }
+
+    #[test]
+    fn search_stem_and_exact_signals() {
+        let index = test_index(&[
+            ("x/report-final.pdf", false),
+            ("x/y/report.pdf", false),
+            ("x/reports", true),
+        ]);
+        let got = hits(&index, "report");
+        assert_eq!(got[0], "x/y/report.pdf");
+        assert!(got.iter().position(|p| p == "x/report-final.pdf").unwrap() > 0);
+        assert_eq!(hits(&index, "reports")[0], "x/reports");
+    }
+
+    #[test]
+    fn search_typo_fallback() {
+        let index = test_index(&[
+            ("Documents", true),
+            ("Downloads", true),
+            ("Music", true),
+            ("Documents/foo/DocumentSummaryInformation", false),
+        ]);
+        assert_eq!(hits(&index, "dcouments")[0], "Documents");
+        assert_eq!(hits(&index, "dwnloads")[0], "Downloads");
+        assert_eq!(hits(&index, "musc")[0], "Music");
+    }
+
+    #[test]
+    fn search_highlight_ranges() {
+        let index = test_index(&[("Docs/Report.pdf", false), ("Docs/Cafe\u{301}.txt", false)]);
+        let f = Frecency::default();
+        let hit = &index.search("rep", 1, &f)[0];
+        assert_eq!(hit.title_hl, vec![0..3]);
+        assert!(hit.subtitle_hl.is_empty());
+        // A path-only term lights up the folder in the full-path subtitle.
+        let hit = &index.search("docs rep", 1, &f)[0];
+        assert_eq!(hit.title_hl, vec![0..3]);
+        assert_eq!(hit.subtitle_hl, vec![3..7]); // "/u/Docs/Report.pdf"
+        // NFD: the composed match maps back over base char + combining mark.
+        let hit = &index.search("café", 1, &f)[0];
+        assert_eq!(hit.name, "Cafe\u{301}.txt");
+        assert_eq!(hit.title_hl, vec![0..6]);
+    }
+
+    #[test]
+    fn search_frecency_breaks_near_ties() {
+        let index = test_index(&[("a/notes.txt", false), ("b/notes.txt", false)]);
+        assert_eq!(hits(&index, "notes")[0], "a/notes.txt"); // index order
+        let mut f = Frecency {
+            root: PathBuf::from("/u"),
+            ..Default::default()
+        };
+        f.folders.insert(PathBuf::from("/u/b"), 10.0);
+        let top = &index.search("notes", 2, &f)[0];
+        assert_eq!(top.path, PathBuf::from("/u/b/notes.txt"));
+        assert!(f.bias(Path::new("/u/b/notes.txt"), false) as f64 <= MAX_FRECENCY_BIAS);
+        // Never enough to lift a path-only match over a name match.
+        let index = test_index(&[("b/notes/x.txt", false), ("a/notes.txt", false)]);
+        assert_eq!(index.search("notes", 1, &f)[0].path, PathBuf::from("/u/a/notes.txt"));
+    }
+
+    #[test]
+    fn top_k_keeps_best_deterministically() {
+        let mut t = TopK::new(3);
+        for (i, r) in [5i64, 9, 1, 9, 7, 3].into_iter().enumerate() {
+            t.push(r, 4, i);
+        }
+        assert_eq!(t.into_sorted(), vec![(9, 1), (9, 3), (7, 4)]);
     }
 }
