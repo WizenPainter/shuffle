@@ -29,6 +29,10 @@ block2 = "0.6"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 # Markdown preview.
 pulldown-cmark = { version = "0.13", default-features = false }
+# Live folder watching (FSEvents backend on macOS).
+notify = "8"
+# Channel the watcher thread uses to hand change batches to the UI's async task.
+futures = "0.3"
 
 # Ships as a universal binary (arm64 + x86_64) via release.sh so it runs on
 # both Apple Silicon and Intel Macs. Build with a thin release profile while
