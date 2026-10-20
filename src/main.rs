@@ -25,7 +25,7 @@ use gpui::{
     actions, anchored, div, ease_out_quint, img, point, prelude::*, px, relative, rgb, rgba, size, ElementInputHandler,
     EntityInputHandler, UTF16Selection,
     uniform_list, Animation, AnimationExt, AnyElement, App,
-    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ExternalPaths, FocusHandle, FontWeight, ImageSource,
+    Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, Entity, ExternalPaths, FocusHandle, FontWeight, ImageSource,
     KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
     PathPromptOptions, Rgba,
     HighlightStyle, RenderImage, ScrollHandle, ScrollStrategy, ScrollWheelEvent, SharedString, StyledText, TitlebarOptions,
@@ -383,6 +383,8 @@ struct Prefs {
     palette_opacity: u8,
     /// Show dotfiles (.DS_Store, .git, …). Off by default, like Finder.
     show_hidden: bool,
+    /// Open Settings as a tab in the main window instead of its own window.
+    settings_in_tab: bool,
 }
 
 impl Default for Prefs {
@@ -406,6 +408,7 @@ impl Default for Prefs {
             waterfall: false,
             palette_opacity: 92,
             show_hidden: false,
+            settings_in_tab: false,
         }
     }
 }
@@ -434,6 +437,7 @@ thread_local! {
         waterfall: false,
         palette_opacity: 92,
         show_hidden: false,
+        settings_in_tab: false,
     }) };
 }
 
@@ -1351,7 +1355,12 @@ impl Settings {
             self.handle_hex_key(ev, cx);
         } else if self.recording.is_some() {
             self.handle_keybind_key(ev, cx);
+        } else {
+            return;
         }
+        // Embedded as a tab, the browser's key handler sits above us —
+        // keys typed into a Settings field mustn't also act there.
+        cx.stop_propagation();
     }
 
     /// Capture typed digits for the search-window opacity field; each edit
@@ -1902,6 +1911,19 @@ impl Settings {
                 "Explorer",
                 Some("Navigation and the file list."),
                 vec![
+                    toggle_row(
+                        "tg-settings-tab",
+                        "Open Settings in a tab",
+                        "Show Settings as a tab in the main window (\u{2318}, switches to it if it's already open) instead of a separate window.",
+                        p.settings_in_tab,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.settings_in_tab = !np.settings_in_tab;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
                     toggle_row(
                         "tg-show-parent",
                         "Show \u{201c}..\u{201d} (up one level)",
@@ -3801,6 +3823,11 @@ struct Tab {
     /// whenever that changes, so a long path shows where you are.
     crumb_scroll: ScrollHandle,
     crumb_pinned: RefCell<Option<(PathBuf, PathBuf)>>,
+    /// The path editor's horizontal scroll (keeps the caret in view).
+    path_scroll: ScrollHandle,
+    /// This tab shows Settings instead of a folder (the "Settings in a tab"
+    /// preference). `current_dir` is just a placeholder then.
+    settings: bool,
     /// The set of selected items.
     selection: HashSet<PathBuf>,
     /// The focused item (last clicked): used for shift-range and the inspector.
@@ -3867,6 +3894,8 @@ impl Tab {
             h_scroll: ScrollHandle::new(),
             crumb_scroll: ScrollHandle::new(),
             crumb_pinned: RefCell::new(None),
+            path_scroll: ScrollHandle::new(),
+            settings: false,
             selection: HashSet::new(),
             anchor: None,
             sort_key: SortKey::None,
@@ -3915,7 +3944,24 @@ impl Pane {
     }
 }
 
-/// Payload for a tab drag: which pane/tab is being dragged.
+thread_local! {
+    /// The main window's view, so the app-level ⌘, can open Settings in it.
+    static MAIN_VIEW: RefCell<Option<gpui::WeakEntity<Shuffle>>> = const { RefCell::new(None) };
+}
+
+/// ⌘, / the palette's Settings: a tab in the main window when that
+/// preference is on, else the separate Settings window.
+fn open_settings(cx: &mut App) {
+    if prefs().settings_in_tab {
+        if let Some(view) = MAIN_VIEW.with(|v| v.borrow().as_ref().and_then(|w| w.upgrade())) {
+            view.update(cx, |this, cx| this.open_settings_tab(cx));
+            cx.activate(true);
+            return;
+        }
+    }
+    open_settings_window(cx);
+}
+
 /// The text field typing goes to — same precedence as `on_key`.
 #[derive(Clone, Copy, PartialEq)]
 enum TextField {
@@ -3934,6 +3980,7 @@ fn utf16_at(s: &str, ci: usize) -> usize {
     s.chars().take(ci).map(char::len_utf16).sum()
 }
 
+/// Payload for a tab drag: which pane/tab is being dragged.
 #[derive(Clone, Copy)]
 struct TabDrag {
     pane: usize,
@@ -4148,6 +4195,8 @@ struct Shuffle {
     kb_pivot: Option<(usize, PathBuf)>,
     /// The F1 shortcut reference, with its filter text, when open.
     shortcut_help: Option<String>,
+    /// The Settings view shown by a Settings tab (created on first use).
+    settings_view: Option<Entity<Settings>>,
     /// Text macOS is still composing (a dead key like ~ or ´ waiting for its
     /// next key, or an IME): the field it sits in and its length in chars,
     /// just before that field's cursor. Replaced when the composition ends.
@@ -4504,6 +4553,7 @@ impl Shuffle {
             delete_permanent: false,
             kb_pivot: None,
             shortcut_help: None,
+            settings_view: None,
             ime_marked: None,
         }
     }
@@ -5491,7 +5541,8 @@ impl Shuffle {
             self.split_ratio, self.active_pane, self.preview_w
         );
         for p in &self.panes {
-            let locals: Vec<(usize, &Tab)> = p.tabs.iter().enumerate().filter(|(_, t)| t.remote.is_none()).collect();
+            let locals: Vec<(usize, &Tab)> =
+                p.tabs.iter().enumerate().filter(|(_, t)| t.remote.is_none() && !t.settings).collect();
             if locals.is_empty() {
                 continue;
             }
@@ -5843,7 +5894,9 @@ impl Shuffle {
         let tab = self.tab(pane);
         let total = tab.entries.len();
         let sel = tab.selection.len();
-        let summary = if sel == 0 {
+        let summary = if tab.settings {
+            "Settings".to_string()
+        } else if sel == 0 {
             items_label(total)
         } else {
             let dir = &tab.current_dir;
@@ -9465,7 +9518,11 @@ impl Shuffle {
             }
             Action::OpenSettings => {
                 self.close_palette(cx);
-                open_settings_window(cx);
+                if prefs().settings_in_tab {
+                    self.open_settings_tab(cx);
+                } else {
+                    open_settings_window(cx);
+                }
             }
             Action::None => {}
         }
@@ -9996,6 +10053,26 @@ impl Shuffle {
         let ks = &ev.keystroke;
         let cmd = ks.modifiers.platform;
         let key = ks.key.as_str();
+
+        // A Settings tab has no files to act on: only tab / window shortcuts
+        // apply there (Settings' own fields stop the keys they consume).
+        if self.active_tab().settings && !self.palette_open {
+            if let Some(action) = keymap().action_for(&canon_keystroke(ks)) {
+                if matches!(
+                    action,
+                    KeyAction::CloseTab
+                        | KeyAction::NewTab
+                        | KeyAction::NextTab
+                        | KeyAction::PrevTab
+                        | KeyAction::SwitchPane
+                        | KeyAction::CommandPalette
+                        | KeyAction::ShortcutHelp
+                ) {
+                    self.run_key_action(action, window, cx);
+                }
+            }
+            return;
+        }
 
         // The first-run SSH prompt: Escape dismisses; clicks pick a mode.
         if self.ssh_ask {
@@ -11622,6 +11699,27 @@ impl Shuffle {
             });
         })
         .detach();
+    }
+
+    /// Show Settings as a tab: switch to it if one is open in any pane,
+    /// else add one to the active pane.
+    fn open_settings_tab(&mut self, cx: &mut Context<Self>) {
+        for (pi, p) in self.panes.iter().enumerate() {
+            if let Some(ti) = p.tabs.iter().position(|t| t.settings) {
+                self.select_tab(pi, ti, cx);
+                return;
+            }
+        }
+        if self.settings_view.is_none() {
+            self.settings_view = Some(cx.new(Settings::new));
+        }
+        let pane = self.active_pane;
+        let mut tab = Tab::new(home_dir());
+        tab.settings = true;
+        let p = self.pane_mut(pane);
+        p.tabs.push(tab);
+        p.active = p.tabs.len() - 1;
+        cx.notify();
     }
 
     /// Select a tab in a pane.
@@ -15023,7 +15121,6 @@ impl Shuffle {
             div()
                 .flex()
                 .items_center()
-                .min_w_0()
                 .child(div().flex_none().child(text[..bl].to_string()))
                 .child(
                     div()
@@ -15039,16 +15136,27 @@ impl Shuffle {
             div()
                 .flex()
                 .items_center()
-                .min_w_0()
                 .child(div().flex_none().child(text[..b].to_string()))
                 // Blinking would need a timer; a static caret reads clearly.
                 .child(div().flex_none().w(px(1.5)).h(px(14.0)).bg(rgb(t.text)))
                 .child(div().flex_none().child(text[b..].to_string()))
         };
 
+        // A long path scrolls inside the field (clipped, never spilling over
+        // the toolbar or the next pane), kept scrolled so the caret / selection
+        // — child 1 of the text row — stays in view while editing.
+        tab.path_scroll.scroll_to_item(1);
+        let field = field
+            .id(("path-field", pane))
+            .flex_1()
+            .min_w_0()
+            .overflow_x_scroll()
+            .track_scroll(&tab.path_scroll);
+
         div()
             .flex_1()
             .min_w_0()
+            .overflow_hidden()
             .flex()
             .items_center()
             .px_2()
@@ -15227,6 +15335,7 @@ impl Shuffle {
             let active = i == p.active && pane == self.active_pane;
             // A remote tab at its root shows the server name, not "Macintosh HD".
             let label = match &tab.remote {
+                _ if tab.settings => "⚙ Settings".to_string(),
                 Some(s) if tab.current_dir == Path::new("/") => s.name.clone(),
                 _ => path_label(&tab.current_dir),
             };
@@ -15340,6 +15449,30 @@ impl Shuffle {
     /// Render one pane: tab strip → path bar → column header → virtualized
     /// listing + scrollbar, plus the right-edge split drop zone.
     fn render_pane(&self, pane: usize, cx: &Context<Self>) -> impl IntoElement {
+        // A Settings tab: just the tab strip over the embedded Settings view.
+        if let (true, Some(sv)) = (self.tab(pane).settings, self.settings_view.clone()) {
+            let active = pane == self.active_pane && self.panes.len() > 1;
+            return div()
+                .flex()
+                .flex_col()
+                .min_w_0()
+                .h_full()
+                .when(self.panes.len() > 1, |s| {
+                    s.border_t_2().border_color(if active { rgb(theme().accent) } else { rgba(0x00000000) })
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                        if this.active_pane != pane {
+                            this.active_pane = pane;
+                            cx.notify();
+                        }
+                    }),
+                )
+                .child(self.render_tab_strip(pane, cx))
+                .child(div().flex_1().min_h_0().child(sv))
+                .into_any_element();
+        }
         let view = self.tab(pane).view;
         // Highlight the active pane's border (only meaningful when split).
         let split = self.panes.len() > 1;
@@ -15405,6 +15538,7 @@ impl Shuffle {
                     .children(self.rename_error_pill(pane))
                     .child(self.render_filter_box(pane, cx)),
             )
+            .into_any_element()
     }
 
     /// The List view body: clickable column header + virtualized rows.
@@ -16284,10 +16418,19 @@ impl EntityInputHandler for Shuffle {
 }
 
 impl Render for Shuffle {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
         // Kick off any pending waterfall folder reads before rendering the tree.
         self.ensure_waterfall_loaded(cx);
+        // Leaving a Settings tab (focus was inside it): hand the keyboard back
+        // to the browser, or keystrokes would go nowhere.
+        if !self.active_tab().settings {
+            if let Some(sv) = &self.settings_view {
+                if sv.read(cx).focus.is_focused(window) {
+                    window.focus(&self.focus);
+                }
+            }
+        }
         // The native media player shows only while its file is previewed and
         // nothing gpui-drawn needs to sit on top of it.
         let target = self.media_target();
@@ -24463,8 +24606,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\nshow_hidden={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity, p.show_hidden
+            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\nshow_hidden={}\nsettings_in_tab={}\n",
+            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity, p.show_hidden, p.settings_in_tab
         );
         let _ = fs::write(&file, body);
     }
@@ -24615,6 +24758,7 @@ fn load_prefs() -> Prefs {
                     "ssh_configured" => p.ssh_configured = on,
                     "waterfall" => p.waterfall = on,
                     "show_hidden" => p.show_hidden = on,
+                    "settings_in_tab" => p.settings_in_tab = on,
                     "palette_opacity" => {
                         if let Ok(n) = v.trim().parse::<u8>() {
                             p.palette_opacity = n.clamp(20, 100);
@@ -25055,7 +25199,7 @@ fn main() {
             },
         ]);
         cx.on_action(|_: &Quit, cx: &mut App| cx.quit());
-        cx.on_action(|_: &OpenSettings, cx: &mut App| open_settings_window(cx));
+        cx.on_action(|_: &OpenSettings, cx: &mut App| open_settings(cx));
 
         open_main_window(cx);
         cx.activate(true);
@@ -25097,6 +25241,7 @@ fn open_main_window(cx: &mut App) {
             });
             // Focus the root so it receives keystrokes (Cmd+P) immediately.
             window.focus(&view.read(cx).focus);
+            MAIN_VIEW.with(|v| *v.borrow_mut() = Some(view.downgrade()));
             view
         },
     );
