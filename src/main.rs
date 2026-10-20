@@ -22,7 +22,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use chrono::{DateTime, Local};
 use gpui::{
-    actions, anchored, div, ease_out_quint, img, point, prelude::*, px, relative, rgb, rgba, size,
+    actions, anchored, div, ease_out_quint, img, point, prelude::*, px, relative, rgb, rgba, size, ElementInputHandler,
+    EntityInputHandler, UTF16Selection,
     uniform_list, Animation, AnimationExt, AnyElement, App,
     Application, Bounds, ClickEvent, ClipboardItem, Context, CursorStyle, ElementId, ExternalPaths, FocusHandle, FontWeight, ImageSource,
     KeyBinding, KeyDownEvent, Menu, MenuItem, MouseButton, MouseDownEvent, MouseMoveEvent, ObjectFit,
@@ -3915,6 +3916,24 @@ impl Pane {
 }
 
 /// Payload for a tab drag: which pane/tab is being dragged.
+/// The text field typing goes to — same precedence as `on_key`.
+#[derive(Clone, Copy, PartialEq)]
+enum TextField {
+    Group,
+    Help,
+    Batch,
+    Rename,
+    Path(usize),
+    Find(usize),
+    Term,
+    Palette,
+}
+
+/// UTF-16 offset of char index `ci` in `s` (macOS text input speaks UTF-16).
+fn utf16_at(s: &str, ci: usize) -> usize {
+    s.chars().take(ci).map(char::len_utf16).sum()
+}
+
 #[derive(Clone, Copy)]
 struct TabDrag {
     pane: usize,
@@ -4129,6 +4148,10 @@ struct Shuffle {
     kb_pivot: Option<(usize, PathBuf)>,
     /// The F1 shortcut reference, with its filter text, when open.
     shortcut_help: Option<String>,
+    /// Text macOS is still composing (a dead key like ~ or ´ waiting for its
+    /// next key, or an IME): the field it sits in and its length in chars,
+    /// just before that field's cursor. Replaced when the composition ends.
+    ime_marked: Option<(TextField, usize)>,
 }
 
 /// Which cloud store a path belongs to, for routing download/evict.
@@ -4481,6 +4504,7 @@ impl Shuffle {
             delete_permanent: false,
             kb_pivot: None,
             shortcut_help: None,
+            ime_marked: None,
         }
     }
 
@@ -5929,11 +5953,8 @@ impl Shuffle {
                 if cmd {
                     return;
                 }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        br.field_mut().push_str(ch);
-                    }
-                }
+                // Characters arrive via the text input handler (so macOS
+                // can compose dead keys / IME input); nothing to do here.
             }
         }
         cx.notify();
@@ -6664,12 +6685,8 @@ impl Shuffle {
                 if cmd {
                     return;
                 }
-                if let Some(ch) = ks.key_char.clone() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        self.rename_insert(&ch);
-                        cx.notify();
-                    }
-                }
+                // Characters arrive via the text input handler (so macOS
+                // can compose dead keys / IME input); nothing to do here.
             }
         }
     }
@@ -9583,6 +9600,186 @@ impl Shuffle {
         }
     }
 
+    // ----- text input (macOS composition: dead keys, accents, IMEs) -----
+
+    /// The text field keystrokes currently type into, if any. While one is
+    /// active, characters arrive through `EntityInputHandler` (so macOS can
+    /// compose ~ + Space → "~", ´ + e → "é", Japanese input, …) instead of
+    /// raw key events.
+    fn text_field(&self) -> Option<TextField> {
+        if self.ssh_ask || self.server_dialog.is_some() {
+            return None;
+        }
+        if self.group_dialog.is_some() {
+            return Some(TextField::Group);
+        }
+        if self.confirm_delete.is_some() {
+            return None;
+        }
+        if self.shortcut_help.is_some() {
+            return Some(TextField::Help);
+        }
+        if self.batch_rename.is_some() {
+            return Some(TextField::Batch);
+        }
+        if self.info_panel.is_some() {
+            return None;
+        }
+        if self.rename.is_some() {
+            return Some(TextField::Rename);
+        }
+        let p = self.active_pane;
+        if self.tab(p).editing_path.is_some() {
+            return Some(TextField::Path(p));
+        }
+        if self.tab(p).find_query.is_some() {
+            return Some(TextField::Find(p));
+        }
+        if self.term_focused && prefs().terminal {
+            return Some(TextField::Term);
+        }
+        if self.context_menu.is_some() {
+            return None;
+        }
+        self.palette_open.then_some(TextField::Palette)
+    }
+
+    /// A field's text and cursor (char index).
+    fn field_state(&self, f: TextField) -> (String, usize) {
+        let end = |s: &str| (s.to_string(), s.chars().count());
+        match f {
+            TextField::Group => end(self.group_dialog.as_deref().unwrap_or("")),
+            TextField::Help => end(self.shortcut_help.as_deref().unwrap_or("")),
+            TextField::Batch => self
+                .batch_rename
+                .as_ref()
+                .map(|b| end(if b.field == 0 { &b.a } else { &b.b }))
+                .unwrap_or_default(),
+            TextField::Term => end(&self.term_input),
+            TextField::Rename => self.rename.as_ref().map(|r| (r.text.clone(), r.cursor)).unwrap_or_default(),
+            TextField::Path(p) => {
+                let t = self.tab(p);
+                (t.editing_path.clone().unwrap_or_default(), t.path_cursor)
+            }
+            TextField::Find(p) => {
+                let t = self.tab(p);
+                (t.find_query.clone().unwrap_or_default(), t.find_cursor)
+            }
+            TextField::Palette => (self.query.clone(), self.query_cursor),
+        }
+    }
+
+    /// Type `s` at the field's cursor (replacing its selection), with the
+    /// same side effects as typing it key by key.
+    fn field_insert(&mut self, f: TextField, s: &str, cx: &mut Context<Self>) {
+        if s.is_empty() || s.chars().any(char::is_control) {
+            return;
+        }
+        match f {
+            TextField::Group => {
+                if let Some(g) = self.group_dialog.as_mut() {
+                    g.push_str(s);
+                }
+            }
+            TextField::Help => {
+                if let Some(q) = self.shortcut_help.as_mut() {
+                    q.push_str(s);
+                }
+            }
+            TextField::Batch => {
+                if let Some(b) = self.batch_rename.as_mut() {
+                    b.field_mut().push_str(s);
+                }
+            }
+            TextField::Term => self.term_input.push_str(s),
+            TextField::Rename => self.rename_insert(s),
+            TextField::Path(p) => self.path_insert(p, s),
+            TextField::Find(p) => {
+                self.find_insert(p, s);
+                self.recompute_find(p);
+                self.update_content_search(p, cx);
+            }
+            TextField::Palette => {
+                self.palette_insert(s);
+                self.refresh_palette(cx);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Delete the `n` chars just before the field's cursor (the composing
+    /// text being replaced).
+    fn field_delete_before(&mut self, f: TextField, n: usize) {
+        if n == 0 {
+            return;
+        }
+        let pop = |s: &mut String| {
+            for _ in 0..n {
+                s.pop();
+            }
+        };
+        match f {
+            TextField::Group => {
+                if let Some(g) = self.group_dialog.as_mut() {
+                    pop(g);
+                }
+            }
+            TextField::Help => {
+                if let Some(q) = self.shortcut_help.as_mut() {
+                    pop(q);
+                }
+            }
+            TextField::Batch => {
+                if let Some(b) = self.batch_rename.as_mut() {
+                    pop(b.field_mut());
+                }
+            }
+            TextField::Term => pop(&mut self.term_input),
+            TextField::Rename => {
+                if let Some(r) = self.rename.as_mut() {
+                    r.anchor = Some(r.cursor.saturating_sub(n));
+                }
+                self.rename_delete_sel();
+            }
+            TextField::Path(p) => {
+                let t = self.tab_mut(p);
+                t.path_anchor = Some(t.path_cursor.saturating_sub(n));
+                self.path_delete_sel(p);
+            }
+            TextField::Find(p) => {
+                let t = self.tab_mut(p);
+                t.find_anchor = Some(t.find_cursor.saturating_sub(n));
+                self.find_delete_sel(p);
+            }
+            TextField::Palette => {
+                self.query_anchor = Some(self.query_cursor.saturating_sub(n));
+                self.query_delete_sel();
+            }
+        }
+    }
+
+    /// Chars to remove before inserting: the composing text if any, else the
+    /// part of `range` (UTF-16) that ends at the cursor — how press-and-hold
+    /// accents replace the letter they decorate.
+    fn ime_replaced_chars(&mut self, f: TextField, range: Option<std::ops::Range<usize>>) -> usize {
+        if let Some((mf, n)) = self.ime_marked.take() {
+            if mf == f {
+                return n;
+            }
+        }
+        let Some(r) = range.filter(|r| r.start < r.end) else { return 0 };
+        let (text, cursor) = self.field_state(f);
+        if r.end != utf16_at(&text, cursor) {
+            return 0;
+        }
+        text.chars().take(cursor).collect::<Vec<_>>().iter().rev().scan(0usize, |acc, c| {
+            *acc += c.len_utf16();
+            Some(*acc)
+        })
+        .take_while(|u| *u <= r.end - r.start)
+        .count()
+    }
+
     /// What a keyboard action acts on: the selection (sorted), else the
     /// focused item.
     fn action_targets(&self, pane: usize) -> Vec<PathBuf> {
@@ -9840,11 +10037,7 @@ impl Shuffle {
                 "backspace" => {
                     q.pop();
                 }
-                _ if !cmd => {
-                    if let Some(ch) = ks.key_char.as_ref().filter(|c| !c.chars().any(char::is_control)) {
-                        q.push_str(ch);
-                    }
-                }
+                // Typed characters arrive via the text input handler.
                 _ => {}
             }
             cx.notify();
@@ -10134,12 +10327,8 @@ impl Shuffle {
                 if cmd {
                     return; // ignore other Cmd-combos
                 }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(|c| c.is_control()) {
-                        self.palette_insert(ch);
-                        self.refresh_palette(cx);
-                    }
-                }
+                // Characters arrive via the text input handler (so macOS
+                // can compose dead keys / IME input); nothing to do here.
             }
         }
     }
@@ -10967,12 +11156,8 @@ impl Shuffle {
                 if cmd {
                     return; // leave other Cmd-combos alone
                 }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        self.path_insert(pane, ch);
-                        cx.notify();
-                    }
-                }
+                // Characters arrive via the text input handler (so macOS
+                // can compose dead keys / IME input); nothing to do here.
             }
         }
     }
@@ -11311,14 +11496,8 @@ impl Shuffle {
                 if cmd {
                     return;
                 }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        self.find_insert(pane, ch);
-                        self.recompute_find(pane);
-                        self.update_content_search(pane, cx);
-                        cx.notify();
-                    }
-                }
+                // Characters arrive via the text input handler (so macOS
+                // can compose dead keys / IME input); nothing to do here.
             }
         }
     }
@@ -13443,12 +13622,8 @@ impl Shuffle {
                 if cmd {
                     return;
                 }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        self.term_input.push_str(ch);
-                        cx.notify();
-                    }
-                }
+                // Characters arrive via the text input handler (so macOS
+                // can compose dead keys / IME input); nothing to do here.
             }
         }
     }
@@ -13845,14 +14020,8 @@ impl Shuffle {
                 if cmd {
                     return;
                 }
-                if let Some(ch) = ks.key_char.as_ref() {
-                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
-                        if let Some(s) = self.group_dialog.as_mut() {
-                            s.push_str(ch);
-                        }
-                        cx.notify();
-                    }
-                }
+                // Characters arrive via the text input handler (so macOS
+                // can compose dead keys / IME input); nothing to do here.
             }
         }
     }
@@ -16030,6 +16199,90 @@ fn header_cell(
         )
 }
 
+impl EntityInputHandler for Shuffle {
+    fn text_for_range(
+        &mut self,
+        range: std::ops::Range<usize>,
+        adjusted: &mut Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<String> {
+        let f = self.text_field()?;
+        let (text, _) = self.field_state(f);
+        let units: Vec<u16> = text.encode_utf16().collect();
+        let (a, b) = (range.start.min(units.len()), range.end.min(units.len()));
+        *adjusted = Some(a..b);
+        Some(String::from_utf16_lossy(&units[a..b]))
+    }
+
+    fn selected_text_range(&mut self, _: bool, _: &mut Window, _: &mut Context<Self>) -> Option<UTF16Selection> {
+        let f = self.text_field()?;
+        let (text, cursor) = self.field_state(f);
+        let at = utf16_at(&text, cursor);
+        Some(UTF16Selection { range: at..at, reversed: false })
+    }
+
+    fn marked_text_range(&self, _: &mut Window, _: &mut Context<Self>) -> Option<std::ops::Range<usize>> {
+        let (f, n) = self.ime_marked?;
+        if self.text_field() != Some(f) {
+            return None;
+        }
+        let (text, cursor) = self.field_state(f);
+        Some(utf16_at(&text, cursor.saturating_sub(n))..utf16_at(&text, cursor))
+    }
+
+    fn unmark_text(&mut self, _: &mut Window, _: &mut Context<Self>) {
+        self.ime_marked = None;
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        text: &str,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(f) = self.text_field() else { return };
+        let n = self.ime_replaced_chars(f, range);
+        self.field_delete_before(f, n);
+        self.field_insert(f, text, cx);
+        cx.notify();
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range: Option<std::ops::Range<usize>>,
+        new_text: &str,
+        _: Option<std::ops::Range<usize>>,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(f) = self.text_field() else { return };
+        let n = self.ime_replaced_chars(f, range);
+        self.field_delete_before(f, n);
+        self.field_insert(f, new_text, cx);
+        let len = new_text.chars().count();
+        self.ime_marked = (len > 0).then_some((f, len));
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _: std::ops::Range<usize>,
+        element_bounds: Bounds<gpui::Pixels>,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) -> Option<Bounds<gpui::Pixels>> {
+        // Near the top of the window, where the fields live — good enough
+        // for placing an IME candidate window.
+        Some(Bounds { origin: element_bounds.origin + point(px(240.0), px(80.0)), size: size(px(2.0), px(18.0)) })
+    }
+
+    fn character_index_for_point(&mut self, _: gpui::Point<gpui::Pixels>, _: &mut Window, _: &mut Context<Self>) -> Option<usize> {
+        None
+    }
+}
+
 impl Render for Shuffle {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme();
@@ -16229,6 +16482,24 @@ impl Render for Shuffle {
 
         if let Some(panel) = self.render_jobs_panel() {
             root = root.child(panel);
+        }
+        // While a text field is active, take typing through macOS's text
+        // input system (dead keys, accents, IMEs) instead of raw keys.
+        if self.text_field().is_some() {
+            let focus = self.focus.clone();
+            let entity = cx.entity();
+            root = root.child(
+                gpui::canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, cx| {
+                        window.handle_input(&focus, ElementInputHandler::new(bounds, entity.clone()), cx);
+                    },
+                )
+                .absolute()
+                .size_full(),
+            );
+        } else {
+            self.ime_marked = None;
         }
         if self.palette_open {
             root = root.child(self.render_palette(cx));
