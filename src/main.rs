@@ -3980,6 +3980,10 @@ fn utf16_at(s: &str, ci: usize) -> usize {
     s.chars().take(ci).map(char::len_utf16).sum()
 }
 
+/// Payload for reordering a bookmark by drag: its index.
+#[derive(Clone, Copy)]
+struct BookmarkDrag(usize);
+
 /// Payload for a tab drag: which pane/tab is being dragged.
 #[derive(Clone, Copy)]
 struct TabDrag {
@@ -7884,7 +7888,7 @@ impl Shuffle {
         }
     }
 
-    fn render_context_menu(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn render_context_menu(&self, viewport: gpui::Size<gpui::Pixels>, cx: &Context<Self>) -> impl IntoElement {
         let menu = self.context_menu.as_ref().expect("called only when open");
         let ms = menu_style();
         let panel = move |rows: Vec<AnyElement>| {
@@ -7913,11 +7917,25 @@ impl Shuffle {
                 self.menu_row(node, selected, i, None, cx)
             })
             .collect();
-        // The open flyout: a second panel beside the root, its top aligned to
-        // the parent row (deterministic — every row height is fixed).
+        // Lay the menu out ourselves (every row height is fixed) so the root
+        // panel's position depends only on its own size. It used to share one
+        // snapped box with the flyout: near the bottom, opening a tall flyout
+        // pushed the whole menu up, the pointer left the parent row, the
+        // flyout closed, the menu dropped back… and looped (issue #15).
+        const MARGIN: f32 = 8.0;
+        const PAD: f32 = 10.0; // py_1 + border
+        let (win_w, win_h) = (f32::from(viewport.width), f32::from(viewport.height));
+        let panel_h = |nodes: &[MenuNode]| nodes.iter().map(MenuNode::height).sum::<f32>() + PAD;
+        let root_h = panel_h(&menu.nodes);
+        let root_y = menu.y.min(win_h - root_h - MARGIN).max(MARGIN);
+        // The open flyout: beside the root, top aligned to its parent row,
+        // slid up just enough to fit the window; flipped to the left side
+        // when there's no room on the right.
         let flyout = menu.open_sub.and_then(|si| match menu.nodes.get(si) {
             Some(MenuNode::Sub { items, .. }) => {
                 let off: f32 = menu.nodes[..si].iter().map(MenuNode::height).sum();
+                let fly_h = panel_h(items);
+                let off = off.min(win_h - MARGIN - fly_h - root_y).max(MARGIN - root_y);
                 let rows: Vec<AnyElement> = items
                     .iter()
                     .enumerate()
@@ -7927,6 +7945,9 @@ impl Shuffle {
             }
             _ => None,
         });
+        const EST_W: f32 = 230.0; // panel width estimate (min 210 + labels)
+        let root_x = menu.x.min(win_w - EST_W - MARGIN).max(MARGIN);
+        let flip = root_x + 2.0 * EST_W + MARGIN > win_w;
 
         // Full-window backdrop: any click/right-click outside closes the menu.
         div()
@@ -7945,20 +7966,17 @@ impl Shuffle {
                 cx.listener(|this, _, _, cx| this.close_context_menu(cx)),
             )
             .child(
-                // Anchored so the menu repositions to stay fully visible near a
-                // window edge instead of being clipped.
-                anchored()
-                    .position(point(px(menu.x), px(menu.y)))
-                    .snap_to_window()
-                    .child(
-                        div()
-                            .flex()
-                            .items_start()
-                            .child(panel(root_rows))
-                            .when_some(flyout, |el, (off, rows)| {
-                                el.child(panel(rows).mt(px(off)))
-                            }),
-                    ),
+                // The root panel at its clamped spot; the flyout hangs off its
+                // side, positioned relative to it and outside its layout box,
+                // so opening it can never move the root.
+                div()
+                    .absolute()
+                    .left(px(root_x))
+                    .top(px(root_y))
+                    .child(div().relative().child(panel(root_rows)).when_some(flyout, |el, (off, rows)| {
+                        let fly = div().absolute().top(px(off)).child(panel(rows));
+                        el.child(if flip { fly.right_full().mr(px(2.0)) } else { fly.left_full().ml(px(2.0)) })
+                    })),
             )
     }
 
@@ -8790,6 +8808,29 @@ impl Shuffle {
                 }
             }
             SidebarTarget::Bookmark(p) => {
+                if let Some(ix) = self.bookmarks.iter().position(|b| *b == p) {
+                    if ix > 0 {
+                        items.push(
+                            ctx_item("Move Up", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.close_sidebar_menu(cx);
+                                this.move_bookmark(ix, ix - 1, cx);
+                            }))
+                            .into_any_element(),
+                        );
+                    }
+                    if ix + 1 < self.bookmarks.len() {
+                        items.push(
+                            ctx_item("Move Down", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                                this.close_sidebar_menu(cx);
+                                this.move_bookmark(ix, ix + 1, cx);
+                            }))
+                            .into_any_element(),
+                        );
+                    }
+                    if self.bookmarks.len() > 1 {
+                        items.push(ctx_separator().into_any_element());
+                    }
+                }
                 items.push(
                     ctx_item("Remove Bookmark", cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_sidebar_menu(cx);
@@ -13990,6 +14031,18 @@ impl Shuffle {
         .detach();
     }
 
+    /// Move bookmark `from` to position `to` (drag-and-drop / Move Up / Down).
+    fn move_bookmark(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        if from >= self.bookmarks.len() || from == to {
+            return;
+        }
+        let item = self.bookmarks.remove(from);
+        let to = to.min(self.bookmarks.len());
+        self.bookmarks.insert(to, item);
+        write_path_list("bookmarks.txt", &self.bookmarks);
+        cx.notify();
+    }
+
     /// Pin the current directory to bookmarks (no-op if already pinned).
     fn add_bookmark(&mut self, cx: &mut Context<Self>) {
         let dir = self.active_tab().current_dir.clone();
@@ -14510,8 +14563,8 @@ impl Shuffle {
                     items.push(empty_hint("Click + to pin a folder").into_any_element());
                 }
             } else {
-                for p in &self.bookmarks {
-                    push_bookmark_nav(&mut items, cx, &mut key, p.clone(), current, collapsed);
+                for (i, p) in self.bookmarks.iter().enumerate() {
+                    push_bookmark_nav(&mut items, cx, &mut key, i, p.clone(), current, collapsed);
                 }
             }
         }
@@ -15460,15 +15513,12 @@ impl Shuffle {
                 .when(self.panes.len() > 1, |s| {
                     s.border_t_2().border_color(if active { rgb(theme().accent) } else { rgba(0x00000000) })
                 })
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                        if this.active_pane != pane {
-                            this.active_pane = pane;
-                            cx.notify();
-                        }
-                    }),
-                )
+                .capture_any_mouse_down(cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    if this.active_pane != pane {
+                        this.active_pane = pane;
+                        cx.notify();
+                    }
+                }))
                 .child(self.render_tab_strip(pane, cx))
                 .child(div().flex_1().min_h_0().child(sv))
                 .into_any_element();
@@ -15510,18 +15560,17 @@ impl Shuffle {
                     rgba(0x00000000)
                 })
             })
-            // Clicking anywhere in the pane focuses it (and leaves terminal
-            // input) — repaint right away so the focus rule follows the click.
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _: &MouseDownEvent, _, cx| {
-                    if this.active_pane != pane || this.term_focused {
-                        this.active_pane = pane;
-                        this.term_focused = false;
-                        cx.notify();
-                    }
-                }),
-            )
+            // Any press inside the pane makes it the active one (and leaves
+            // terminal input) — in the capture phase, so rows, headers, buttons
+            // and scrollbars that stop propagation can't swallow it (keyboard
+            // actions like ⇧⌘G then target the pane you clicked).
+            .capture_any_mouse_down(cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                if this.active_pane != pane || this.term_focused {
+                    this.active_pane = pane;
+                    this.term_focused = false;
+                    cx.notify();
+                }
+            }))
             .child(self.render_tab_strip(pane, cx))
             // Path bar: back/forward arrows + breadcrumb + view/sort toolbar.
             .child(self.render_path_bar(pane, cx))
@@ -16648,7 +16697,7 @@ impl Render for Shuffle {
             root = root.child(self.render_palette(cx));
         }
         if self.context_menu.is_some() {
-            root = root.child(self.render_context_menu(cx));
+            root = root.child(self.render_context_menu(window.viewport_size(), cx));
         }
         if let Some((p, x, y)) = self.sort_menu {
             root = root.child(self.render_sort_menu(p, x, y, cx));
@@ -16725,10 +16774,12 @@ fn push_nav(
 /// Like [`push_nav`] but for a bookmark, which may be a file or a folder:
 /// folders navigate, files open in their default app, and the icon reflects the
 /// file type.
+#[allow(clippy::too_many_arguments)]
 fn push_bookmark_nav(
     items: &mut Vec<AnyElement>,
     cx: &Context<Shuffle>,
     key: &mut usize,
+    index: usize,
     target: PathBuf,
     current: &Path,
     collapsed: bool,
@@ -16765,7 +16816,20 @@ fn push_bookmark_nav(
             cx.stop_propagation();
         }),
     );
-    items.push(item.into_any_element());
+    // Drag a bookmark onto another to move it there.
+    let drag_label = path_label(&target);
+    items.push(
+        div()
+            .id(("bm-drag", index))
+            .rounded_md()
+            .on_drag(BookmarkDrag(index), move |_, _, _, cx| cx.new(|_| TabDragPreview { label: drag_label.clone() }))
+            .drag_over::<BookmarkDrag>(|s, _, _, _| s.bg(Theme::alpha(theme().accent, 0x33)))
+            .on_drop(cx.listener(move |this, from: &BookmarkDrag, _, cx| {
+                this.move_bookmark(from.0, index, cx);
+            }))
+            .child(item)
+            .into_any_element(),
+    );
 }
 
 /// A group member row: click opens/navigates, right-click offers "Remove from
