@@ -32,7 +32,7 @@ Format rules the website parser expects:
 ## Later
 
 - [ ] Discover Macs & servers on the local network - Bonjour/SMB - vote: github.com/WizenPainter/shuffle/discussions/5
-- [ ] Preview more file types & archive browsing - vote: github.com/WizenPainter/shuffle/discussions/7
+- [x] Preview more file types & archive browsing - code, Markdown, CSV, PDF, video, audio, archives
 - [ ] Richer plugin runtime - embedded Lua or WASM, evaluated as a follow-up to script actions
 - [ ] Localization
 - [ ] Maybe: a one-time Pro purchase - never a subscription
