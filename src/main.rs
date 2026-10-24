@@ -7724,12 +7724,7 @@ impl Shuffle {
                     .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
                     .collect();
                 // ditto can't zip several roots into one archive; zip can.
-                let _ = Command::new("zip")
-                    .current_dir(&parent)
-                    .args(["-r", "-q", "-y"])
-                    .arg(&dest)
-                    .args(&names)
-                    .status();
+                let _ = zip_command(&parent, &dest, &names).status();
             })
             .await;
             let _ = this.update(cx, |this, cx| {
@@ -17631,6 +17626,12 @@ fn modal_backdrop(on_dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 
         .on_mouse_down(MouseButton::Left, on_dismiss)
 }
 
+fn zip_command(parent: &Path, dest: &Path, names: &[String]) -> Command {
+    let mut command = Command::new("zip");
+    command.current_dir(parent).args(["-r", "-q", "-y"]).arg(dest).arg("--").args(names);
+    command
+}
+
 // ----- file operations: background copy/move with progress + undo ---------
 //
 // The engine never overwrites and never shows a half-written item under its
@@ -25125,6 +25126,24 @@ mod tests {
         let mut v: Vec<String> = list.iter().map(|s| s.to_string()).collect();
         v.sort_by_cached_key(|n| NatKey::new(n));
         v
+    }
+
+    #[test]
+    fn compress_option_names_keeps_all_originals() {
+        let d = scratch("zip-option-names");
+        let names: Vec<String> = ["-m", "-T", "--", "ordinary.txt", "лапки\".txt"]
+            .into_iter().map(String::from).collect();
+        for name in &names { fs::write(d.join(name), name).unwrap(); }
+        let archive = d.join("archive.zip");
+        let status = zip_command(&d, &archive, &names).status().unwrap();
+        assert!(status.success());
+        let list = Command::new("unzip").args(["-Z1"]).arg(&archive).output().unwrap();
+        let entries = String::from_utf8(list.stdout).unwrap();
+        for name in &names {
+            assert_eq!(fs::read_to_string(d.join(name)).unwrap(), *name);
+            assert!(entries.lines().any(|line| line == name), "missing {name}");
+        }
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
