@@ -17631,6 +17631,14 @@ fn modal_backdrop(on_dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 
         .on_mouse_down(MouseButton::Left, on_dismiss)
 }
 
+fn validate_copy_destination(src: &Path, dir: &Path) -> std::io::Result<()> {
+    if fs::symlink_metadata(src)?.is_dir() && fs::canonicalize(dir)?.starts_with(fs::canonicalize(src)?) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            "a folder cannot be copied into itself or its own descendant"));
+    }
+    Ok(())
+}
+
 // ----- file operations: background copy/move with progress + undo ---------
 //
 // The engine never overwrites and never shows a half-written item under its
@@ -18161,6 +18169,7 @@ fn copy_item(
     cx: &CopyCtx,
     manifest: Option<&Mutex<Vec<SrcStamp>>>,
 ) -> std::io::Result<bool> {
+    validate_copy_destination(src, staged.parent().ok_or(std::io::ErrorKind::InvalidInput)?)?;
     const CLONE_NOFOLLOW: u32 = 0x0001;
     let md = fs::symlink_metadata(src)?;
     if cx.clone && manifest.is_none() && md.is_dir() {
@@ -18367,6 +18376,12 @@ fn run_transfer(
     let mut notes: Vec<String> = Vec::new();
     let mut to_copy = Vec::new();
     for (src, dest) in pairs {
+        if let Err(e) = dest.parent().ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+            .and_then(|dir| validate_copy_destination(src, dir))
+        {
+            notes.push(place_error("transfer", src, dest, &e));
+            continue;
+        }
         if kind == TransferKind::Move && !hook_force_exdev() {
             match place(dest, policy, |d| rename_excl(src, d)) {
                 Ok(d) => {
@@ -25125,6 +25140,48 @@ mod tests {
         let mut v: Vec<String> = list.iter().map(|s| s.to_string()).collect();
         v.sort_by_cached_key(|n| NatKey::new(n));
         v
+    }
+
+    #[test]
+    fn copy_rejects_actual_descendant_and_accepts_external_symlink() {
+        let d = scratch("copy-descendant");
+        let src = d.join("src");
+        let outside = d.join("outside");
+        fs::create_dir_all(src.join("inside")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(src.join("file"), "kept").unwrap();
+        let alias = d.join("alias");
+        let external = d.join("external");
+        std::os::unix::fs::symlink(src.join("inside"), &alias).unwrap();
+        std::os::unix::fs::symlink(&outside, &external).unwrap();
+        // Check the engine boundary first with copying cancelled. On the old
+        // implementation this fails safely, without entering recursive staging.
+        let prog = JobProgress::default();
+        prog.cancel.store(true, Ordering::Relaxed);
+        let cx = CopyCtx { prog: &prog, clone: false, durable: false };
+        assert_eq!(copy_item(&src, &alias.join("staged"), &cx, None).unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput);
+        TEST_NO_CLONE.set(true);
+        for kind in [TransferKind::Copy, TransferKind::Move] {
+            TEST_FORCE_EXDEV.set(true);
+            let out = run_transfer(&[(src.clone(), alias.join("copy"))], kind,
+                ConflictPolicy::Skip, &JobProgress::default());
+            TEST_FORCE_EXDEV.set(false);
+            assert!(out.placed.is_empty());
+            assert!(out.err.as_deref().is_some_and(|e| e.contains("own descendant")));
+            assert!(fs::read_dir(src.join("inside")).unwrap().next().is_none());
+        }
+        let out = run_transfer(&[(src.clone(), external.join("copy"))], TransferKind::Copy,
+            ConflictPolicy::Skip, &JobProgress::default());
+        TEST_NO_CLONE.set(false);
+        assert!(out.err.is_none(), "{:?}", out.err);
+        assert_eq!(fs::read_to_string(outside.join("copy/file")).unwrap(), "kept");
+        // A source symlink itself is copied as a symlink, not walked.
+        let out = run_transfer(&[(alias, outside.join("link"))], TransferKind::Copy,
+            ConflictPolicy::Skip, &JobProgress::default());
+        assert_eq!(out.placed.len(), 1);
+        assert!(fs::symlink_metadata(outside.join("link")).unwrap().file_type().is_symlink());
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
