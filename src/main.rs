@@ -5534,6 +5534,25 @@ impl Shuffle {
         self.start_transfer(pairs, TransferKind::Copy, ConflictPolicy::KeepBoth, label, Record::Fresh, cx);
     }
 
+    fn begin_file_job(&mut self, label: String, cx: &mut Context<Self>) -> (u64, Arc<JobProgress>) {
+        let prog = Arc::new(JobProgress::default());
+        self.next_job_id += 1;
+        let id = self.next_job_id;
+        let was_idle = self.jobs.is_empty();
+        self.jobs.push(FileJob { id, label, started: Instant::now(), prog: prog.clone() });
+        if was_idle {
+            cx.spawn(async move |this, cx| loop {
+                cx.background_executor().timer(Duration::from_millis(150)).await;
+                let running = this.update(cx, |this, cx| {
+                    cx.notify();
+                    !this.jobs.is_empty()
+                });
+                if !matches!(running, Ok(true)) { break; }
+            }).detach();
+        }
+        (id, prog)
+    }
+
     /// Run a copy/move off the main thread. The progress panel shows it once
     /// it has taken longer than a blink; when it finishes the panes reload and
     /// the completed part lands on the undo (or, per `record`, redo) stack.
@@ -5546,25 +5565,7 @@ impl Shuffle {
         record: Record,
         cx: &mut Context<Self>,
     ) {
-        let prog = Arc::new(JobProgress::default());
-        self.next_job_id += 1;
-        let id = self.next_job_id;
-        let was_idle = self.jobs.is_empty();
-        self.jobs.push(FileJob { id, label, started: Instant::now(), prog: prog.clone() });
-        if was_idle {
-            // Repaint the progress panel while anything is running.
-            cx.spawn(async move |this, cx| loop {
-                cx.background_executor().timer(Duration::from_millis(150)).await;
-                let running = this.update(cx, |this, cx| {
-                    cx.notify();
-                    !this.jobs.is_empty()
-                });
-                if !matches!(running, Ok(true)) {
-                    break;
-                }
-            })
-            .detach();
-        }
+        let (id, prog) = self.begin_file_job(label, cx);
         cx.spawn(async move |this, cx| {
             let as_placed = matches!(record, Record::Revert { as_placed: true, .. });
             let out = cx
@@ -6385,6 +6386,21 @@ impl Shuffle {
         let gone = |p: &Path| fs::symlink_metadata(p).is_err();
         let from_trash = matches!(op, UndoOp::Trashed(_));
         match op {
+            UndoOp::Steps(steps) => {
+                let (id, prog) = self.begin_file_job(format!("{doing} {label}"), cx);
+                cx.spawn(async move |this, cx| {
+                    let (inverse, err) = cx.background_spawn(async move { reverse_steps(steps, &prog) }).await;
+                    let _ = this.update(cx, |this, cx| {
+                        this.jobs.retain(|j| j.id != id);
+                        if !inverse.is_empty() {
+                            this.record_inverse(UndoEntry { label: label.clone(), op: UndoOp::Steps(inverse) }, to_redo);
+                        }
+                        this.set_notice(err.unwrap_or_else(|| format!("{did} {label}")), cx);
+                        this.refresh_all_panes(cx);
+                    });
+                }).detach();
+                return;
+            }
             UndoOp::Created(paths) => {
                 let op = UndoOp::Placed(paths.into_iter().map(|p| (p, None)).collect());
                 return self.revert(UndoEntry { label, op }, to_redo, cx);
@@ -17954,13 +17970,13 @@ struct FileJob {
     prog: Arc<JobProgress>,
 }
 
-/// Cheap fingerprint of an item tree — bytes, entries, newest mtime — enough
-/// to tell whether a copy has been edited since it was placed.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+/// Per-entry metadata, keyed by relative path. An unreadable tree never
+/// authorizes destructive undo.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 struct TreeStamp {
     bytes: u64,
-    items: u64,
-    newest: i128,
+    entries: BTreeMap<PathBuf, SrcStamp>,
+    complete: bool,
 }
 
 /// One item a transfer put in place (`stamp` only where undo needs it).
@@ -17968,6 +17984,9 @@ struct Placed {
     src: PathBuf,
     dest: PathBuf,
     stamp: Option<TreeStamp>,
+    /// A partially retired source needs restoration of its missing subtrees
+    /// before the destination copy can safely be undone.
+    undo_steps: Option<Vec<UndoStep>>,
 }
 
 struct TransferOutcome {
@@ -17986,6 +18005,13 @@ enum UndoOp {
     /// Items an operation brought into being (copies, things put back from
     /// the Trash) and how they looked then: undo trashes only the unchanged.
     Placed(Vec<(PathBuf, Option<TreeStamp>)>),
+    Steps(Vec<UndoStep>),
+}
+
+enum UndoStep {
+    Check { path: PathBuf, stamp: TreeStamp },
+    Transfer { src: PathBuf, dest: PathBuf, kind: TransferKind, as_placed: bool },
+    Trash { path: PathBuf, stamp: Option<TreeStamp> },
 }
 
 impl UndoOp {
@@ -17998,6 +18024,7 @@ impl UndoOp {
             UndoOp::Created(p) if p.len() == 1 => format!("New “{}”", path_label(&p[0])),
             UndoOp::Created(p) => format!("New {}", items_label(p.len())),
             UndoOp::Placed(p) => format!("Copy of {}", items_label(p.len())),
+            UndoOp::Steps(_) => "Partial move".into(),
         }
     }
 }
@@ -18031,11 +18058,26 @@ enum Record {
 
 /// The undo op for what a transfer placed.
 fn transfer_undo_op(kind: TransferKind, placed: Vec<Placed>, as_placed: bool) -> UndoOp {
+    if placed.iter().any(|p| p.undo_steps.is_some()) && kind == TransferKind::Move && !as_placed {
+        return UndoOp::Steps(transfer_undo_steps(kind, placed, as_placed));
+    }
     if kind == TransferKind::Copy || as_placed {
         UndoOp::Placed(placed.into_iter().map(|p| (p.dest, p.stamp)).collect())
     } else {
         UndoOp::Moved(placed.into_iter().map(|p| (p.src, p.dest)).collect())
     }
+}
+
+fn transfer_undo_steps(kind: TransferKind, placed: Vec<Placed>, as_placed: bool) -> Vec<UndoStep> {
+    placed.into_iter().flat_map(|p| {
+        if kind == TransferKind::Copy || as_placed {
+            vec![UndoStep::Trash { path: p.dest, stamp: p.stamp }]
+        } else if let Some(steps) = p.undo_steps {
+            steps
+        } else {
+            vec![UndoStep::Transfer { src: p.dest, dest: p.src, kind: TransferKind::Move, as_placed: false }]
+        }
+    }).collect()
 }
 
 /// "1 item" / "3 items".
@@ -18215,7 +18257,7 @@ struct CopyCtx<'a> {
 }
 
 /// A source entry as a copy-based move read it.
-#[derive(PartialEq)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 struct SrcStamp {
     path: PathBuf,
     dev: u64,
@@ -18524,15 +18566,22 @@ fn add_sizes(p: &Path, prog: &JobProgress, stop: &AtomicBool) {
 
 /// Fingerprint the tree at `p` (symlinks not followed).
 fn tree_stamp(p: &Path) -> TreeStamp {
-    use std::os::unix::fs::MetadataExt;
-    let mut s = TreeStamp::default();
+    let mut s = TreeStamp { complete: true, ..TreeStamp::default() };
     let mut stack = vec![p.to_path_buf()];
-    while let Some(p) = stack.pop() {
-        let Ok(m) = fs::symlink_metadata(&p) else { continue };
-        s.items += 1;
-        s.newest = s.newest.max(m.mtime() as i128 * 1_000_000_000 + m.mtime_nsec() as i128);
+    while let Some(entry) = stack.pop() {
+        let Ok(m) = fs::symlink_metadata(&entry) else { s.complete = false; continue };
+        let relative = entry.strip_prefix(p).expect("entry under snapshot root");
+        s.entries.insert(relative.to_path_buf(), SrcStamp::of(relative, &m));
         if m.is_dir() {
-            stack.extend(fs::read_dir(&p).into_iter().flatten().flatten().map(|e| e.path()));
+            match fs::read_dir(&entry) {
+                Ok(entries) => for entry in entries {
+                    match entry {
+                        Ok(entry) => stack.push(entry.path()),
+                        Err(_) => s.complete = false,
+                    }
+                },
+                Err(_) => s.complete = false,
+            }
         } else if m.is_file() {
             s.bytes += m.len();
         }
@@ -18540,26 +18589,37 @@ fn tree_stamp(p: &Path) -> TreeStamp {
     s
 }
 
-/// After a copy-based move: delete the sources still exactly as they were
-/// read (deepest first; folders only once empty). Returns how many changed
-/// meanwhile and were kept.
-fn delete_moved_sources(manifest: Vec<SrcStamp>) -> usize {
+#[derive(Default)]
+struct SourceCleanup {
+    changed: usize,
+    removed: Vec<PathBuf>,
+    errors: Vec<String>,
+}
+
+/// Check before deleting children (which change their parents' dates).
+/// Keep an exact list of successful removals for partial-move undo.
+fn delete_moved_sources(manifest: Vec<SrcStamp>) -> SourceCleanup {
     // Check everything first: deleting a child touches its folder's dates.
-    let mut changed = 0;
+    let mut result = SourceCleanup::default();
     let mut doomed = Vec::new();
     for s in manifest {
         match fs::symlink_metadata(&s.path) {
             Ok(m) if SrcStamp::of(&s.path, &m) == s => doomed.push(s),
-            Ok(_) => changed += 1,
-            Err(_) => {}
+            Ok(_) => result.changed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => result.removed.push(s.path),
+            Err(e) => result.errors.push(format!("Couldn't inspect “{}”: {e}", path_label(&s.path))),
         }
     }
     doomed.sort_by_key(|s| std::cmp::Reverse(s.path.components().count()));
     for s in doomed {
         // A folder that kept a changed child (or gained one) stays.
-        let _ = if s.is_dir { fs::remove_dir(&s.path) } else { fs::remove_file(&s.path) };
+        match if s.is_dir { fs::remove_dir(&s.path) } else { fs::remove_file(&s.path) } {
+            Ok(()) => result.removed.push(s.path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => result.removed.push(s.path),
+            Err(e) => result.errors.push(format!("Couldn't remove “{}”: {e}", path_label(&s.path))),
+        }
     }
-    changed
+    result
 }
 
 fn place_error(verb: &str, src: &Path, dest: &Path, e: &std::io::Error) -> String {
@@ -18611,22 +18671,53 @@ fn transfer_by_copy(
         }
     };
     let mut note = None;
+    let mut undo_steps = None;
     if let Some(m) = manifest {
+        let manifest = m.into_inner().unwrap_or_else(|e| e.into_inner());
+        let mut removed = Vec::new();
         // The copy must be on disk before any original goes.
         if let Err(e) = full_barrier(dir) {
             note = Some(format!("Couldn't flush “{}” to disk ({e}); kept the original", path_label(src)));
         } else {
             hook_before_delete();
-            if delete_moved_sources(m.into_inner().unwrap_or_else(|e| e.into_inner())) > 0 {
+            let cleanup = delete_moved_sources(manifest);
+            removed = cleanup.removed;
+            if !cleanup.errors.is_empty() {
+                note = Some(format!("Move copied “{}”, but source cleanup was incomplete: {} ({} errors)",
+                    path_label(src), cleanup.errors[0], cleanup.errors.len()));
+                if cleanup.changed > 0 {
+                    note.as_mut().unwrap().push_str("; sources changed during the move and were kept");
+                }
+            } else if cleanup.changed > 0 {
                 note = Some(format!("“{}” changed during the move; kept the original", path_label(src)));
             }
+        }
+        if !removed.iter().any(|path| path == src) {
+            // Restore only subtrees actually removed, never replace retained
+            // or edited originals. Leave the destination intact until every
+            // restoration succeeds; its snapshot is checked before trashing.
+            removed.sort_by_key(|path| path.components().count());
+            let mut roots: Vec<PathBuf> = Vec::new();
+            for path in removed {
+                if !roots.iter().any(|root| path.starts_with(root)) { roots.push(path); }
+            }
+            let snapshot = tree_stamp(&dest);
+            let mut steps = vec![UndoStep::Check { path: dest.clone(), stamp: snapshot.clone() }];
+            steps.extend(roots.into_iter().map(|path| UndoStep::Transfer {
+                src: dest.join(path.strip_prefix(src).expect("removed source entry")),
+                dest: path,
+                kind: TransferKind::Copy,
+                as_placed: false,
+            }));
+            steps.push(UndoStep::Trash { path: dest.clone(), stamp: Some(snapshot) });
+            undo_steps = Some(steps);
         }
     }
     let stamp = (kind == TransferKind::Copy || cloned).then(|| tree_stamp(&dest));
     if cloned {
-        cx.prog.done.fetch_add(stamp.map_or(0, |s| s.bytes), Ordering::Relaxed);
+        cx.prog.done.fetch_add(stamp.as_ref().map_or(0, |s| s.bytes), Ordering::Relaxed);
     }
-    Ok((Placed { src: src.to_path_buf(), dest, stamp }, note))
+    Ok((Placed { src: src.to_path_buf(), dest, stamp, undo_steps }, note))
 }
 
 /// Copy or move each (src, dest) pair. Moves try an exclusive rename first
@@ -18653,7 +18744,7 @@ fn run_transfer(
         if kind == TransferKind::Move && !hook_force_exdev() {
             match place(dest, policy, |d| rename_excl(src, d)) {
                 Ok(d) => {
-                    placed.push(Placed { src: src.clone(), dest: d, stamp: None });
+                    placed.push(Placed { src: src.clone(), dest: d, stamp: None, undo_steps: None });
                     continue;
                 }
                 Err(e) if e.raw_os_error() == Some(libc::EXDEV) => {}
@@ -18701,6 +18792,47 @@ fn run_transfer(
 
 // --- undo helpers ---
 
+/// Reverse a partial move in dependency order. Stop on the first failure:
+/// the complete destination must survive a failed restoration. Inverses of
+/// completed steps are retained, so partial undo/redo remains reversible.
+fn reverse_steps(steps: Vec<UndoStep>, prog: &JobProgress) -> (Vec<UndoStep>, Option<String>) {
+    let mut inverse = Vec::new();
+    for step in steps {
+        if prog.cancel.load(Ordering::Relaxed) {
+            return (inverse, Some("Undo/redo cancelled; completed steps remain reversible".into()));
+        }
+        let (mut back, err) = match step {
+            UndoStep::Check { path, stamp } => {
+                if !stamp.complete || tree_stamp(&path) != stamp {
+                    return (inverse, Some(format!("“{}” changed or couldn't be read; left in place", path_label(&path))));
+                }
+                (Vec::new(), None)
+            }
+            UndoStep::Transfer { src, dest, kind, as_placed } => {
+                let mut out = run_transfer(&[(src, dest)], kind, ConflictPolicy::Skip, prog);
+                if as_placed {
+                    for p in &mut out.placed { p.stamp = Some(tree_stamp(&p.dest)); }
+                }
+                let err = out.err.or_else(|| out.placed.is_empty().then(|| "Couldn't restore item; kept the complete copy".into()));
+                (transfer_undo_steps(kind, out.placed, as_placed), err)
+            }
+            UndoStep::Trash { path, stamp } => {
+                let label = path_label(&path);
+                let (trashed, _) = trash_unchanged(vec![(path, stamp)]);
+                let err = trashed.is_empty().then(|| format!("Couldn't undo “{label}”: changed, missing, or couldn't move to Trash"));
+                let back = trashed.into_iter().map(|(dest, src)| UndoStep::Transfer {
+                    src, dest, kind: TransferKind::Move, as_placed: true,
+                }).collect();
+                (back, err)
+            }
+        };
+        back.extend(inverse);
+        inverse = back;
+        if err.is_some() { return (inverse, err); }
+    }
+    (inverse, None)
+}
+
 /// Move `path` to the Trash; returns where it landed there (for undo).
 fn trash_path(path: &Path) -> Option<PathBuf> {
     let ns_path = NSString::from_str(&path.to_string_lossy());
@@ -18730,7 +18862,7 @@ fn trash_unchanged(items: Vec<(PathBuf, Option<TreeStamp>)>) -> (Vec<(PathBuf, P
         if fs::symlink_metadata(&p).is_err() {
             continue;
         }
-        if stamp.is_some_and(|s| tree_stamp(&p) != s) {
+        if !stamp.is_some_and(|s| s.complete && tree_stamp(&p) == s) {
             changed.push(p);
             continue;
         }
@@ -25469,6 +25601,135 @@ mod tests {
             ConflictPolicy::Skip, &JobProgress::default());
         assert_eq!(out.placed.len(), 1);
         assert!(fs::symlink_metadata(outside.join("link")).unwrap().file_type().is_symlink());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn undo_detects_each_edited_entry_beside_future_mtime() {
+        let d = scratch("undo-future-mtime");
+        let copy = d.join("copy");
+        fs::create_dir(&copy).unwrap();
+        fs::write(copy.join("future"), "x").unwrap();
+        fs::write(copy.join("edited"), "old").unwrap();
+        let future = fs::File::open(copy.join("future")).unwrap();
+        future.set_modified(SystemTime::now() + Duration::from_secs(86_400)).unwrap();
+        let stamp = tree_stamp(&copy);
+        std::thread::sleep(Duration::from_millis(10));
+        fs::write(copy.join("edited"), "NEW").unwrap();
+        let (trashed, changed) = trash_unchanged(vec![(copy.clone(), Some(stamp))]);
+        assert!(trashed.is_empty());
+        assert_eq!(changed, vec![copy.clone()]);
+        assert_eq!(fs::read_to_string(copy.join("edited")).unwrap(), "NEW");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn cross_volume_move_reports_cleanup_permission_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("cleanup-permission");
+        let src = d.join("src");
+        let dst = d.join("dst");
+        fs::create_dir(&src).unwrap();
+        fs::create_dir(&dst).unwrap();
+        fs::write(src.join("kept"), "original").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o555)).unwrap();
+        TEST_FORCE_EXDEV.set(true);
+        let out = run_transfer(&[(src.clone(), dst.join("copy"))], TransferKind::Move,
+            ConflictPolicy::Skip, &JobProgress::default());
+        TEST_FORCE_EXDEV.set(false);
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(out.placed.len(), 1);
+        assert!(src.join("kept").exists());
+        assert!(out.err.is_some(), "cleanup failure must be visible");
+        remove_staged(&d);
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn unreadable_snapshot_never_authorizes_undo() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("unreadable-stamp");
+        let copy = d.join("copy");
+        fs::create_dir(&copy).unwrap();
+        fs::write(copy.join("file"), "data").unwrap();
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o000)).unwrap();
+        let stamp = tree_stamp(&copy);
+        assert!(!stamp.complete);
+        let (trashed, changed) = trash_unchanged(vec![(copy.clone(), Some(stamp))]);
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(trashed.is_empty());
+        assert_eq!(changed, vec![copy.clone()]);
+        assert_eq!(fs::read_to_string(copy.join("file")).unwrap(), "data");
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn partial_move_undo_redo_preserves_retained_sources() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("partial-undo");
+        let src = d.join("src");
+        let dest = d.join("dest");
+        let trash = d.join("trash");
+        fs::create_dir_all(src.join("locked")).unwrap();
+        fs::create_dir(&trash).unwrap();
+        fs::write(src.join("moved"), "moved data").unwrap();
+        fs::write(src.join("locked/kept"), "retained data").unwrap();
+        fs::set_permissions(src.join("locked"), fs::Permissions::from_mode(0o555)).unwrap();
+        TEST_FORCE_EXDEV.set(true);
+        let out = run_transfer(&[(src.clone(), dest.clone())], TransferKind::Move,
+            ConflictPolicy::Skip, &JobProgress::default());
+        TEST_FORCE_EXDEV.set(false);
+        assert!(out.err.is_some());
+        assert!(!src.join("moved").exists());
+        assert!(src.join("locked/kept").exists());
+        // A later edit to the retained source must survive undo and redo.
+        fs::write(src.join("locked/kept"), "user edit").unwrap();
+        let UndoOp::Steps(steps) = transfer_undo_op(TransferKind::Move, out.placed, false) else { panic!("partial move needs exact undo"); };
+        TEST_TRASH.with(|t| *t.borrow_mut() = Some(trash));
+        let (redo, err) = reverse_steps(steps, &JobProgress::default());
+        assert!(err.is_none(), "{err:?}");
+        assert!(!dest.exists());
+        assert_eq!(fs::read_to_string(src.join("moved")).unwrap(), "moved data");
+        assert_eq!(fs::read_to_string(src.join("locked/kept")).unwrap(), "user edit");
+        let (undo, err) = reverse_steps(redo, &JobProgress::default());
+        assert!(err.is_none(), "{err:?}");
+        assert!(dest.join("moved").exists());
+        assert!(!src.join("moved").exists());
+        assert_eq!(fs::read_to_string(src.join("locked/kept")).unwrap(), "user edit");
+        let (_, err) = reverse_steps(undo, &JobProgress::default());
+        assert!(err.is_none(), "{err:?}");
+        assert!(!dest.exists());
+        TEST_TRASH.with(|t| *t.borrow_mut() = None);
+        fs::set_permissions(src.join("locked"), fs::Permissions::from_mode(0o755)).unwrap();
+        remove_staged(&d);
+        assert!(!d.exists());
+    }
+
+    #[test]
+    fn partial_move_undo_keeps_complete_copy_when_restore_is_blocked() {
+        let d = scratch("partial-undo-conflict");
+        let src = d.join("src");
+        let dest = d.join("dest");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("removed"), "original").unwrap();
+        fs::write(src.join("retained"), "old").unwrap();
+        let retained = src.join("retained");
+        TEST_BEFORE_DELETE.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+            fs::write(&retained, "changed during copy").unwrap();
+        })));
+        TEST_FORCE_EXDEV.set(true);
+        let out = run_transfer(&[(src.clone(), dest.clone())], TransferKind::Move,
+            ConflictPolicy::Skip, &JobProgress::default());
+        TEST_FORCE_EXDEV.set(false);
+        TEST_BEFORE_DELETE.with(|h| *h.borrow_mut() = None);
+        assert!(out.err.is_some());
+        fs::write(src.join("removed"), "newcomer").unwrap();
+        let UndoOp::Steps(steps) = transfer_undo_op(TransferKind::Move, out.placed, false) else { panic!(); };
+        let (inverse, err) = reverse_steps(steps, &JobProgress::default());
+        assert!(err.is_some());
+        assert!(inverse.is_empty());
+        assert_eq!(fs::read_to_string(src.join("removed")).unwrap(), "newcomer");
+        assert_eq!(fs::read_to_string(dest.join("removed")).unwrap(), "original");
         fs::remove_dir_all(d).unwrap();
     }
 
