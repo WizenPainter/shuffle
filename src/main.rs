@@ -17970,12 +17970,16 @@ struct FileJob {
     prog: Arc<JobProgress>,
 }
 
-/// Per-entry metadata, keyed by relative path. An unreadable tree never
-/// authorizes destructive undo.
+/// Fingerprint of an item tree that changes when any entry does: every
+/// entry's relative path, identity, size, mtime and ctime folded into an
+/// order-independent digest (constant memory, however big the tree — each
+/// undoable copy keeps one). An unreadable tree never authorizes destructive
+/// undo.
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 struct TreeStamp {
     bytes: u64,
-    entries: BTreeMap<PathBuf, SrcStamp>,
+    items: u64,
+    digest: u64,
     complete: bool,
 }
 
@@ -18115,6 +18119,23 @@ fn rename_excl(from: &Path, to: &Path) -> std::io::Result<()> {
         return Ok(());
     }
     let e = std::io::Error::last_os_error();
+    // macOS refuses to rename a folder its owner can't write (even within the
+    // same parent) — a read-only folder couldn't be copied (its staged copy
+    // can't be published), moved or renamed. Like Finder, lend the owner
+    // write permission for the rename and put the original mode back after.
+    if e.raw_os_error() == Some(libc::EACCES) {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(md) = fs::symlink_metadata(from) {
+            let mode = md.permissions().mode();
+            if md.is_dir() && mode & 0o200 == 0 && fs::set_permissions(from, fs::Permissions::from_mode(mode | 0o200)).is_ok() {
+                let r = unsafe { libc::renamex_np(f.as_ptr(), t.as_ptr(), libc::RENAME_EXCL) };
+                let err = std::io::Error::last_os_error();
+                let at = if r == 0 { to } else { from };
+                let _ = fs::set_permissions(at, fs::Permissions::from_mode(mode));
+                return if r == 0 { Ok(()) } else { Err(err) };
+            }
+        }
+    }
     if e.raw_os_error() == Some(libc::ENOTSUP) {
         // Volumes without exclusive rename (some network/FAT disks): best effort.
         if fs::symlink_metadata(to).is_ok() {
@@ -18257,7 +18278,7 @@ struct CopyCtx<'a> {
 }
 
 /// A source entry as a copy-based move read it.
-#[derive(Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug, Hash)]
 struct SrcStamp {
     path: PathBuf,
     dev: u64,
@@ -18571,7 +18592,13 @@ fn tree_stamp(p: &Path) -> TreeStamp {
     while let Some(entry) = stack.pop() {
         let Ok(m) = fs::symlink_metadata(&entry) else { s.complete = false; continue };
         let relative = entry.strip_prefix(p).expect("entry under snapshot root");
-        s.entries.insert(relative.to_path_buf(), SrcStamp::of(relative, &m));
+        {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            SrcStamp::of(relative, &m).hash(&mut h);
+            s.digest = s.digest.wrapping_add(h.finish());
+            s.items += 1;
+        }
         if m.is_dir() {
             match fs::read_dir(&entry) {
                 Ok(entries) => for entry in entries {
@@ -25731,6 +25758,34 @@ mod tests {
         assert_eq!(fs::read_to_string(src.join("removed")).unwrap(), "newcomer");
         assert_eq!(fs::read_to_string(dest.join("removed")).unwrap(), "original");
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn read_only_folders_copy_move_and_rename() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = scratch("ro-folder");
+        let ro = d.join("ro");
+        fs::create_dir(&ro).unwrap();
+        fs::write(ro.join("f"), "x").unwrap();
+        fs::set_permissions(&ro, fs::Permissions::from_mode(0o555)).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        // Copy (walked, as across volumes) keeps the read-only mode.
+        TEST_NO_CLONE.set(true);
+        let out = run_transfer(&[(ro.clone(), d.join("copy"))], TransferKind::Copy, ConflictPolicy::Skip, &JobProgress::default());
+        TEST_NO_CLONE.set(false);
+        assert!(out.err.is_none(), "{:?}", out.err);
+        assert_eq!(mode(&d.join("copy")), 0o555);
+        // Cloned copy too.
+        let out = run_transfer(&[(ro.clone(), d.join("clone"))], TransferKind::Copy, ConflictPolicy::Skip, &JobProgress::default());
+        assert!(out.err.is_none(), "{:?}", out.err);
+        assert_eq!(mode(&d.join("clone")), 0o555);
+        // Rename and move keep it as well.
+        rename_excl(&ro, &d.join("renamed")).unwrap();
+        assert_eq!(mode(&d.join("renamed")), 0o555);
+        fs::create_dir(d.join("sub")).unwrap();
+        rename_excl(&d.join("renamed"), &d.join("sub/moved")).unwrap();
+        assert_eq!(mode(&d.join("sub/moved")), 0o555);
+        remove_staged(&d);
     }
 
     #[test]
