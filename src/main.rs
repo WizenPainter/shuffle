@@ -3581,6 +3581,42 @@ impl MenuNode {
     }
 }
 
+/// Where the context menu's panels go (window coords). The root's spot
+/// depends only on its own size — never on the flyout — and the flyout's
+/// offset is relative to the root's top.
+#[derive(Debug, PartialEq)]
+struct MenuLayout {
+    root_x: f32,
+    root_y: f32,
+    /// Flyout top relative to the root's top (None when no flyout is open).
+    fly_off: Option<f32>,
+    /// Flyout goes on the left (no room on the right).
+    flip: bool,
+}
+
+/// Lay the menu out ourselves (every row height is fixed). The root and the
+/// flyout used to share one window-snapped box: near the bottom, opening a
+/// tall flyout pushed the whole menu up, the pointer left the parent row,
+/// the flyout closed, the menu dropped back… and looped (issue #15).
+fn menu_layout(win: (f32, f32), at: (f32, f32), nodes: &[MenuNode], open_sub: Option<usize>) -> MenuLayout {
+    const MARGIN: f32 = 8.0;
+    const PAD: f32 = 10.0; // py_1 + border
+    const EST_W: f32 = 230.0; // panel width estimate (min 210 + labels)
+    let (win_w, win_h) = win;
+    let panel_h = |nodes: &[MenuNode]| nodes.iter().map(MenuNode::height).sum::<f32>() + PAD;
+    let root_y = at.1.min(win_h - panel_h(nodes) - MARGIN).max(MARGIN);
+    let root_x = at.0.min(win_w - EST_W - MARGIN).max(MARGIN);
+    // Flyout: top aligned to its parent row, slid up just enough to fit.
+    let fly_off = open_sub.and_then(|si| match nodes.get(si) {
+        Some(MenuNode::Sub { items, .. }) => {
+            let off: f32 = nodes[..si].iter().map(MenuNode::height).sum();
+            Some(off.min(win_h - MARGIN - panel_h(items) - root_y).max(MARGIN - root_y))
+        }
+        _ => None,
+    });
+    MenuLayout { root_x, root_y, fly_off, flip: root_x + 2.0 * EST_W + MARGIN > win_w }
+}
+
 /// Context-menu row height (fixed so flyout alignment is deterministic).
 const MENU_ROW_H: f32 = 26.0;
 
@@ -4199,6 +4235,9 @@ struct Shuffle {
     kb_pivot: Option<(usize, PathBuf)>,
     /// The F1 shortcut reference, with its filter text, when open.
     shortcut_help: Option<String>,
+    /// Bumped on every context-menu hover; a delayed flyout switch only
+    /// applies if nothing was hovered since.
+    menu_hover_gen: u64,
     /// The Settings view shown by a Settings tab (created on first use).
     settings_view: Option<Entity<Settings>>,
     /// Text macOS is still composing (a dead key like ~ or ´ waiting for its
@@ -4557,6 +4596,7 @@ impl Shuffle {
             delete_permanent: false,
             kb_pivot: None,
             shortcut_help: None,
+            menu_hover_gen: 0,
             settings_view: None,
             ime_marked: None,
         }
@@ -4626,17 +4666,45 @@ impl Shuffle {
         }
         m.sel_root = Some(i);
         m.sel_sub = None;
+        self.menu_hover_gen += 1;
+        // A flyout is open and the pointer crossed another row — usually on
+        // its way diagonally to the flyout. Highlight the row now but switch
+        // the flyout only if the pointer is still there a moment later (the
+        // grace period native menus use); reaching the flyout cancels it.
+        if m.open_sub.is_some() && m.open_sub != Some(i) {
+            let gen = self.menu_hover_gen;
+            cx.notify();
+            cx.spawn(async move |this, cx| {
+                cx.background_executor().timer(Duration::from_millis(260)).await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.menu_hover_gen != gen {
+                        return;
+                    }
+                    if let Some(m) = this.context_menu.as_mut() {
+                        if m.sel_root == Some(i) && m.sel_sub.is_none() {
+                            m.open_sub = want_sub;
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .detach();
+            return;
+        }
         m.open_sub = want_sub;
         cx.notify();
     }
 
-    /// Mouse entered a flyout row.
+    /// Mouse entered a flyout row: it's the target, so the flyout's parent
+    /// stays the highlighted root row and any pending switch is cancelled.
     fn menu_hover_sub(&mut self, j: usize, cx: &mut Context<Self>) {
         let Some(m) = self.context_menu.as_mut() else { return };
-        if m.sel_sub == Some(j) {
+        if m.sel_sub == Some(j) && m.sel_root == m.open_sub {
             return;
         }
         m.sel_sub = Some(j);
+        m.sel_root = m.open_sub;
+        self.menu_hover_gen += 1;
         cx.notify();
     }
 
@@ -7922,20 +7990,15 @@ impl Shuffle {
         // snapped box with the flyout: near the bottom, opening a tall flyout
         // pushed the whole menu up, the pointer left the parent row, the
         // flyout closed, the menu dropped back… and looped (issue #15).
-        const MARGIN: f32 = 8.0;
-        const PAD: f32 = 10.0; // py_1 + border
-        let (win_w, win_h) = (f32::from(viewport.width), f32::from(viewport.height));
-        let panel_h = |nodes: &[MenuNode]| nodes.iter().map(MenuNode::height).sum::<f32>() + PAD;
-        let root_h = panel_h(&menu.nodes);
-        let root_y = menu.y.min(win_h - root_h - MARGIN).max(MARGIN);
-        // The open flyout: beside the root, top aligned to its parent row,
-        // slid up just enough to fit the window; flipped to the left side
-        // when there's no room on the right.
-        let flyout = menu.open_sub.and_then(|si| match menu.nodes.get(si) {
+        let layout = menu_layout(
+            (f32::from(viewport.width), f32::from(viewport.height)),
+            (menu.x, menu.y),
+            &menu.nodes,
+            menu.open_sub,
+        );
+        let (root_x, root_y, flip) = (layout.root_x, layout.root_y, layout.flip);
+        let flyout = layout.fly_off.zip(menu.open_sub).and_then(|(off, si)| match menu.nodes.get(si) {
             Some(MenuNode::Sub { items, .. }) => {
-                let off: f32 = menu.nodes[..si].iter().map(MenuNode::height).sum();
-                let fly_h = panel_h(items);
-                let off = off.min(win_h - MARGIN - fly_h - root_y).max(MARGIN - root_y);
                 let rows: Vec<AnyElement> = items
                     .iter()
                     .enumerate()
@@ -7945,9 +8008,6 @@ impl Shuffle {
             }
             _ => None,
         });
-        const EST_W: f32 = 230.0; // panel width estimate (min 210 + labels)
-        let root_x = menu.x.min(win_w - EST_W - MARGIN).max(MARGIN);
-        let flip = root_x + 2.0 * EST_W + MARGIN > win_w;
 
         // Full-window backdrop: any click/right-click outside closes the menu.
         div()
@@ -26035,6 +26095,30 @@ mod tests {
         assert_eq!(pretty_keystroke("cmd-shift-z"), "⌘⇧Z");
         assert_eq!(pretty_keystroke("-"), "-");
         assert_eq!(pretty_keystroke("f1"), "F1");
+    }
+
+    #[test]
+    fn context_menu_root_never_moves_for_its_flyout() {
+        let item = || MenuNode::Disabled("x".into());
+        let tags = MenuNode::Sub { label: "Tags".into(), items: (0..8).map(|_| item()).collect() };
+        let mut nodes: Vec<MenuNode> = (0..10).map(|_| item()).collect();
+        nodes.push(tags);
+        nodes.push(item());
+        let win = (1100.0, 720.0);
+        // Opened near the bottom: root is clamped up by its own height only.
+        let closed = menu_layout(win, (300.0, 650.0), &nodes, None);
+        let open = menu_layout(win, (300.0, 650.0), &nodes, Some(10));
+        assert_eq!((closed.root_x, closed.root_y), (open.root_x, open.root_y), "opening the flyout moved the root");
+        let root_h = 12.0 * MENU_ROW_H + 10.0;
+        assert!(closed.root_y + root_h <= 720.0 - 8.0 + 0.01);
+        // The tall flyout slid up to fit inside the window.
+        let fly_h = 8.0 * MENU_ROW_H + 10.0;
+        let off = open.fly_off.unwrap();
+        assert!(open.root_y + off + fly_h <= 720.0 - 8.0 + 0.01);
+        assert!(off < 10.0 * MENU_ROW_H, "flyout should slide up from its parent row");
+        // Near the right edge the flyout flips to the left.
+        assert!(menu_layout(win, (1000.0, 100.0), &nodes, Some(10)).flip);
+        assert!(!menu_layout(win, (200.0, 100.0), &nodes, Some(10)).flip);
     }
 
     #[test]
