@@ -385,6 +385,9 @@ struct Prefs {
     show_hidden: bool,
     /// Open Settings as a tab in the main window instead of its own window.
     settings_in_tab: bool,
+    /// Require a double-click to open a folder in the list/icon views (a single
+    /// click only selects it), like Finder. Off by default: a click opens.
+    double_click_folders: bool,
 }
 
 impl Default for Prefs {
@@ -409,6 +412,7 @@ impl Default for Prefs {
             palette_opacity: 92,
             show_hidden: false,
             settings_in_tab: false,
+            double_click_folders: false,
         }
     }
 }
@@ -438,6 +442,7 @@ thread_local! {
         palette_opacity: 92,
         show_hidden: false,
         settings_in_tab: false,
+        double_click_folders: false,
     }) };
 }
 
@@ -1932,6 +1937,19 @@ impl Settings {
                         cx.listener(|_, _: &ClickEvent, _, cx| {
                             let mut np = prefs();
                             np.show_parent = !np.show_parent;
+                            apply_prefs(np, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .into_any_element(),
+                    toggle_row(
+                        "tg-double-click-folders",
+                        "Double-click to open folders",
+                        "A single click only selects a folder; double-click opens it, like Finder. Off by default (a single click opens).",
+                        p.double_click_folders,
+                        cx.listener(|_, _: &ClickEvent, _, cx| {
+                            let mut np = prefs();
+                            np.double_click_folders = !np.double_click_folders;
                             apply_prefs(np, cx);
                             cx.notify();
                         }),
@@ -12170,7 +12188,12 @@ impl Shuffle {
         } else if mods.shift {
             self.range_select(pane, path, cx);
         } else if is_dir {
-            self.navigate_in(pane, path, cx);
+            // With "double-click to open folders", the first click only selects.
+            if prefs().double_click_folders && ev.click_count() < 2 {
+                self.select_entry(pane, path, cx);
+            } else {
+                self.navigate_in(pane, path, cx);
+            }
         } else if ev.click_count() >= 2 {
             self.open_path(pane, path, false, cx);
         } else {
@@ -24905,8 +24928,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\nshow_hidden={}\nsettings_in_tab={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity, p.show_hidden, p.settings_in_tab
+            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\nshow_hidden={}\nsettings_in_tab={}\ndouble_click_folders={}\n",
+            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity, p.show_hidden, p.settings_in_tab, p.double_click_folders
         );
         let _ = fs::write(&file, body);
     }
@@ -25058,6 +25081,7 @@ fn load_prefs() -> Prefs {
                     "waterfall" => p.waterfall = on,
                     "show_hidden" => p.show_hidden = on,
                     "settings_in_tab" => p.settings_in_tab = on,
+                    "double_click_folders" => p.double_click_folders = on,
                     "palette_opacity" => {
                         if let Ok(n) = v.trim().parse::<u8>() {
                             p.palette_opacity = n.clamp(20, 100);
