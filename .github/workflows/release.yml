@@ -39,7 +39,7 @@ permissions:
 
 jobs:
   release:
-    runs-on: macos-14  # Apple Silicon; cross-builds the x86_64 slice too
+    runs-on: macos-15  # Apple Silicon; cross-builds the x86_64 slice too
     steps:
       - uses: actions/checkout@v4
 
