@@ -3777,6 +3777,8 @@ enum SidebarTarget {
     Tab(usize, usize),
     /// The nav/path bar of a pane → New Tab / Copy Path / Open in Terminal.
     NavBar(usize),
+    /// A mounted volume (USB drive, disk image, network share) → Open / Eject.
+    Volume(PathBuf),
 }
 
 /// One row in the command palette: a title, a gray subtitle (full path), and
@@ -4537,6 +4539,31 @@ impl Shuffle {
             while let Some(batch) = fs_rx.next().await {
                 if this.update(cx, |this, cx| this.apply_fs_batch(batch, cx)).is_err() {
                     break;
+                }
+            }
+        })
+        .detach();
+        // Drives being plugged in / ejected (here or in Finder): redraw the
+        // sidebar when the set of /Volumes entries changes, so a new USB stick
+        // shows up without waiting for some unrelated repaint.
+        cx.spawn(async move |this, cx| {
+            let names = || -> Vec<std::ffi::OsString> {
+                let mut v: Vec<_> = fs::read_dir("/Volumes")
+                    .map(|rd| rd.flatten().map(|e| e.file_name()).collect())
+                    .unwrap_or_default();
+                v.sort();
+                v
+            };
+            let mut last = names();
+            loop {
+                cx.background_executor().timer(Duration::from_millis(1500)).await;
+                let now = names();
+                if now != last {
+                    last = now;
+                    cx.background_spawn(async { rescan_sidebar_now() }).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        break;
+                    }
                 }
             }
         })
@@ -9216,6 +9243,24 @@ impl Shuffle {
                     ctx_item("Remove from Group", cx.listener(move |this, _: &ClickEvent, _, cx| {
                         this.close_sidebar_menu(cx);
                         this.remove_from_group(idx, &p, cx);
+                    }))
+                    .into_any_element(),
+                );
+            }
+            SidebarTarget::Volume(p) => {
+                let open = p.clone();
+                items.push(
+                    ctx_item("Open", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.navigate_to(open.clone(), cx);
+                    }))
+                    .into_any_element(),
+                );
+                items.push(ctx_separator().into_any_element());
+                items.push(
+                    ctx_item("Eject", cx.listener(move |this, _: &ClickEvent, _, cx| {
+                        this.close_sidebar_menu(cx);
+                        this.eject_volume(p.clone(), cx);
                     }))
                     .into_any_element(),
                 );
@@ -14503,6 +14548,41 @@ impl Shuffle {
         }
     }
 
+    /// Eject the volume at `vol` off the main thread. Panes showing a folder on
+    /// it move to the home folder first, so Shuffle itself doesn't hold it busy.
+    fn eject_volume(&mut self, vol: PathBuf, cx: &mut Context<Self>) {
+        let name = path_label(&vol);
+        let keep_active = self.active_pane;
+        for pane in 0..self.panes.len() {
+            let t = self.tab(pane);
+            if t.remote.is_none() && t.current_dir.starts_with(&vol) {
+                self.navigate_in(pane, home_dir(), cx);
+            }
+        }
+        self.active_pane = keep_active;
+        clear_column_cache();
+        self.set_notice_sticky(format!("Ejecting \u{201c}{name}\u{201d}\u{2026}"), cx);
+        cx.spawn(async move |this, cx| {
+            let target = vol.clone();
+            // Rescan the sidebar now rather than on the next 2 s refresh.
+            let res = cx
+                .background_spawn(async move {
+                    let r = eject_mount(&target);
+                    rescan_sidebar_now();
+                    r
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                match res {
+                    Ok(()) => this.set_notice(format!("Ejected \u{201c}{name}\u{201d}"), cx),
+                    Err(e) => this.set_notice(format!("Couldn\u{2019}t eject \u{201c}{name}\u{201d}: {e}"), cx),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     fn open_sidebar_menu(&mut self, x: f32, y: f32, target: SidebarTarget, cx: &mut Context<Self>) {
         self.sidebar_menu = Some((x, y, target));
         cx.notify();
@@ -15049,8 +15129,7 @@ impl Shuffle {
             // saved SFTP servers, and Connect to Server. The boot disk and home
             // live in Favorites, so they aren't duplicated here.
             for (label, path) in volumes {
-                let icon_key = path.to_string_lossy().into_owned();
-                push_nav(&mut items, cx, &mut key, label, icon_key, path, current, collapsed);
+                push_volume_nav(&mut items, cx, &mut key, label, path, current, collapsed);
             }
             // Saved SFTP servers — click to connect and browse remotely.
             for server in sftp_servers() {
@@ -17156,6 +17235,87 @@ fn push_nav(
     items.push(item.into_any_element());
 }
 
+/// A mounted volume row in the sidebar: navigates like [`push_nav`], with a ⏏
+/// button and a right-click menu (Open / Eject).
+#[allow(clippy::too_many_arguments)]
+fn push_volume_nav(
+    items: &mut Vec<AnyElement>,
+    cx: &Context<Shuffle>,
+    key: &mut usize,
+    label: String,
+    target: PathBuf,
+    current: &Path,
+    collapsed: bool,
+) {
+    *key += 1;
+    let t = theme();
+    let active = target.as_path() == current;
+    let tooltip = format!("{label}\n{}", display_path(&target));
+    let nav_target = target.clone();
+    let right_target = target.clone();
+    let eject_target = target.clone();
+    let eject = div()
+        .id(("eject", *key))
+        .flex_none()
+        .px_1()
+        .rounded_sm()
+        .text_color(rgb(t.text_dim))
+        .hover(|s| s.bg(rgb(t.selected)).text_color(rgb(t.text)))
+        .child("\u{23cf}")
+        .tooltip(tip(format!("Eject \u{201c}{label}\u{201d}")))
+        // Keep the row's own click (navigate) from firing underneath.
+        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+            cx.stop_propagation();
+            this.eject_volume(eject_target.clone(), cx);
+        }))
+        .into_any_element();
+    let item = nav_item_with(
+        label,
+        tooltip,
+        sidebar_icon(&target.to_string_lossy(), 16.0),
+        *key,
+        active,
+        collapsed,
+        cx.listener(move |this, _: &ClickEvent, _, cx| {
+            this.navigate_to(nav_target.clone(), cx);
+        }),
+        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+            let (x, y) = (f64::from(ev.position.x) as f32, f64::from(ev.position.y) as f32);
+            this.open_sidebar_menu(x, y, SidebarTarget::Volume(right_target.clone()), cx);
+            cx.stop_propagation();
+        }),
+        Some(eject),
+    );
+    items.push(item.into_any_element());
+}
+
+/// Eject (or, for network shares, unmount) the volume mounted at `path`.
+/// Returns an error message on failure (e.g. "in use by …").
+fn eject_mount(path: &Path) -> Result<(), String> {
+    let run = |verb: &str| {
+        Command::new("diskutil")
+            .arg(verb)
+            .arg(path)
+            .output()
+            .map_err(|e| e.to_string())
+            .and_then(|o| {
+                if o.status.success() {
+                    Ok(())
+                } else {
+                    let mut msg = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                    if msg.is_empty() {
+                        msg = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    }
+                    Err(msg.lines().last().unwrap_or("unknown error").to_string())
+                }
+            })
+    };
+    // `eject` takes the whole physical disk (all its partitions) offline, as
+    // Finder does; shares and some images only support `unmount`.
+    run("eject").or_else(|e| if path.exists() { run("unmount").map_err(|_| e) } else { Ok(()) })
+}
+
 /// Like [`push_nav`] but for a bookmark, which may be a file or a folder:
 /// folders navigate, files open in their default app, and the icon reflects the
 /// file type.
@@ -19241,6 +19401,7 @@ fn revert_renames(pairs: &[(PathBuf, PathBuf)]) -> Vec<(PathBuf, PathBuf)> {
 
 #[allow(clippy::too_many_arguments)]
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn nav_item(
     label: String,
     tooltip: String,
@@ -19250,6 +19411,23 @@ fn nav_item(
     collapsed: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> impl IntoElement {
+    nav_item_with(label, tooltip, icon, key, active, collapsed, on_click, on_right, None)
+}
+
+/// [`nav_item`] with an optional element pinned to the row's right edge (the
+/// ⏏ button on volumes). It's dropped in the collapsed rail.
+#[allow(clippy::too_many_arguments)]
+fn nav_item_with(
+    label: String,
+    tooltip: String,
+    icon: AnyElement,
+    key: usize,
+    active: bool,
+    collapsed: bool,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    on_right: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    trailing: Option<AnyElement>,
 ) -> impl IntoElement {
     let t = theme();
     let mut base = div()
@@ -19274,7 +19452,8 @@ fn nav_item(
     let base = if collapsed {
         base
     } else {
-        base.child(div().min_w_0().overflow_hidden().child(label))
+        base.child(div().flex_1().min_w_0().overflow_hidden().child(label))
+            .children(trailing)
     };
     base.tooltip(tip(tooltip))
         .on_click(on_click)
@@ -19982,6 +20161,13 @@ fn sidebar_locations() -> (Vec<(String, PathBuf)>, Vec<(String, PathBuf)>) {
             (cloud, vols)
         }
     }
+}
+
+/// Rescan cloud locations and volumes and store them for the sidebar. Blocking
+/// (a stale network mount can stall it), so call it off the main thread.
+fn rescan_sidebar_now() {
+    let fresh = (Instant::now(), cloud_locations(), mounted_volumes());
+    *SIDEBAR_SCAN.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(fresh);
 }
 
 /// List a folder's visible subdirectories (sorted case-insensitively) plus its
