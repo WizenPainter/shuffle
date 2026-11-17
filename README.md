@@ -12,6 +12,10 @@ and a deep set of power user features and customization.
 
 </div>
 
+<p align="center">
+  <img src="docs/screenshot.png" alt="Shuffle in split view: a project folder in the list view on the left, a Pictures folder in the icon view on the right" width="900" />
+</p>
+
 ## Philosophy
 
 macOS file managers are either too limited or too slow. Shuffle is a single,
