@@ -388,6 +388,9 @@ struct Prefs {
     /// Require a double-click to open a folder in the list/icon views (a single
     /// click only selects it), like Finder. Off by default: a click opens.
     double_click_folders: bool,
+    /// "Group by Kind" in the List view (sections per kind). Global: applies to
+    /// every tab and pane, and survives restarts.
+    group_by_kind: bool,
 }
 
 impl Default for Prefs {
@@ -413,6 +416,7 @@ impl Default for Prefs {
             show_hidden: false,
             settings_in_tab: false,
             double_click_folders: false,
+            group_by_kind: false,
         }
     }
 }
@@ -443,6 +447,7 @@ thread_local! {
         show_hidden: false,
         settings_in_tab: false,
         double_click_folders: false,
+        group_by_kind: false,
     }) };
 }
 
@@ -3824,6 +3829,142 @@ impl SortKey {
     }
 }
 
+
+/// One display row of a grouped List view.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum RowRef {
+    /// Section header number `k` (index into `Tab::group_marks`).
+    Header(usize),
+    /// Blank row separating two sections (rows are all one height, so extra
+    /// spacing is a whole empty row).
+    Spacer,
+    /// A file/folder row: index into `Tab::entries`.
+    Entry(usize),
+}
+
+impl Tab {
+    /// Sort `entries` by this tab's criterion, then (if grouping is on) stable-
+    /// group them by kind and rebuild the section boundaries.
+    fn resort(&mut self) {
+        let (key, asc) = (self.sort_key, self.sort_asc);
+        sort_entries(&mut self.entries, key, asc);
+        if prefs().group_by_kind {
+            let reverse = key == SortKey::Kind && !asc;
+            self.group_marks = group_entries_by_kind(&mut self.entries, reverse);
+        } else {
+            self.group_marks.clear();
+        }
+    }
+
+    /// Whether the List view currently shows section headers.
+    fn grouped(&self) -> bool {
+        prefs().group_by_kind
+            && self.view == ViewMode::List
+            && self.find_query.is_none()
+            && self.group_marks.last().is_some_and(|m| m.0 + m.2 == self.entries.len())
+    }
+
+    /// Layout: group `k` is [spacer (k>0)] [header] [entries...], so its header
+    /// sits at row `start_k + 2k` and its entries follow at `ix + 2k + 1`.
+    fn rows_len(&self) -> usize {
+        if self.grouped() {
+            self.entries.len() + 2 * self.group_marks.len() - 1
+        } else {
+            self.entries.len()
+        }
+    }
+
+    /// Display row (excluding ".." row) of entry index `ix`.
+    fn entry_row(&self, ix: usize) -> usize {
+        if !self.grouped() {
+            return ix;
+        }
+        let k = self.group_marks.iter().take_while(|m| m.0 <= ix).count().saturating_sub(1);
+        ix + 2 * k + 1
+    }
+
+    /// What lives at display `row` (excluding ".." row), or `None` past the end.
+    fn row_ref(&self, row: usize) -> Option<RowRef> {
+        if !self.grouped() {
+            return (row < self.entries.len()).then_some(RowRef::Entry(row));
+        }
+        for (k, m) in self.group_marks.iter().enumerate() {
+            let header = m.0 + 2 * k;
+            let block_start = header - usize::from(k > 0);
+            if row < block_start {
+                return Some(RowRef::Entry(row - (2 * k - 1)));
+            }
+            if k > 0 && row == header - 1 {
+                return Some(RowRef::Spacer);
+            }
+            if row == header {
+                return Some(RowRef::Header(k));
+            }
+        }
+        let g = self.group_marks.len();
+        let ix = row.checked_sub(2 * g - 1)?;
+        (ix < self.entries.len()).then_some(RowRef::Entry(ix))
+    }
+}
+
+/// Broad category for "Group by Kind": (display rank, name). Related formats
+/// share a section (all images, the Office suite…); PDF stays its own.
+fn kind_category(name: &str, is_dir: bool) -> (u8, &'static str) {
+    if is_dir {
+        return (0, "Folders");
+    }
+    let ext = Path::new(name)
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase());
+    match ext.as_deref() {
+        Some("jpg" | "jpeg" | "png" | "gif" | "bmp" | "tiff" | "tif" | "heic" | "heif" | "webp" | "svg" | "ico") => {
+            (1, "Images")
+        }
+        Some("mp4" | "mov" | "avi" | "mkv" | "webm" | "m4v" | "wmv" | "flv") => (2, "Videos"),
+        Some("mp3" | "wav" | "flac" | "aac" | "m4a" | "ogg" | "aiff" | "wma" | "opus") => (3, "Audio"),
+        Some(
+            "doc" | "docx" | "xls" | "xlsx" | "xlsm" | "xlsb" | "ppt" | "pptx" | "odt" | "ods" | "odp"
+            | "pages" | "numbers" | "key",
+        ) => (4, "Office"),
+        Some("pdf") => (5, "PDF"),
+        Some(
+            "txt" | "md" | "rtf" | "log" | "csv" | "tsv" | "rs" | "py" | "js" | "ts" | "tsx" | "jsx" | "c"
+            | "cpp" | "h" | "hpp" | "go" | "java" | "rb" | "swift" | "zig" | "sh" | "json" | "toml" | "yaml"
+            | "yml" | "html" | "css",
+        ) => (6, "Text & Code"),
+        Some("zip" | "tar" | "gz" | "7z" | "rar" | "bz2" | "xz") => (7, "Archives"),
+        Some("app" | "dmg" | "pkg") => (8, "Apps & Installers"),
+        _ => (9, "Other"),
+    }
+}
+
+/// Stable-group `entries` by broad category (already sorted by the user's
+/// criterion) and return the section boundaries. Sections follow a fixed order
+/// (reversed when sorting by Kind descending); order inside a section is kept.
+fn group_entries_by_kind(entries: &mut [Entry], reverse: bool) -> Vec<(usize, String, usize)> {
+    use std::cmp::Reverse;
+    if reverse {
+        entries.sort_by_cached_key(|e| Reverse(kind_category(&e.name, e.is_dir).0));
+    } else {
+        entries.sort_by_cached_key(|e| kind_category(&e.name, e.is_dir).0);
+    }
+    let mut marks: Vec<(usize, String, usize)> = Vec::new();
+    let mut last_rank = None;
+    for (i, e) in entries.iter().enumerate() {
+        let (rank, label) = kind_category(&e.name, e.is_dir);
+        if last_rank == Some(rank) {
+            if let Some(m) = marks.last_mut() {
+                m.2 += 1;
+            }
+        } else {
+            marks.push((i, label.to_string(), 1));
+            last_rank = Some(rank);
+        }
+    }
+    marks
+}
+
 /// How items are displayed in a pane.
 #[derive(Clone, Copy, PartialEq)]
 enum ViewMode {
@@ -3889,6 +4030,9 @@ struct Tab {
     /// Sort criterion and direction for this tab's listing.
     sort_key: SortKey,
     sort_asc: bool,
+    /// Section boundaries over `entries` (first entry index, kind label,
+    /// count), rebuilt by `sort_tab`. Empty unless grouping is on.
+    group_marks: Vec<(usize, String, usize)>,
     /// How items are displayed.
     view: ViewMode,
     /// Column view: the chain of folders selected, one per cascading column.
@@ -3954,6 +4098,7 @@ impl Tab {
             anchor: None,
             sort_key: SortKey::None,
             sort_asc: true,
+            group_marks: Vec::new(),
             view: ViewMode::List,
             col_chain: Vec::new(),
             col_active: 0,
@@ -5209,8 +5354,20 @@ impl Shuffle {
 
     /// Re-apply this tab's sort criterion to its entries.
     fn sort_tab(&mut self, pane: usize) {
-        let (key, asc) = (self.tab(pane).sort_key, self.tab(pane).sort_asc);
-        sort_entries(&mut self.tab_mut(pane).entries, key, asc);
+        self.tab_mut(pane).resort();
+    }
+
+    /// Flip the global "Group by Kind" preference and re-sort every tab.
+    fn toggle_group_by_kind(&mut self, cx: &mut Context<Self>) {
+        let mut np = prefs();
+        np.group_by_kind = !np.group_by_kind;
+        apply_prefs(np, cx);
+        for pane in self.panes.iter_mut() {
+            for tab in pane.tabs.iter_mut() {
+                tab.resort();
+            }
+        }
+        cx.notify();
     }
 
     /// Set the sort criterion (clicking the same column toggles direction).
@@ -5306,7 +5463,7 @@ impl Shuffle {
             };
             let item = match view {
                 ViewMode::Icons => ix / self.icon_cols(pane),
-                _ => ix + off,
+                _ => self.tab(pane).entry_row(ix) + off,
             };
             self.tab(pane).scroll_handle.scroll_to_item(item, ScrollStrategy::Center);
             self.mark_scrolled(pane, cx);
@@ -8120,6 +8277,37 @@ impl Shuffle {
             );
         }
 
+        // Separator + "Group by Kind" toggle (sections in the List view).
+        let grouped = prefs().group_by_kind;
+        items.push(div().mx_2().my_1().h(px(1.0)).bg(rgb(t.border)).into_any_element());
+        items.push(
+            div()
+                .id("sortopt-group")
+                .flex()
+                .items_center()
+                .gap_2()
+                .mx_1()
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_color(rgb(t.text))
+                .hover(|s| s.bg(rgb(t.selected)))
+                .child(
+                    div()
+                        .flex_none()
+                        .w(px(12.0))
+                        .text_color(rgb(t.accent))
+                        .child(if grouped { "✓" } else { " " }),
+                )
+                .child("Group by Kind")
+                .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                    this.sort_menu = None;
+                    this.toggle_group_by_kind(cx);
+                }))
+                .into_any_element(),
+        );
+
         div()
             .absolute()
             .top_0()
@@ -9765,7 +9953,7 @@ impl Shuffle {
         );
         let item = match self.tab(pane).view {
             ViewMode::Icons => ni / self.icon_cols(pane),
-            _ => ni + offset,
+            _ => self.tab(pane).entry_row(ni) + offset,
         };
         self.tab(pane).scroll_handle.scroll_to_item(item, ScrollStrategy::Center);
         self.mark_scrolled(pane, cx);
@@ -12362,6 +12550,7 @@ impl Shuffle {
         let has_parent =
             self.tab(pane).find_query.is_none() && prefs().show_parent && self.tab(pane).current_dir.parent().is_some();
         let off = i64::from(has_parent);
+        let grouped = self.tab(pane).grouped();
         // Only touch the covered rows — cloning every path in the directory per
         // mouse-move made marquee drags crawl in large folders.
         let mut sel = HashSet::new();
@@ -12371,7 +12560,7 @@ impl Shuffle {
             let len = if find {
                 tab.find_results.len()
             } else {
-                tab.entries.len()
+                tab.rows_len()
             };
             for i in i0..=i1 {
                 let di = i - off;
@@ -12382,7 +12571,16 @@ impl Shuffle {
                 if di >= len {
                     break;
                 }
-                let ix = if find { tab.find_results[di] } else { di };
+                let ix = if find {
+                    tab.find_results[di]
+                } else if grouped {
+                    match tab.row_ref(di) {
+                        Some(RowRef::Entry(e)) => e,
+                        _ => continue, // section header: not selectable
+                    }
+                } else {
+                    di
+                };
                 sel.insert(tab.current_dir.join(&tab.entries[ix].name));
             }
         }
@@ -12472,7 +12670,7 @@ impl Shuffle {
             let count = if find_active {
                 tab.find_results.len()
             } else {
-                tab.entries.len() + usize::from(has_parent)
+                tab.rows_len() + usize::from(has_parent)
             };
             if row >= count {
                 return Some((pane, None));
@@ -12488,12 +12686,14 @@ impl Shuffle {
             let is_folder = if has_parent && row == 0 {
                 true
             } else {
-                let ix = if find_active {
-                    tab.find_results[row]
+                if find_active {
+                    tab.entries.get(tab.find_results[row]).is_some_and(|e| e.is_dir)
                 } else {
-                    row - usize::from(has_parent)
-                };
-                tab.entries.get(ix).is_some_and(|e| e.is_dir)
+                    match tab.row_ref(row - usize::from(has_parent)) {
+                        Some(RowRef::Entry(ix)) => tab.entries.get(ix).is_some_and(|e| e.is_dir),
+                        _ => false,
+                    }
+                }
             };
             return Some((pane, is_folder.then_some(row)));
         }
@@ -12689,7 +12889,7 @@ impl Shuffle {
         );
         let item = match view {
             ViewMode::Icons => ni as usize / self.icon_cols(pane),
-            _ => ni as usize + offset,
+            _ => self.tab(pane).entry_row(ni as usize) + offset,
         };
         self.tab(pane).scroll_handle.scroll_to_item(item, ScrollStrategy::Center);
         // Keyboard scrolling shows the overlay scrollbar too.
@@ -15694,7 +15894,7 @@ impl Shuffle {
         let item_count = if find_active {
             tab.find_results.len()
         } else {
-            tab.entries.len() + usize::from(has_parent)
+            tab.rows_len() + usize::from(has_parent)
         };
         let scroll = tab.scroll_handle.clone();
         let h_scroll = tab.h_scroll.clone();
@@ -15891,10 +16091,21 @@ impl Shuffle {
                             let tab = this.tab(pane);
                             let entry_ix = if find_active {
                                 tab.find_results[ix]
-                            } else if has_parent {
-                                ix - 1
                             } else {
-                                ix
+                                let row = ix - usize::from(has_parent);
+                                match tab.row_ref(row) {
+                                    Some(RowRef::Entry(e)) => e,
+                                    Some(RowRef::Spacer) => {
+                                        items.push(div().flex_none().w_full().h(px(ROW_H)).into_any_element());
+                                        continue;
+                                    }
+                                    Some(RowRef::Header(k)) => {
+                                        let (_, label, count) = &tab.group_marks[k];
+                                        items.push(group_header_row(label, *count, widths).into_any_element());
+                                        continue;
+                                    }
+                                    None => continue,
+                                }
                             };
                             let entry = &tab.entries[entry_ix];
                             let name = entry.name.clone();
@@ -19347,6 +19558,24 @@ fn column_row(
             }),
         )
         .into_any_element()
+}
+
+/// A section header row in a grouped List view: "Kind  ·  N items".
+fn group_header_row(label: &str, count: usize, widths: ColumnWidths) -> impl IntoElement {
+    let _ = widths;
+    let noun = if count == 1 { "item" } else { "items" };
+    div()
+        .flex()
+        .items_center()
+        .flex_none()
+        .w_full()
+        .h(px(ROW_H))
+        .px_3()
+        .gap_2()
+        .bg(Theme::alpha(theme().border, 0x55))
+        .text_xs()
+        .child(div().text_color(rgb(theme().text)).child(label.to_string()))
+        .child(div().text_color(rgb(theme().text_dim)).child(format!("{count} {noun}")))
 }
 
 /// A human-readable kind label for a file (e.g. "Microsoft Excel", "DWG File").
@@ -24928,8 +25157,8 @@ fn save_prefs(p: &Prefs) {
             let _ = fs::create_dir_all(parent);
         }
         let body = format!(
-            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\nshow_hidden={}\nsettings_in_tab={}\ndouble_click_folders={}\n",
-            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity, p.show_hidden, p.settings_in_tab, p.double_click_folders
+            "terminal={}\nterm_history={}\npreview={}\npreview_pages={}\ninfo={}\nshow_parent={}\nsidebar_collapsed={}\nrecent_limit={}\npalette_history={}\ngroups_enabled={}\nshow_filter_button={}\nshow_fps={}\nscript_actions={}\nssh_use_system={}\nssh_configured={}\nwaterfall={}\npalette_opacity={}\nshow_hidden={}\nsettings_in_tab={}\ndouble_click_folders={}\ngroup_by_kind={}\n",
+            p.terminal, p.term_history, p.preview, p.preview_pages, p.info, p.show_parent, p.sidebar_collapsed, p.recent_limit, p.palette_history, p.groups_enabled, p.show_filter_button, p.show_fps, p.script_actions, p.ssh_use_system, p.ssh_configured, p.waterfall, p.palette_opacity, p.show_hidden, p.settings_in_tab, p.double_click_folders, p.group_by_kind
         );
         let _ = fs::write(&file, body);
     }
@@ -25082,6 +25311,7 @@ fn load_prefs() -> Prefs {
                     "show_hidden" => p.show_hidden = on,
                     "settings_in_tab" => p.settings_in_tab = on,
                     "double_click_folders" => p.double_click_folders = on,
+                    "group_by_kind" => p.group_by_kind = on,
                     "palette_opacity" => {
                         if let Ok(n) = v.trim().parse::<u8>() {
                             p.palette_opacity = n.clamp(20, 100);
@@ -25833,6 +26063,43 @@ mod tests {
         );
         assert_eq!(natural_compare(b"abc", b"abc"), std::cmp::Ordering::Equal);
         assert_eq!(natural_compare(b"ab", b"abc"), std::cmp::Ordering::Less);
+    }
+
+    #[test]
+    fn group_by_kind_row_mapping() {
+        let t = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(1000));
+        let mut v = vec![
+            entry("b.pdf", false, 1, t),
+            entry("a.png", false, 1, t),
+            entry("dir", true, 0, t),
+            entry("a.pdf", false, 1, t),
+        ];
+        sort_entries(&mut v, SortKey::Name, true);
+        let marks = group_entries_by_kind(&mut v, false);
+        // Broad categories in a fixed order: Folders, Images, PDF.
+        assert_eq!(marks.iter().map(|m| m.1.as_str()).collect::<Vec<_>>(), ["Folders", "Images", "PDF"]);
+        assert_eq!(marks.iter().map(|m| m.2).collect::<Vec<_>>(), [1, 1, 2]);
+        let n: Vec<&str> = v.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(n, ["dir", "a.png", "a.pdf", "b.pdf"]);
+        let mut tab = Tab::new(PathBuf::from("/"));
+        tab.entries = v;
+        set_active_prefs(Prefs { group_by_kind: true, ..Prefs::default() });
+        tab.group_marks = marks;
+        assert!(tab.grouped());
+        assert_eq!(tab.rows_len(), 9);
+        let refs: Vec<_> = (0..9).map(|r| tab.row_ref(r).unwrap()).collect();
+        assert_eq!(
+            refs,
+            [
+                RowRef::Header(0), RowRef::Entry(0),
+                RowRef::Spacer, RowRef::Header(1), RowRef::Entry(1),
+                RowRef::Spacer, RowRef::Header(2), RowRef::Entry(2), RowRef::Entry(3),
+            ]
+        );
+        assert!(tab.row_ref(9).is_none());
+        for e in 0..4 {
+            assert_eq!(tab.row_ref(tab.entry_row(e)), Some(RowRef::Entry(e)));
+        }
     }
 
     #[test]
