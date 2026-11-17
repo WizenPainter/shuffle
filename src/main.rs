@@ -772,6 +772,7 @@ enum KeyAction {
     CopyPath,
     Duplicate,
     MakeAlias,
+    MakeSymlink,
     Compress,
     MoveToTrash,
     RevealInFinder,
@@ -835,6 +836,7 @@ impl KeyAction {
         KeyAction::CopyPath,
         KeyAction::Duplicate,
         KeyAction::MakeAlias,
+        KeyAction::MakeSymlink,
         KeyAction::Compress,
         KeyAction::MoveToTrash,
         KeyAction::RevealInFinder,
@@ -915,6 +917,7 @@ impl KeyAction {
             KeyAction::CopyPath => "copy_path",
             KeyAction::Duplicate => "duplicate",
             KeyAction::MakeAlias => "make_alias",
+            KeyAction::MakeSymlink => "make_symlink",
             KeyAction::Compress => "compress",
             KeyAction::MoveToTrash => "move_to_trash",
             KeyAction::RevealInFinder => "reveal_in_finder",
@@ -964,6 +967,16 @@ impl KeyAction {
         }
     }
 
+    /// A fixed (non-rebindable) key that also runs this action, shown under its
+    /// label in Settings so it isn't a hidden default.
+    fn builtin_hint(self) -> Option<&'static str> {
+        match self {
+            KeyAction::MoveToTrash => Some("Also ⌦ (forward delete, fn⌫)"),
+            KeyAction::GoParent => Some("Also ⌫"),
+            _ => None,
+        }
+    }
+
     /// Human label shown in Settings.
     fn label(self) -> &'static str {
         match self {
@@ -978,6 +991,7 @@ impl KeyAction {
             KeyAction::CopyPath => "Copy path",
             KeyAction::Duplicate => "Duplicate",
             KeyAction::MakeAlias => "Make alias",
+            KeyAction::MakeSymlink => "Make symlink (in the other pane when split)",
             KeyAction::Compress => "Compress",
             KeyAction::MoveToTrash => "Move to Trash",
             KeyAction::RevealInFinder => "Reveal in Finder",
@@ -1502,9 +1516,12 @@ impl Settings {
         };
         let ks = &ev.keystroke;
         let key = ks.key.as_str();
+        let m = &ks.modifiers;
+        let bare = !(m.platform || m.control || m.alt || m.shift || m.function);
         match key {
-            "escape" => {}
-            "backspace" | "delete" => {
+            "escape" if bare => {}
+            // A bare ⌫ clears; with modifiers (⇧⌫, ⌥⌘⌫…) it is recorded.
+            "backspace" if bare => {
                 let mut km = keymap();
                 km.set(action, None);
                 apply_keymap(km, cx);
@@ -2317,6 +2334,7 @@ impl Settings {
                             .flex_col()
                             .min_w_0()
                             .child(div().text_color(rgb(t.text)).child(action.label()))
+                            .children(action.builtin_hint().map(|h| div().text_xs().text_color(rgb(t.text_dim)).child(h)))
                             .children(note.map(|n| div().text_xs().text_color(rgb(RENAME_ERR_COLOR)).child(n))),
                     )
                     .child(
@@ -7034,6 +7052,51 @@ impl Shuffle {
         self.refresh_pane(pane, cx);
     }
 
+    /// Where "Make Symlink" puts links made from `pane`: the other pane's
+    /// folder in split view (Double Commander-style), else None (beside the
+    /// originals).
+    fn symlink_dest(&self, pane: usize) -> Option<PathBuf> {
+        if self.panes.len() < 2 {
+            return None;
+        }
+        let other = 1 - pane.min(1);
+        let tab = self.tab(other);
+        (tab.remote.is_none() && !tab.settings).then(|| tab.current_dir.clone())
+    }
+
+    /// Create a symbolic link to each of `targets`: in the other pane's folder
+    /// when split (keeping the name), otherwise beside the original as
+    /// "name symlink". Undo removes the links.
+    fn make_symlinks(&mut self, pane: usize, targets: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if targets.is_empty() || self.tab(pane).remote.is_some() {
+            return;
+        }
+        let dest = self.symlink_dest(pane);
+        let mut made = Vec::new();
+        let mut failed = None;
+        for t in &targets {
+            let (Some(parent), Some(name)) = (t.parent(), t.file_name()) else { continue };
+            let name = name.to_string_lossy();
+            let link = match &dest {
+                Some(d) if d.as_path() != parent => unique_child(d, &name),
+                _ => unique_child(parent, &format!("{name} symlink")),
+            };
+            match std::os::unix::fs::symlink(t, &link) {
+                Ok(()) => made.push(link),
+                Err(e) => failed = Some(format!("Couldn't create a symlink to “{name}”: {e}")),
+            }
+        }
+        if !made.is_empty() {
+            self.push_undo(UndoOp::Created(made));
+        }
+        if let Some(msg) = failed {
+            self.set_notice(msg, cx);
+        }
+        for p in 0..self.panes.len() {
+            self.refresh_pane(p, cx);
+        }
+    }
+
     /// Compress a file/folder into a `.zip` beside it (Finder uses `ditto`).
     /// Zip a file/folder beside itself, off-thread so a big folder can't
     /// freeze the UI while `ditto` runs.
@@ -7685,6 +7748,19 @@ impl Shuffle {
                 nodes.push(mi("Make Alias", move |this, _, cx| {
                     this.close_context_menu(cx);
                     this.make_alias(pane, p.clone(), cx);
+                }));
+            }
+            if self.tab(pane).remote.is_none() {
+                let ts = targets.clone();
+                let label = match (self.symlink_dest(pane).is_some(), many) {
+                    (true, false) => "Make Symlink in Other Pane".to_string(),
+                    (true, true) => format!("Make {n} Symlinks in Other Pane"),
+                    (false, false) => "Make Symlink".to_string(),
+                    (false, true) => format!("Make {n} Symlinks"),
+                };
+                nodes.push(mi(label, move |this, _, cx| {
+                    this.close_context_menu(cx);
+                    this.make_symlinks(pane, ts.clone(), cx);
                 }));
             }
             {
@@ -10205,6 +10281,10 @@ impl Shuffle {
                 if let Some(p) = anchor {
                     self.make_alias(pane, p, cx);
                 }
+            }
+            KeyAction::MakeSymlink => {
+                let targets = self.action_targets(pane);
+                self.make_symlinks(pane, targets, cx);
             }
             KeyAction::Compress => {
                 if let Some(p) = anchor {
@@ -20954,8 +21034,45 @@ define_class!(
             // original file.
             NSDragOperation::Copy
         }
+
+        #[unsafe(method(draggingSession:endedAtPoint:operation:))]
+        fn ended(&self, _session: &NSDraggingSession, _point: objc2_foundation::NSPoint, _op: NSDragOperation) {
+            end_gpui_drag();
+        }
     }
 );
+
+thread_local! {
+    /// The GPUI view that started the current native drag.
+    static DRAG_VIEW: RefCell<Option<objc2::rc::Retained<objc2_app_kit::NSView>>> = const { RefCell::new(None) };
+}
+
+/// The native drag session swallows the mouse-up, so gpui never learns the
+/// button was released: its macOS backend keeps replaying the last
+/// pressed-button move every 16 ms, which drags hover (and the marquee) back to
+/// where the drag began (#30). Hand gpui's view the missing mouse-up, far
+/// outside the window so it can't complete a click on any row.
+fn end_gpui_drag() {
+    use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
+    let Some(view) = DRAG_VIEW.with(|v| v.borrow_mut().take()) else { return };
+    let Some(window) = view.window() else { return };
+    let up = NSEvent::mouseEventWithType_location_modifierFlags_timestamp_windowNumber_context_eventNumber_clickCount_pressure(
+        NSEventType::LeftMouseUp,
+        objc2_foundation::NSPoint::new(-100_000.0, -100_000.0),
+        NSEventModifierFlags::empty(),
+        objc2_foundation::NSProcessInfo::processInfo().systemUptime(),
+        window.windowNumber(),
+        None,
+        0,
+        1,
+        0.0,
+    );
+    if let Some(up) = up {
+        unsafe {
+            let _: () = objc2::msg_send![&*view, mouseUp: &*up];
+        }
+    }
+}
 
 thread_local! {
     /// One shared dragging-source instance, reused for every drag.
@@ -21083,6 +21200,7 @@ fn start_os_file_drag(view_ptr: *mut std::ffi::c_void, paths: &[PathBuf]) {
 
     let source = drag_source(mtm);
     let source_proto: &ProtocolObject<dyn NSDraggingSource> = ProtocolObject::from_ref(&*source);
+    DRAG_VIEW.with(|v| *v.borrow_mut() = Some(objc2::Message::retain(view)));
     let _ = view.beginDraggingSessionWithItems_event_source(&array, &event, source_proto);
 }
 
